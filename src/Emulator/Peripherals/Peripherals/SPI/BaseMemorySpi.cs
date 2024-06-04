@@ -2,19 +2,46 @@ using System;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Peripherals.Memory;
-
+using System.Collections.Generic;
 using Range = Antmicro.Renode.Core.Range;
 using Antmicro.Renode.Logging;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    public abstract class BASE_EEPROM_SPI : ISPIPeripheral
+    /// <summary>
+    /// Provides basic functionality for spi memory
+    /// support commands:
+    /// 0x03 - read
+    /// 0x02 - write
+    /// 0x06 - write enable
+    /// 0x04 - write disable
+    /// 0x05 - read status register - returns 0
+    /// 0x01 - write status register - no effect
+    /// 0x9F - read JEDEC ID
+    /// 0x4B - read unique ID 
+    /// register custom commands via RegisterCustomCommandHandler <see cref="RegisterCustomCommandHandler"/>
+    /// </summary>
+    public abstract class BaseMemorySpi : ISPIPeripheral
     { 
-        public BASE_EEPROM_SPI(byte[] memory, int pageSize = 0)
+       
+        public BaseMemorySpi(byte[] memory, int pageSize = 0, byte manufactuerId = 0, ushort uniqueId = 0) 
         {
             this.pageSize = pageSize;
             this.memory = memory;
+            writeEnable = true;
+            this.manufacturerId = manufactuerId;
+            this.uniqueId = uniqueId;
             Reset();
+        }
+
+        /// <summary>
+        /// Registers custom command handler for given command.
+        /// <param name="command">Command to register handler for.</param>
+        /// <param name="handler">byte f(byte command, byte data_in) handler</param>
+        /// </summary>
+        public void RegisterCustomCommandHandler (byte command, Func<byte,byte, byte> handler)
+        {
+            customCommandHandlers[command] = handler;
         }
 
         public void Reset()
@@ -25,20 +52,34 @@ namespace Antmicro.Renode.Peripherals.SPI
         void ResetTransmit()
         {
             selected = false;
+            customHandled = false;
             selectedPage = -1;
             currentCommand = Command.None;
             memoryWriteState = MemoryWriteState.Command;
             memoryReadState = MemoryReadState.Command;
             memoryWriteAddress = 0;
             memoryReadAddress = 0;
+            dataCounter = 0;
         } 
 
         //ISPIPeripheral
         public byte Transmit(byte data)
         {
+            dataCounter++;
+            if(currentCommand == Command.None && customCommandHandlers.ContainsKey(data) || customHandled)
+            {
+                if(customHandled == false)
+                {
+                    customHandledValue = data;
+                    customHandled = true;
+                }
+               
+                return customCommandHandlers[customHandledValue](customHandledValue, data);
+            }
+
             if(currentCommand==Command.None)
             {
-                if(data == (byte)Command.Read || data == (byte)Command.Write || data == (byte)Command.WriteEnable || data == (byte)Command.WriteDisable || data == (byte)Command.ReadStatusRegister || data == (byte)Command.WriteStatusRegister)
+                if(Enum.IsDefined(typeof(Command), data))
                 {
                     currentCommand = (Command)data;
                      this.NoisyLog("Parsing command: " + currentCommand);
@@ -46,7 +87,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 else
                 {
                     currentCommand = Command.None;
-                    this.Log(LogLevel.Warning, "BASE_EEPROM_SPI: Invalid command");
+                    this.Log(LogLevel.Warning, "Invalid command value: 0x" + data.ToString("X"));
                 }
             }
             else
@@ -60,13 +101,39 @@ namespace Antmicro.Renode.Peripherals.SPI
                         WriteIntoMemory(data);
                         break;
                     case Command.WriteEnable:
+                        writeEnable = true;
                         return 0xFF;
                     case Command.WriteDisable:
+                        writeEnable = false;
                         return 0xFF;
                     case Command.ReadStatusRegister:
                         return 0;
                     case Command.WriteStatusRegister:
                         return 0xFF;
+                    case Command.ReadJEDECID:
+                        if(dataCounter == 2)
+                        {
+                            return (byte)manufacturerId;
+                        }
+                        else if(dataCounter == 3)
+                        {
+                            return (byte)(uniqueId >> 8);
+                        }
+                        else if(dataCounter == 4)
+                        {
+                            return (byte)(uniqueId & 0xFF);
+                        }
+                        break;
+                    case Command.ReadUniqueID:
+                        if(dataCounter == 2)
+                        {
+                            return (byte)(uniqueId >> 8);
+                        }
+                        else if(dataCounter == 3)
+                        {
+                            return (byte)(uniqueId & 0xFF);
+                        }
+                        break;
                 }
             }
 
@@ -81,6 +148,12 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         void WriteIntoMemory(byte value)
         {
+            if(writeEnable == false)
+            {
+                this.Log(LogLevel.Error, "Write command received while write is disabled");
+                return;
+            }
+
             switch (memoryWriteState)
             {
                 case MemoryWriteState.Command:
@@ -157,6 +230,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             return true;
         }
 
+
         public byte[] MemoryValue
         {
             get
@@ -165,12 +239,21 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
         }
 
+        private byte manufacturerId;
+        private ushort uniqueId;
+
         private int selectedPage;
         private int pageSize;
         private byte[] memory;
+        private bool writeEnable;
 
         private Command currentCommand;
         private bool selected;
+        private bool customHandled;
+        private byte customHandledValue;
+        private int dataCounter;
+
+        Dictionary<byte, Func<byte, byte, byte>> customCommandHandlers = new Dictionary<byte, Func<byte, byte, byte>>();
 
         enum MemoryWriteState
         {
@@ -192,14 +275,17 @@ namespace Antmicro.Renode.Peripherals.SPI
         MemoryReadState memoryReadState;
         ushort memoryReadAddress;
 
-        enum Command{
+        enum Command : byte
+        {
             None = 0x00,
             Read = 0x03,
             Write = 0x02,
             WriteEnable = 0x06,
             WriteDisable = 0x04,
             ReadStatusRegister = 0x05,
-            WriteStatusRegister = 0x01
+            WriteStatusRegister = 0x01,
+            ReadJEDECID = 0x9F,
+            ReadUniqueID = 0x4B,
         }
 
     }
