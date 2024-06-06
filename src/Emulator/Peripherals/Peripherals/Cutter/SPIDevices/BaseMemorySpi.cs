@@ -5,8 +5,9 @@ using Antmicro.Renode.Peripherals.Memory;
 using System.Collections.Generic;
 using Range = Antmicro.Renode.Core.Range;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.SPI;
 
-namespace Antmicro.Renode.Peripherals.SPI
+namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
 {
     /// <summary>
     /// Provides basic functionality for spi memory
