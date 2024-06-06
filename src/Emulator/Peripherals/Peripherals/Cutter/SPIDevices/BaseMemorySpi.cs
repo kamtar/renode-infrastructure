@@ -22,7 +22,7 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
     /// 0x4B - read unique ID 
     /// register custom commands via RegisterCustomCommandHandler <see cref="RegisterCustomCommandHandler"/>
     /// </summary>
-    public abstract class BaseMemorySpi : ISPIPeripheral
+    public abstract class BaseMemorySpi : ISPIDevice
     { 
        
         public BaseMemorySpi(byte[] memory, int pageSize = 0, byte manufactuerId = 0, ushort uniqueId = 0) 
@@ -140,7 +140,12 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
 
             return 0xFF;//high impedance
         }
-
+        
+        public void DeviceSelected()
+        {
+            this.NoisyLog("Memory asserted");
+        }
+        
         public void FinishTransmission()
         {
             ResetTransmit();
