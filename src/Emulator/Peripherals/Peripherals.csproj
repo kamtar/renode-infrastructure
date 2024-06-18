@@ -344,7 +344,7 @@
     <Compile Include="Peripherals\SPI\NPCX_FIU.cs" />
     <Compile Include="Peripherals\SPI\NPCX_Flash.cs" />
     <Compile Include="Peripherals\Timers\MPFS_Timer.cs" />
-    <Compile Include="Peripherals\Timers\NPCX_ITIM32.cs" />
+    <Compile Include="Peripherals\Timers\NPCX_ITIM.cs" />
     <Compile Include="Peripherals\I2C\MPFS_I2C.cs" />
     <Compile Include="Peripherals\USB\USBMouse.cs" />
     <Compile Include="Peripherals\Miscellaneous\STM32F4_RNG.cs" />
@@ -378,6 +378,7 @@
     <Compile Include="Peripherals\Analog\EOSS3_ADC.cs" />
     <Compile Include="Peripherals\Analog\STM32_ADC_Common.cs" />
     <Compile Include="Peripherals\Analog\STM32F0_ADC.cs" />
+    <Compile Include="Peripherals\Analog\STM32G0_ADC.cs" />
     <Compile Include="Peripherals\Analog\STM32WBA_ADC.cs" />
     <Compile Include="Peripherals\Analog\Xilinx_XADC.cs" />
     <Compile Include="Peripherals\Analog\STM32_ADC.cs" />
