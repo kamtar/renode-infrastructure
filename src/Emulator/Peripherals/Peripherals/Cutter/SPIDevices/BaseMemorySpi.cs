@@ -11,7 +11,7 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
 {
     /// <summary>
     /// Provides basic functionality for spi memory
-    /// support commands:
+    /// supported commands:
     /// 0x03 - read
     /// 0x02 - write
     /// 0x06 - write enable
@@ -152,7 +152,7 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
             this.NoisyLog("Memory deasserted");
         }
 
-        void WriteIntoMemory(byte value)
+        protected void WriteIntoMemory(byte value)
         {
             if(writeEnable == false)
             {
@@ -164,11 +164,11 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
             {
                 case MemoryWriteState.Command:
                 case MemoryWriteState.AddressLow:                  
-                    memoryWriteAddress |= (ushort)(value << 8);
+                    memoryWriteAddress = (ushort)(value << 8);
                     memoryWriteState = MemoryWriteState.AddressHigh;
                     break;
                 case MemoryWriteState.AddressHigh:
-                    memoryWriteAddress = value;
+                    memoryWriteAddress |= value;
                     memoryWriteState = MemoryWriteState.Data;
                     this.NoisyLog("Write to memory at "+ memoryWriteAddress + " initiated");
                     break;
@@ -183,17 +183,17 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
             }
         }
 
-        byte ReadFromMemory(byte value)
+        protected byte ReadFromMemory(byte value)
         {
             switch (memoryReadState)
             {
                 case MemoryReadState.Command:
                 case MemoryReadState.AddressLow:
-                    memoryReadAddress |= (ushort)(value << 8);                   
+                    memoryReadAddress = (ushort)(value << 8);                   
                     memoryReadState = MemoryReadState.AddressHigh;
                     break;
                 case MemoryReadState.AddressHigh:
-                    memoryReadAddress = value;
+                    memoryReadAddress |= value;
                     memoryReadState = MemoryReadState.Data;
                     this.NoisyLog("Read from memory at "+ memoryReadAddress + " initiated");
                     break;
@@ -208,8 +208,16 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
 
             return 0xFF;
         }
+        
 
-        bool SanityAddressCheck(ushort address, bool isWrite = false)
+        /// <summary>
+        /// Checks if memory isnt out of bounds or missaligned for write attempt.
+        /// Override it to monitor or ban write/read attempts.
+        /// <param name="address">Address</param>
+        /// <param name="isWrite">Write attempt</param>
+        /// <returns>Allow memory access</returns>
+        /// </summary>
+        protected virtual bool SanityAddressCheck(ushort address, bool isWrite = false)
         {
             if(address >= memory.Length)
             {
