@@ -18,7 +18,7 @@ namespace Antmicro.Renode.Peripherals.CPU
     public interface ICPU : IPeripheral, IHasOwnLife
     {
         string Architecture { get; }
-        uint Id { get; }
+        uint MultiprocessingId { get; }
         string Model { get; }
         RegisterValue PC { get; set; }
         bool IsHalted { get; set; }
@@ -51,7 +51,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 machineName += ".";
             }
-            return "{0}{1}[{2}]".FormatWith(machineName, machine.GetLocalName(cpu), machine.SystemBus.GetCPUId(cpu));
+            return "{0}{1}[{2}]".FormatWith(machineName, machine.GetLocalName(cpu), machine.SystemBus.GetCPUSlot(cpu));
         }
     }
 }

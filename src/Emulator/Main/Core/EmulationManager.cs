@@ -9,6 +9,7 @@ using Antmicro.Migrant;
 using System.IO;
 using System;
 using System.Collections.Generic;
+using System.IO.Compression;
 using System.Text;
 using Antmicro.Renode.Exceptions;
 using IronPython.Runtime;
@@ -95,7 +96,10 @@ namespace Antmicro.Renode.Core
 
         public void Load(ReadFilePath path)
         {
-            using(var stream = new FileStream(path, FileMode.Open, FileAccess.Read))
+            using(var fstream = new FileStream(path, FileMode.Open, FileAccess.Read))
+            using(var stream = path.ToString().EndsWith(".gz", StringComparison.InvariantCulture)
+                                ? (Stream) new GZipStream(fstream, CompressionMode.Decompress)
+                                : (Stream) fstream)
             {
                 var deserializationResult = serializer.TryDeserialize<string>(stream, out var version);
                 if(deserializationResult != DeserializationResult.OK)
@@ -110,7 +114,7 @@ namespace Antmicro.Renode.Core
                 }
 
                 CurrentEmulation = emulation;
-                CurrentEmulation.BlobManager.Load(stream);
+                CurrentEmulation.BlobManager.Load(stream, fstream.Name);
 
                 if(version != VersionString)
                 {
@@ -238,43 +242,6 @@ namespace Antmicro.Renode.Core
                         entryAssembly.GetName().Name,
                         entryAssembly.GetName().Version,
                         ((AssemblyInformationalVersionAttribute)entryAssembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)[0]).InformationalVersion
-                    );
-                }
-                catch(System.Exception)
-                {
-                    return string.Empty;
-                }
-
-            }
-        }
-        public string LongVersionString
-        {
-            get
-            {
-                var entryAssembly = Assembly.GetEntryAssembly();
-                if(entryAssembly == null)
-                {
-                    // When running from NUnit in MonoDevelop entryAssembly is null, but we don't care
-                    return string.Empty;
-                }
-
-                try
-                {
-
-#if NET
-                    var runtime = ".NET";
-#elif PLATFORM_WINDOWS
-                    var runtime = ".NET Framework";
-#else
-                    var runtime = "Mono";
-#endif
-                    return string.Format("{0} v{1}\n  build: {2}\n  build type: {3}\n  runtime: {4} {5}",
-                        entryAssembly.GetName().Name,
-                        entryAssembly.GetName().Version,
-                        ((AssemblyInformationalVersionAttribute)entryAssembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)[0]).InformationalVersion,
-                        ((AssemblyConfigurationAttribute)entryAssembly.GetCustomAttributes(typeof(AssemblyConfigurationAttribute), false)[0]).Configuration,
-                        runtime,
-                        Environment.Version
                     );
                 }
                 catch(System.Exception)

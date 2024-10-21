@@ -13,6 +13,8 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Peripherals.CFU;
 using Antmicro.Renode.Time;
@@ -23,17 +25,33 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, ICPUWithPostOpcodeExecutionHooks, ICPUWithPostGprAccessHooks, ICPUWithNMI
+    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, ICPUWithPostOpcodeExecutionHooks, ICPUWithPostGprAccessHooks, ICPUWithNMI
     {
-        protected BaseRiscV(IRiscVTimeProvider timeProvider, uint hartId, string cpuType, IMachine machine, PrivilegeArchitecture privilegeArchitecture, Endianess endianness, CpuBitness bitness, ulong? nmiVectorAddress = null, uint? nmiVectorLength = null, bool allowUnalignedAccesses = false, InterruptMode interruptMode = InterruptMode.Auto, uint minimalPmpNapotInBytes = 8)
-                : base(hartId, cpuType, machine, endianness, bitness)
+        protected BaseRiscV(
+            IRiscVTimeProvider timeProvider,
+            uint hartId,
+            string cpuType,
+            IMachine machine,
+            PrivilegedArchitecture privilegedArchitecture,
+            Endianess endianness,
+            CpuBitness bitness,
+            ulong? nmiVectorAddress = null,
+            uint? nmiVectorLength = null,
+            bool allowUnalignedAccesses = false,
+            InterruptMode interruptMode = InterruptMode.Auto,
+            uint minimalPmpNapotInBytes = 8,
+            uint pmpNumberOfAddrBits = 32,
+            PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineSupervisorUser
+        )
+            : base(hartId, cpuType, machine, endianness, bitness)
         {
             HartId = hartId;
             this.timeProvider = timeProvider;
-            this.privilegeArchitecture = privilegeArchitecture;
+            this.privilegedArchitecture = privilegedArchitecture;
             shouldEnterDebugMode = true;
             nonstandardCSR = new Dictionary<ulong, NonstandardCSR>();
             customInstructionsMapping = new Dictionary<ulong, Action<UInt64>>();
+            indirectCsrPeripherals = new Dictionary<BusRangeRegistration, IIndirectCSRPeripheral>();
             this.nmiVectorLength = nmiVectorLength;
             this.nmiVectorAddress = nmiVectorAddress;
 
@@ -45,7 +63,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             postOpcodeExecutionHooks = new List<Action<ulong>>();
             postGprAccessHooks = new Action<bool>[NumberOfGeneralPurposeRegisters];
 
-            architectureDecoder = new ArchitectureDecoder(machine, this, cpuType);
+            architectureDecoder = new ArchitectureDecoder(machine, this, cpuType, privilegeLevels);
             EnableArchitectureVariants();
 
             UpdateNMIVector();
@@ -62,7 +80,22 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new ConstructionException(string.Format("Unsupported interrupt mode: 0x{0:X}", interruptMode));
             }
 
+            TlibSetPmpaddrBits(pmpNumberOfAddrBits);
             TlibSetNapotGrain(minimalPmpNapotInBytes);
+
+            RegisterCSR((ulong)StandardCSR.Miselect, () => miselectValue, s => miselectValue = (uint)s, "miselect");
+            for(uint i = 0; i < 6; ++i)
+            {
+                var j = i;
+                RegisterCSR((ulong)StandardCSR.Mireg + i, () => ReadIndirectCSR(miselectValue, j), v => WriteIndirectCSR(miselectValue, j, (uint)v), $"mireg{i + 1}");
+            }
+
+            RegisterCSR((ulong)StandardCSR.Siselect, () => siselectValue, s => siselectValue = (uint)s, "siselect");
+            for(uint i = 0; i < 6; ++i)
+            {
+                var j = i;
+                RegisterCSR((ulong)StandardCSR.Sireg + i, () => ReadIndirectCSR(siselectValue, j), v => WriteIndirectCSR(siselectValue, j, (uint)v), $"sireg{i + 1}");
+            }
         }
 
         public void Register(ICFU cfu, NumberRegistrationPoint<int> registrationPoint)
@@ -106,6 +139,34 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        public void Register(IIndirectCSRPeripheral peripheral, BusRangeRegistration registrationPoint)
+        {
+            machine.RegisterAsAChildOf(this, peripheral, registrationPoint);
+            indirectCsrPeripherals.Add(registrationPoint, peripheral);
+        }
+
+        public void Unregister(IIndirectCSRPeripheral peripheral)
+        {
+            foreach(var point in GetRegistrationPoints(peripheral).ToList())
+            {
+                indirectCsrPeripherals.Remove(point);
+            }
+            machine.UnregisterAsAChildOf(this, peripheral);
+        }
+
+        public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IIndirectCSRPeripheral peripheral)
+        {
+            return indirectCsrPeripherals.Where(p => p.Value == peripheral).Select(p => p.Key);
+        }
+
+        IEnumerable<IRegistered<IIndirectCSRPeripheral, BusRangeRegistration>> IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>.Children
+        {
+            get
+            {
+                return indirectCsrPeripherals.Select(x => Registered.Create(x.Value, x.Key));
+            }
+        }
+
         public virtual void OnNMI(int number, bool value, ulong? mcause = null)
         {
             if(this.NMIVectorLength == null || this.NMIVectorAddress == null)
@@ -123,7 +184,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
 
             // we don't log warning when value is false to handle gpio initial reset
-            if(privilegeArchitecture >= PrivilegeArchitecture.Priv1_10 && IsValidInterruptOnlyInV1_09(number) && value)
+            if(privilegedArchitecture >= PrivilegedArchitecture.Priv1_10 && IsValidInterruptOnlyInV1_09(number) && value)
             {
                 this.Log(LogLevel.Warning, "Interrupt {0} not supported since Privileged ISA v1.10", (IrqType)number);
                 return;
@@ -206,6 +267,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             // we know that the size is correct so the below method will alwyas succeed
             Misc.TryParseBitPattern(pattern, out var bitPattern, out var bitMask);
 
+            CheckCustomInstructionLengthPattern(bitPattern, pattern.Length);
+
             var length = (ulong)pattern.Length / 8;
             var id = TlibInstallCustomInstruction(bitMask, bitPattern, length);
             if(id == 0)
@@ -268,6 +331,20 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             postGprAccessHooks[registerIndex] = callback;
             TlibEnablePostGprAccessHookOn(registerIndex, value);
+        }
+
+        public void RegisterLocalInterruptController(CoreLocalInterruptController clic)
+        {
+            if(this.clic != null)
+            {
+                throw new ArgumentException($"{nameof(CoreLocalInterruptController)} is already registered");
+            }
+            this.clic = clic;
+        }
+
+        public void ClicPresentInterrupt(int index, bool vectored, int level, PrivilegeLevel mode)
+        {
+            TlibSetClicInterruptState(index, vectored ? 1u : 0, (uint)level, (uint)mode);
         }
 
         public CSRValidationLevel CSRValidation
@@ -506,6 +583,32 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected abstract byte MostSignificantBit { get; }
 
+        private static void ReportInvalidCustomInstructionFormat(ulong pattern, int bitsLength, string format)
+        {
+            throw new RecoverableException($"Pattern 0x{pattern:X} is invalid for {bitsLength} bits long instruction. Expected instruction in format: {format}");
+        }
+
+        // These patterns are defined in RISC-V User-Level ISA V2.2, section 1.2 Instruction Length Encoding
+        // there are more, but we support only 16, 32 and 64 bit long custom instructions
+        private static void CheckCustomInstructionLengthPattern(ulong pattern, int bitLength)
+        {
+            if(bitLength == 16 && ((pattern & 0b11) == 0b11))
+            {
+                ReportInvalidCustomInstructionFormat(pattern, bitLength, "AA".PadLeft(bitLength, 'x') + ", AA != 11");
+            }
+            else if(bitLength == 32 && (
+                ((pattern & 0b11) != 0b11) ||
+                ((pattern & 0b11100) == 0b11100))
+            )
+            {
+                ReportInvalidCustomInstructionFormat(pattern, bitLength, "BBB11".PadLeft(bitLength, 'x') + ", BBB != 111");
+            }
+            else if(bitLength == 64 && ((pattern & 0b1111111) != 0b0111111))
+            {
+                ReportInvalidCustomInstructionFormat(pattern, bitLength, "0111111".PadLeft(bitLength, 'x'));
+            }
+        }
+
         private void EnableArchitectureVariants()
         {
             foreach(var @set in architectureDecoder.InstructionSets)
@@ -539,7 +642,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 TlibAllowAdditionalFeature((uint)set);
             }
 
-            TlibSetPrivilegeArchitecture((int)privilegeArchitecture);
+            TlibSetPrivilegeArchitecture((int)privilegedArchitecture);
         }
 
         private bool TrySetVectorRegister(uint registerNumber, RegisterValue value)
@@ -600,6 +703,33 @@ namespace Antmicro.Renode.Peripherals.CPU
                 this.Log(LogLevel.Noisy, "Non maskable interrupts disabled");
                 TlibSetNmiVector(0, 0);
             }
+        }
+
+        private IIndirectCSRPeripheral GetIndirectCsrPeripheral(uint iselect)
+        {
+            return indirectCsrPeripherals.SingleOrDefault(p => p.Key.Range.Contains(iselect)).Value;
+        }
+
+        private uint ReadIndirectCSR(uint iselect, uint ireg)
+        {
+            var peripheral = GetIndirectCsrPeripheral(iselect);
+            if(peripheral == null)
+            {
+                this.WarningLog("Unknown indirect CSR 0x{0:x}", iselect);
+                return 0;
+            }
+            return peripheral.ReadIndirectCSR(iselect - (uint)GetRegistrationPoints(peripheral).Single().Range.StartAddress, ireg);
+        }
+
+        private void WriteIndirectCSR(uint iselect, uint ireg, uint value)
+        {
+            var peripheral = GetIndirectCsrPeripheral(iselect);
+            if(peripheral == null)
+            {
+                this.WarningLog("Unknown indirect CSR 0x{0:x}", iselect);
+                return;
+            }
+            peripheral.WriteIndirectCSR(iselect - (uint)GetRegistrationPoints(peripheral).Single().Range.StartAddress, ireg, value);
         }
 
         [Export]
@@ -690,17 +820,43 @@ namespace Antmicro.Renode.Peripherals.CPU
             postGprAccessHooks[(int)registerIndex].Invoke(isWrite);
         }
 
+        [Export]
+        private void ClicClearEdgeInterrupt()
+        {
+            if(clic == null)
+            {
+                this.ErrorLog("Attempting to clear CLIC edge interrupt, but there is no CLIC peripheral connected to this core.");
+                return;
+            }
+            clic.ClearEdgeInterrupt();
+        }
+
+        [Export]
+        private void ClicAcknowledgeInterrupt()
+        {
+            if(clic == null)
+            {
+                this.ErrorLog("Attempting to acknowledge CLIC interrupt, but there is no CLIC peripheral connected to this core.");
+                return;
+            }
+            clic.AcknowledgeInterrupt();
+        }
+
         public readonly Dictionary<int, ICFU> ChildCollection;
 
         private ulong? nmiVectorAddress;
         private uint? nmiVectorLength;
+        private uint miselectValue;
+        private uint siselectValue;
+
+        private CoreLocalInterruptController clic;
 
         private bool pcWrittenFlag;
         private ulong resetVector = DefaultResetVector;
 
         private readonly IRiscVTimeProvider timeProvider;
 
-        private readonly PrivilegeArchitecture privilegeArchitecture;
+        private readonly PrivilegedArchitecture privilegedArchitecture;
 
         private readonly Dictionary<ulong, NonstandardCSR> nonstandardCSR;
 
@@ -711,6 +867,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         private List<GDBFeatureDescriptor> gdbFeatures = new List<GDBFeatureDescriptor>();
 
         private readonly ArchitectureDecoder architectureDecoder;
+
+        private readonly Dictionary<BusRangeRegistration, IIndirectCSRPeripheral> indirectCsrPeripherals;
 
         [Constructor]
         private readonly List<Action<ulong>> postOpcodeExecutionHooks;
@@ -748,9 +906,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private ActionUInt32 TlibSetNapotGrain;
 
         [Import]
-        private FuncUInt64UInt64UInt64UInt64 TlibInstallCustomInstruction;
-        [Import(Name="tlib_install_custom_csr")]
+        private ActionUInt32 TlibSetPmpaddrBits;
 
+        [Import]
+        private FuncUInt64UInt64UInt64UInt64 TlibInstallCustomInstruction;
+
+        [Import(Name="tlib_install_custom_csr")]
         private FuncInt32UInt64 TlibInstallCustomCSR;
 
         [Import]
@@ -804,6 +965,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Import]
         private ActionUInt32UInt32 TlibEnablePostGprAccessHookOn;
 
+        [Import]
+        private ActionInt32UInt32UInt32UInt32 TlibSetClicInterruptState;
+
 #pragma warning restore 649
 
         private readonly Dictionary<ulong, string> InterruptDescriptionsMap = new Dictionary<ulong, string>
@@ -834,12 +998,18 @@ namespace Antmicro.Renode.Peripherals.CPU
             {15, "Store page fault"}
         };
 
-        public enum PrivilegeArchitecture
+        [NameAlias("PrivilegeArchitecture")]
+        public enum PrivilegedArchitecture
         {
             Priv1_09,
             Priv1_10,
             Priv1_11,
             Priv1_12,
+            /* Keep last.
+             * For features that are not yet part of a ratified privileged specification.
+             * As new specs become ratified, we should substitute uses of Unratified to the new spec value.
+             */
+            PrivUnratified
         }
 
         /* The enabled instruction sets are exposed via a register. Each instruction bit is represented
@@ -869,6 +1039,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             ICSR = 0x5 << AdditionalExtensionOffset,
             IFENCEI = 0x6 << AdditionalExtensionOffset,
             ZFH = 0x7 << AdditionalExtensionOffset,
+            SMEPMP = 0x8 << AdditionalExtensionOffset,
         }
 
         public enum InterruptMode
@@ -878,6 +1049,13 @@ namespace Antmicro.Renode.Peripherals.CPU
             Auto = 0,
             Direct = 1,
             Vectored = 2
+        }
+
+        public enum PrivilegeLevels
+        {
+            Machine,
+            MachineUser,
+            MachineSupervisorUser,
         }
 
         protected void BeforeVectorExtensionRegisterRead()
@@ -903,7 +1081,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private class ArchitectureDecoder
         {
-            public ArchitectureDecoder(IMachine machine, BaseRiscV parent, string architectureString)
+            public ArchitectureDecoder(IMachine machine, BaseRiscV parent, string architectureString, PrivilegeLevels privilegeLevels)
             {
                 this.parent = parent;
                 this.machine = machine;
@@ -911,6 +1089,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 standardExtensions = new List<StandardInstructionSetExtensions>();
 
                 Decode(architectureString);
+                DecodePrivilegeLevels(privilegeLevels);
             }
 
             public IEnumerable<InstructionSet> InstructionSets
@@ -951,11 +1130,15 @@ namespace Antmicro.Renode.Peripherals.CPU
                         case 'F': instructionSets.Add(InstructionSet.F); break;
                         case 'D': instructionSets.Add(InstructionSet.D); break;
                         case 'C': instructionSets.Add(InstructionSet.C); break;
-                        case 'S': instructionSets.Add(InstructionSet.S); break;
-                        case 'U': instructionSets.Add(InstructionSet.U); break;
                         case 'V': instructionSets.Add(InstructionSet.V); break;
                         case 'B': instructionSets.Add(InstructionSet.B); break;
                         case 'G': instructionSets.Add(InstructionSet.G); break;
+                        case 'S':
+                        case 'U':
+                            parent.WarningLog("Enabling privilege level extension '{0}' using 'cpuType' is not supported. " +
+                                "Privilege levels should be specified using the 'privilegeLevels' constructor parameter. " +
+                                "Extension will not be enabled", set);
+                            break;
                         default:
                             throw new ConstructionException($"Undefined instruction set: {set}.");
                     }
@@ -981,6 +1164,16 @@ namespace Antmicro.Renode.Peripherals.CPU
                                 throw new ConstructionException($"Undefined instruction set standard extension: {set}.");
                         }
                     }
+                    // supervisor extensions
+                    else if(extension.StartsWith("S"))
+                    {
+                        switch(extension.Substring(1))
+                        {
+                            case "MEPMP": standardExtensions.Add(StandardInstructionSetExtensions.SMEPMP); break;
+                            default:
+                                throw new ConstructionException($"Undefined supervisor instruction set extension: {extension}.");
+                        }
+                    }
                     // custom extesions
                     else if(extension.StartsWith("X"))
                     {
@@ -999,7 +1192,25 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
             }
 
-            private IList<StandardInstructionSetExtensions> standardExtensions;
+            private void DecodePrivilegeLevels(PrivilegeLevels privilegeLevels)
+            {
+                switch(privilegeLevels)
+                {
+                    case PrivilegeLevels.Machine:
+                        break; // Nothing to do
+                    case PrivilegeLevels.MachineUser:
+                        instructionSets.Add(InstructionSet.U);
+                        break;
+                    case PrivilegeLevels.MachineSupervisorUser:
+                        instructionSets.Add(InstructionSet.S);
+                        instructionSets.Add(InstructionSet.U);
+                        break;
+                    default:
+                        throw new Exception("Unreachable");
+                }
+            }
+
+            private readonly IList<StandardInstructionSetExtensions> standardExtensions;
             private readonly IList<InstructionSet> instructionSets;
             private readonly BaseRiscV parent;
             private readonly IMachine machine;
@@ -1082,6 +1293,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             SupervisorExternalInterrupt = 0x9,
             HypervisorExternalInterrupt = 0xa,
             MachineExternalInterrupt = 0xb
+        }
+
+        protected enum StandardCSR
+        {
+            Siselect = 0x150,
+            Sireg = 0x151, // sireg, sireg2, ..., sireg6 (0x156)
+            Miselect = 0x350,
+            Mireg = 0x351, // mireg, mireg2, ..., mireg6 (0x356)
         }
     }
 }

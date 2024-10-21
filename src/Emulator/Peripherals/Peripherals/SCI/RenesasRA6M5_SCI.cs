@@ -256,6 +256,40 @@ namespace Antmicro.Renode.Peripherals.SCI
 
         private void SetPeripheralMode()
         {
+            if(smartCardMode.Value)
+            {
+                peripheralMode = PeripheralMode.SmartCardInterface;
+                if(i2cMode.Value)
+                {
+                    this.Log(LogLevel.Warning,
+                        "The IICM flag in the {0} register (SIMR1) should be unset for Smart Card Interface mode; it's set",
+                        nameof(Registers.IICMode1)
+                    );
+                }
+                return;
+            }
+
+            if(i2cMode.Value)
+            {
+                peripheralMode = PeripheralMode.IIC;
+                if(nonSmartCommunicationMode.Value != CommunicationMode.AsynchOrSimpleIIC)
+                {
+                    this.Log(LogLevel.Warning,
+                        "The CM flag in the {0} register (SMR) should be unset ({1}) for Simple I2C mode; it's set ({2})",
+                        nameof(Registers.SerialModeNonSmartCard), CommunicationMode.AsynchOrSimpleIIC, CommunicationMode.SynchOrSimpleSPI
+                    );
+                }
+
+                if(dataTransferDirection.Value != DataTransferDirection.MSBFirst)
+                {
+                    this.Log(LogLevel.Warning,
+                        "The SDIR flag in the {0} should be set ({1}) for Simple I2Cmode; it's unset ({2})",
+                        nameof(Registers.SmartCardMode), DataTransferDirection.MSBFirst, DataTransferDirection.LSBFirst
+                    );
+                }
+                return;
+            }
+
             switch(nonSmartCommunicationMode.Value)
             {
                 case CommunicationMode.AsynchOrSimpleIIC:
@@ -452,11 +486,12 @@ namespace Antmicro.Renode.Peripherals.SCI
                 .WithFlag(0, out smartCardMode, name: "SMIF")
                 .WithReservedBits(1, 1)
                 .WithTaggedFlag("SINV", 2)
-                .WithTaggedFlag("SDIR", 3)
+                .WithEnumField(3, 1, out dataTransferDirection, name: "SDIR")
                 .WithTaggedFlag("CHR1", 4)
                 .WithReservedBits(5, 2)
                 .WithTaggedFlag("BCP2", 7)
-                .WithReservedBits(8, 8);
+                .WithReservedBits(8, 8)
+                .WithChangeCallback((_, __) => SetPeripheralMode());
 
             Registers.SerialExtendedMode.Define(this)
                 .WithTaggedFlag("ACS0", 0)
@@ -474,7 +509,7 @@ namespace Antmicro.Renode.Peripherals.SCI
                 .WithReservedBits(3, 13);
 
             Registers.IICMode1.Define(this)
-                .WithTaggedFlag("IICM", 0)
+                .WithFlag(0, out i2cMode, changeCallback: (_, __) => SetPeripheralMode(), name: "IICM")
                 .WithReservedBits(1, 2)
                 .WithTag("IICDL", 3, 5)
                 .WithReservedBits(8, 8);
@@ -558,6 +593,7 @@ namespace Antmicro.Renode.Peripherals.SCI
 
             if(enableFIFO)
             {
+                // TransmitFIFODataLowByte (below) is an 8-bits wide window of this register
                 Registers.TransmitFIFOData.DefineConditional(this, () => fifoMode, 0xff)
                     .WithValueField(0, 9, FieldMode.Write, name: "TDAT",
                         writeCallback: (_, val) =>
@@ -569,6 +605,17 @@ namespace Antmicro.Renode.Peripherals.SCI
                         })
                     .WithTaggedFlag("MPBT", 9)
                     .WithReservedBits(10, 6);
+
+                // this is the upper 8-bits of transmitFIFOData register
+                Registers.TransmitFIFODataLowByte.DefineConditional(this, () => fifoMode, 0xff)
+                    .WithValueField(0, 8, FieldMode.Write, name: "TDATL",
+                        writeCallback: (_, val) =>
+                        {
+                            TransmitUARTData((byte)val);
+                            transmitFIFOEmpty.Value = true;
+                            UpdateInterrupts();
+                        })
+                    .WithReservedBits(9, 7);
             }
 
             Registers.ReceiveDataNonManchesterMode.DefineConditional(this, () => !manchesterMode && !fifoMode)
@@ -623,7 +670,7 @@ namespace Antmicro.Renode.Peripherals.SCI
                     .WithFlag(0, name: "FM",
                         writeCallback: (_, val) => fifoMode = val,
                         valueProviderCallback: _ => fifoMode)
-                    .WithFlag(1, name: "RFRST",
+                    .WithFlag(1, FieldMode.Read | FieldMode.WriteOneToClear, name: "RFRST",
                         writeCallback: (_, __) =>
                         {
                             if(fifoMode)
@@ -959,9 +1006,11 @@ namespace Antmicro.Renode.Peripherals.SCI
         private IFlagRegisterField smartCardMode;
         private IFlagRegisterField transmitFIFOEmpty;
         private IFlagRegisterField conditionCompletedFlag;
+        private IFlagRegisterField i2cMode;
         private IValueRegisterField receiveFIFOTriggerCount;
         private IValueRegisterField bitRate;
         private IValueRegisterField clockSource;
+        private IEnumRegisterField<DataTransferDirection> dataTransferDirection;
         private IEnumRegisterField<CommunicationMode> nonSmartCommunicationMode;
 
 
@@ -970,6 +1019,12 @@ namespace Antmicro.Renode.Peripherals.SCI
         private const int IICReadBufferCount = 24;
         // This byte is used to trigger reception on IIC bus. It should not be transmitted
         private const byte DummyTransmitByte = 0xFF;
+
+        private enum DataTransferDirection
+        {
+            LSBFirst = 0,
+            MSBFirst = 1,
+        }
 
         private enum IICCondition
         {
@@ -1002,68 +1057,70 @@ namespace Antmicro.Renode.Peripherals.SCI
             UART,
             SPI,
             IIC,
+            SmartCardInterface,
         }
 
         private enum Registers
         {
-            SerialModeNonSmartCard = 0x00,
-            SerialModeSmartCard = 0x00,
-            BitRate = 0x01,
-            SerialControlNonSmartCard = 0x02,
-            SerialControlSmartCard = 0x02,
-            TransmitData = 0x03,
-            SerialStatusNonSmartCardNonFIFO = 0x04,
-            SerialStatusNonSmartCardFIFO = 0x04,
-            SerialStatusSmartCard = 0x04,
-            SerialStatusManchesterMode = 0x04,
-            ReceiveData = 0x05,
-            SmartCardMode = 0x06,
-            SerialExtendedMode = 0x07,
-            NoiseFilterSetting = 0x08,
-            IICMode1 = 0x09,
-            IICMode2 = 0x0A,
-            IICMode3 = 0x0B,
-            IICStatus = 0x0C,
-            SPIMode = 0x0D,
-            TransmitDataNonManchesterMode = 0xE,
-            TransmitDataManchesterMode = 0xE,
-            TransmitFIFOData = 0xE,
-            ReceiveDataNonManchesterMode = 0x10,
-            ReceiveDataManchesterMode = 0x10,
-            ReceiveFIFOData = 0x10,
-            ModulationDuty = 0x12,
-            DataCompareMatchControl = 0x13,
-            FIFOControl = 0x14,
-            FIFODataCount = 0x16,
-            LineStatus = 0x18,
-            CompareMatchData = 0x1A,
-            SerialPort = 0x1C,
-            AdjustmentCommunicationTiming = 0x1D,
-            ExtendedSerialModuleEnable = 0x20,
-            ManchesterMode = 0x20,
-            Control0 = 0x21,
-            Control1 = 0x22,
-            TransmitManchesterPrefaceSetting = 0x22,
-            Control2 = 0x23,
-            ReceiveManchesterPrefaceSetting = 0x23,
-            Control3 = 0x24,
-            ManchesterExtendedErrorStatus = 0x24,
-            PortControl = 0x25,
-            ManchesterExtendedErrorControl = 0x25,
-            InterruptControl = 0x26,
-            Status = 0x27,
-            StatusClear = 0x28,
-            ControlField0Data = 0x29,
-            ControlField0CompareEnable = 0x2A,
-            ControlField0RecieveData = 0x2B,
-            PrimaryControlField1Data = 0x2C,
-            SecondaryControlField1Data = 0x2D,
-            ControlField1CompareEnable = 0x2E,
-            ControlField1ReceiveData = 0x2F,
-            TimerControl = 0x30,
-            TimerMode = 0x31,
-            TimerPrescaler = 0x32,
-            TimerCount = 0x33,
+            SerialModeNonSmartCard = 0x00,  // SMR
+            SerialModeSmartCard = 0x00,  // SMR_SMCI
+            BitRate = 0x01,  // BRR
+            SerialControlNonSmartCard = 0x02,  // SCR
+            SerialControlSmartCard = 0x02,  // SCR_SMCI
+            TransmitData = 0x03,  // TDR
+            SerialStatusNonSmartCardNonFIFO = 0x04,  // SSR
+            SerialStatusNonSmartCardFIFO = 0x04,  // SSR_FIFO
+            SerialStatusSmartCard = 0x04,  // SSR_SMCI
+            SerialStatusManchesterMode = 0x04,  // SSR_MANC
+            ReceiveData = 0x05,  // RDR
+            SmartCardMode = 0x06,  // SCMR
+            SerialExtendedMode = 0x07,  // SEMR
+            NoiseFilterSetting = 0x08,  // SNFR
+            IICMode1 = 0x09,  // SIMR1
+            IICMode2 = 0x0A,  // SIMR2
+            IICMode3 = 0x0B,  // SIMR3
+            IICStatus = 0x0C,  // SISR
+            SPIMode = 0x0D,  // SPMR
+            TransmitDataNonManchesterMode = 0xE,  // TDRHL
+            TransmitDataManchesterMode = 0xE,  // TDRHL_MAN
+            TransmitFIFOData = 0xE,  // FTDRHL
+            TransmitFIFODataLowByte = 0xF,  // FTDRL
+            ReceiveDataNonManchesterMode = 0x10,  // RDRHL
+            ReceiveDataManchesterMode = 0x10,  // RDRHL_MAN
+            ReceiveFIFOData = 0x10,  // FRDRHL
+            ModulationDuty = 0x12,  // MDDR
+            DataCompareMatchControl = 0x13,  // DCCR
+            FIFOControl = 0x14,  // FCR
+            FIFODataCount = 0x16,  // FDR
+            LineStatus = 0x18,  // LSR
+            CompareMatchData = 0x1A,  // CDR
+            SerialPort = 0x1C,  // SPTR
+            AdjustmentCommunicationTiming = 0x1D,  // ACTR
+            ExtendedSerialModuleEnable = 0x20,  // ESMER
+            ManchesterMode = 0x20,  // MMR
+            Control0 = 0x21,  // CR0
+            Control1 = 0x22,  // CR1
+            TransmitManchesterPrefaceSetting = 0x22,  // TMPR
+            Control2 = 0x23,  // CR2
+            ReceiveManchesterPrefaceSetting = 0x23,  // RMPR
+            Control3 = 0x24,  // CR3
+            ManchesterExtendedErrorStatus = 0x24,  // MESR
+            PortControl = 0x25,  // PCR
+            ManchesterExtendedErrorControl = 0x25,  // MECR
+            InterruptControl = 0x26,  // ICR
+            Status = 0x27,  // STR
+            StatusClear = 0x28,  // STCR
+            ControlField0Data = 0x29,  // CF0DR
+            ControlField0CompareEnable = 0x2A,  // CF0CR
+            ControlField0RecieveData = 0x2B,  // CF0RR
+            PrimaryControlField1Data = 0x2C,  // PCF1DR
+            SecondaryControlField1Data = 0x2D,  // SCF1DR
+            ControlField1CompareEnable = 0x2E,  // CF1CR
+            ControlField1ReceiveData = 0x2F,  // CF1RR
+            TimerControl = 0x30,  // TCR
+            TimerMode = 0x31,  // TMR
+            TimerPrescaler = 0x32,  // TPRE
+            TimerCount = 0x33,  // TCNT
         }
     }
 }

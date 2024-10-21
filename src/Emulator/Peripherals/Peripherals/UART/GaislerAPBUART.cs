@@ -32,8 +32,14 @@ namespace Antmicro.Renode.Peripherals.UART
                 this.Log(LogLevel.Warning, "Received byte 0x{0:X}, but the receiver is not enabled, dropping.", value);
                 return;
             }
+
+            if(receiveFifo.Count == fifoDepth)
+            {
+                this.Log(LogLevel.Debug, "Received data that would overflow the FIFO capacity. Enqueuing anyway.");
+            }
+
             receiveFifo.Enqueue(value);
-            UpdateInterrupt();
+            UpdateInterrupt(rxFinished: true);
         }
 
         public override void Reset()
@@ -90,31 +96,32 @@ namespace Antmicro.Renode.Peripherals.UART
                             this.Log(LogLevel.Warning, "Tried to transmit byte 0x{0:X}, but the transmitter is not enabled. dropping.", value);
                             return;
                         }
+
                         CharReceived?.Invoke((byte)value);
-                        UpdateInterrupt();
+                        UpdateInterrupt(txFinished: true);
                     }, name: "DATA"
                 )
                 .WithReservedBits(8, 24)
             ;
 
             Registers.Status.Define(this, 0x86, name: "STATUS")
-                .WithFlag(0, out dataReady, FieldMode.Read, valueProviderCallback: _ => receiveFifo.Count > 0, name: "DR")
-                .WithTaggedFlag("TS", 1)
-                .WithTaggedFlag("TE", 2)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => receiveFifo.Count > 0, name: "DR")
+                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => true, name: "TS")
+                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => true, name: "TE")
                 .WithTaggedFlag("BR", 3)
-                .WithTaggedFlag("OV", 4)
+                .WithFlag(4, valueProviderCallback: _ => false, name: "OV")
                 .WithTaggedFlag("PE", 5)
                 .WithTaggedFlag("FE", 6)
-                .WithTaggedFlag("TH", 7)
-                .WithTaggedFlag("RH", 8)
-                .WithTaggedFlag("TF", 9)
-                .WithTaggedFlag("RF", 10)
+                .WithFlag(7, FieldMode.Read, valueProviderCallback: _ => TxHalfEmpty, name: "TH")
+                .WithFlag(8, FieldMode.Read, valueProviderCallback: _ => RxHalfFull, name: "RH")
+                .WithFlag(9, FieldMode.Read, valueProviderCallback: _ => false, name: "TF")
+                .WithFlag(10, FieldMode.Read, valueProviderCallback: _ => receiveFifo.Count >= fifoDepth, name: "RF")
                 .WithReservedBits(11, 9)
-                .WithTag("TCNT", 20, 6)
+                .WithValueField(20, 6, FieldMode.Read, valueProviderCallback: _ => 0, name: "TCNT")
                 .WithValueField(26, 6, FieldMode.Read, valueProviderCallback: _ => (ulong) Math.Min(receiveFifo.Count, fifoDepth), name: "RCNT")
             ;
 
-            Registers.Control.Define(this, 0x80000000, name: "CONTROL")
+            Registers.Control.Define(this, name: "CONTROL")
                 .WithFlag(0, out receiverEnable, name: "RE")
                 .WithFlag(1, out transmitterEnable, name: "TE")
                 .WithFlag(2, out receiverInterruptEnable, name: "RI", softResettable: false)
@@ -122,7 +129,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithEnumField(4, 1, out paritySelect, name: "PS", softResettable: false)
                 .WithFlag(5, out parityEnable, name: "PE", softResettable: false)
                 .WithTaggedFlag("FL", 6)
-                .WithFlag(7, out loopBack, name: "LB", softResettable: false)
+                .WithFlag(7, name: "LB", softResettable: false)
                 .WithFlag(8, name: "EC", valueProviderCallback: _ => false, writeCallback: (_, value) =>
                         {
                             if(value)
@@ -132,12 +139,12 @@ namespace Antmicro.Renode.Peripherals.UART
                         })
                 .WithFlag(9,  out transmitterFifoInterruptEnable, name: "TF", softResettable: false)
                 .WithFlag(10, out receiverFifoInterruptEnable, name: "RF", softResettable: false)
-                .WithFlag(11, out fifoDebugModeEnable, name: "DB", softResettable: false)
-                .WithFlag(12, out breakInterruptEnable, name: "BI", softResettable: false)
-                .WithFlag(13, out delayedInterruptEnable, name: "DI", softResettable: false)
+                .WithFlag(11, name: "DB", softResettable: false)
+                .WithFlag(12, name: "BI", softResettable: false)
+                .WithFlag(13, name: "DI", softResettable: false)
                 .WithFlag(14, out transmitterShiftRegisterEmptyInterruptEnable, name: "SI", softResettable: false)
                 .WithReservedBits(15, 16)
-                .WithTaggedFlag("FA", 31)
+                .WithFlag(31, FieldMode.Read, valueProviderCallback: _ => true, name: "FA")
                 .WithChangeCallback((_, __) => UpdateInterrupt())
             ;
 
@@ -152,27 +159,30 @@ namespace Antmicro.Renode.Peripherals.UART
             ;
         }
 
-        private void UpdateInterrupt()
+        private void UpdateInterrupt(bool rxFinished = false, bool txFinished = false)
         {
-            if(receiveFifo.Count > 0 && receiverInterruptEnable.Value || transmitterInterruptEnable.Value)
+            var txFifoIrq = TxHalfEmpty && transmitterFifoInterruptEnable.Value && transmitterEnable.Value;
+            var rxFifoIrq = RxHalfFull && receiverFifoInterruptEnable.Value && receiverInterruptEnable.Value;
+            var irq = txFifoIrq || rxFifoIrq;
+            this.Log(LogLevel.Noisy, "IRQ {0} (tx fifo {1}, rx fifo {2})", irq, txFifoIrq, rxFifoIrq);
+            IRQ.Set(irq);
+
+            var rxIrq = rxFinished && receiverInterruptEnable.Value;
+            var txIrq = txFinished && (transmitterInterruptEnable.Value || transmitterShiftRegisterEmptyInterruptEnable.Value);
+            if(!irq && (rxIrq || txIrq))
             {
+                this.Log(LogLevel.Noisy, "IRQ blink (rx {0}, tx {1})", rxIrq, txIrq);
                 IRQ.Blink();
-            }
-            else
-            {
-                IRQ.Set(transmitterFifoInterruptEnable.Value && transmitterEnable.Value);
             }
         }
 
-        private IFlagRegisterField dataReady;
+        private bool TxHalfEmpty => true;
+        private bool RxHalfFull => receiveFifo.Count > (fifoDepth - 1) / 2;
+
         private IFlagRegisterField transmitterEnable;
         private IFlagRegisterField receiverEnable;
-        private IFlagRegisterField loopBack;
         private IFlagRegisterField transmitterFifoInterruptEnable;
         private IFlagRegisterField receiverFifoInterruptEnable;
-        private IFlagRegisterField fifoDebugModeEnable;
-        private IFlagRegisterField breakInterruptEnable;
-        private IFlagRegisterField delayedInterruptEnable;
         private IFlagRegisterField transmitterShiftRegisterEmptyInterruptEnable;
         private IFlagRegisterField transmitterInterruptEnable;
         private IFlagRegisterField receiverInterruptEnable;
@@ -185,7 +195,7 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private readonly Queue<byte> receiveFifo = new Queue<byte>();
 
-        private const uint vendorID = 0x01;  // Aeroflex Gaisler
+        private const uint vendorID = 0x01; // Aeroflex Gaisler
         private const uint deviceID = 0x0c; // GRLIB APBUART
 
         private enum ParitySelect

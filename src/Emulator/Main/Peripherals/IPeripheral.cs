@@ -5,12 +5,14 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-using Antmicro.Renode.Core;
-using System.Linq;
-using System.Collections.Generic;
 using System;
-using Antmicro.Renode.UserInterface;
+using System.Collections.Generic;
+using System.Linq;
+using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.UserInterface;
+
 using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals
@@ -48,16 +50,42 @@ namespace Antmicro.Renode.Peripherals
 
         public static bool TryGetMachine(this IPeripheral @this, out IMachine machine)
         {
-            return EmulationManager.Instance.CurrentEmulation.TryGetMachineForPeripheral(@this, out machine);
+            if(EmulationManager.Instance.CurrentEmulation.TryGetMachineForPeripheral(@this, out machine))
+            {
+                return true;
+            }
+
+            // let's try a fallback:
+            // check if the provided object is not a container of peripherals -
+            // in such case if and only if all peripherals belong to the same machine we can return it
+            var simpleContainer = @this as ISimpleContainer;
+            if(simpleContainer != null)
+            {
+                try
+                {
+                    var allMachines = simpleContainer.ChildCollection.Select(x => x.Value.GetMachine()).Distinct().ToArray();
+                    if(allMachines.Length == 1)
+                    {
+                        machine = allMachines[0];
+                        return true;
+                    }
+                }
+                catch(Exception)
+                {
+                    // the try/catch here is to obtain a more readable stack trace;
+                    // do nothing, we'll throw in a second anyway
+                }
+            }
+            return false;
         }
 
         public static IMachine GetMachine(this IPeripheral @this)
         {
-            if(!@this.TryGetMachine(out var machine))
+            if(@this.TryGetMachine(out var machine))
             {
-                throw new ArgumentException($"Couldn't find machine for given peripheral of type {@this.GetType().FullName}.");
+                return machine;
             }
-            return machine;
+            throw new ArgumentException($"Couldn't find machine for a given peripheral of type {@this.GetType().FullName}.");
         }
 
         public static Endianess GetEndianness(this IPeripheral @this, Endianess? defaultEndianness = null)

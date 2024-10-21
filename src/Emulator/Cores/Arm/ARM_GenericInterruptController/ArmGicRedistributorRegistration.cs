@@ -5,16 +5,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
-using System.Linq;
-using Antmicro.Renode.Core;
-using Antmicro.Renode.Logging;
-using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals.Bus;
-using Antmicro.Renode.Core.Structure.Registers;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.IRQControllers.ARM_GenericInterruptControllerModel;
 
@@ -22,7 +14,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 {
     public class ArmGicRedistributorRegistration : BusParametrizedRegistration
     {
-        public ArmGicRedistributorRegistration(IARMSingleSecurityStateCPU attachedCPU, ulong address, ICPU visibleTo = null) : base(address, 0x20000, visibleTo)
+        public ArmGicRedistributorRegistration(IARMSingleSecurityStateCPU attachedCPU, ulong address, ICPU visibleTo = null, ICluster<ICPU> visibleToCluster = null) : base(address, 0x20000, visibleTo, visibleToCluster)
         {
             Cpu = attachedCPU;
         }
@@ -115,6 +107,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             };
         }
 
+        public override void RegisterForEachContext(Action<BusParametrizedRegistration> register)
+        {
+            RegisterForEachContextInner(register, visibleTo => new ArmGicRedistributorRegistration(Cpu, Range.StartAddress, visibleTo));
+        }
+
         private void GetGICAndCPUEntry(IBusPeripheral peripheral, out ARM_GenericInterruptController gic, out ARM_GenericInterruptController.CPUEntry entry)
         {
             gic = peripheral as ARM_GenericInterruptController;
@@ -128,7 +125,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
             if(!gic.TryGetCPUEntryForCPU(Cpu, out entry))
             {
-                throw new RegistrationException($"Couldn't register redistributor for CPU {Cpu.Id} because the CPU isn't attached to this GIC");
+                throw new RegistrationException($"Couldn't register redistributor for CPU because the CPU isn't attached to this GIC: {Cpu.GetName()}");
             }
         }
 

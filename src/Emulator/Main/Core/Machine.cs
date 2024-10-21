@@ -58,10 +58,10 @@ namespace Antmicro.Renode.Core
             SetLocalName(SystemBus, SystemBusName);
             gdbStubs = new Dictionary<int, GdbStub>();
 
-            invalidatedAddressesById = new Dictionary<uint, List<long>>();
+            invalidatedAddressesByCpu = new Dictionary<ICPU, List<long>>();
             invalidatedAddressesByArchitecture = new Dictionary<string, List<long>>();
             invalidatedAddressesLock = new object();
-            firstUnbroadcastedDirtyAddressIndex = new Dictionary<uint, int>();
+            firstUnbroadcastedDirtyAddressIndex = new Dictionary<ICPU, int>();
 
             if(createLocalTimeSource)
             {
@@ -194,7 +194,8 @@ namespace Antmicro.Renode.Core
         public void UnregisterFromParent(IPeripheral peripheral)
         {
             InnerUnregisterFromParent(peripheral);
-            OnMachinePeripheralsChanged(peripheral, PeripheralsChangedEventArgs.PeripheralChangeType.CompleteRemoval);
+            var operation = PeripheralsChangedEventArgs.PeripheralChangeType.CompleteRemoval;
+            PeripheralsChanged?.Invoke(this, PeripheralsChangedEventArgs.Create(peripheral, operation));
         }
 
         public IEnumerable<T> GetPeripheralsOfType<T>()
@@ -303,12 +304,8 @@ namespace Antmicro.Renode.Core
                 }
                 localNames[peripheral] = name;
             }
-
-            var pc = PeripheralsChanged;
-            if(pc != null)
-            {
-                pc(this, new PeripheralsChangedEventArgs(peripheral, PeripheralsChangedEventArgs.PeripheralChangeType.NameChanged));
-            }
+            var operation = PeripheralsChangedEventArgs.PeripheralChangeType.NameChanged;
+            PeripheralsChanged?.Invoke(this, PeripheralsChangedEventArgs.Create(peripheral, operation));
         }
 
         public IEnumerable<string> GetAllNames()
@@ -426,7 +423,9 @@ namespace Antmicro.Renode.Core
             });
         }
 
-        public void Start()
+        /// <param name="startFilter">A function to test each own life whether it should be started along with the machine.
+        /// Useful when unpausing the machine but we don't want to unpause what's already been paused before.</param>
+        private void Start(Func<IHasOwnLife, bool> startFilter)
         {
             lock(pausingSync)
             {
@@ -440,8 +439,11 @@ namespace Antmicro.Renode.Core
                 }
                 foreach(var ownLife in ownLifes.OrderBy(x => x is ICPU ? 1 : 0))
                 {
-                    this.NoisyLog("Starting {0}.", GetNameForOwnLife(ownLife));
-                    ownLife.Start();
+                    if(startFilter(ownLife))
+                    {
+                        this.NoisyLog("Starting {0}.", GetNameForOwnLife(ownLife));
+                        ownLife.Start();
+                    }
                 }
                 (LocalTimeSource as SlaveTimeSource)?.Resume();
                 this.Log(LogLevel.Info, "Machine started.");
@@ -452,6 +454,11 @@ namespace Antmicro.Renode.Core
                     machineStarted(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Started));
                 }
             }
+        }
+
+        public void Start()
+        {
+            Start(_ => true);
         }
 
         public void Pause()
@@ -839,38 +846,38 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        public long[] GetNewDirtyAddressesForCore(uint id)
+        public long[] GetNewDirtyAddressesForCore(ICPU cpu)
         {
-            if(!firstUnbroadcastedDirtyAddressIndex.ContainsKey(id))
+            if(!firstUnbroadcastedDirtyAddressIndex.ContainsKey(cpu))
             {
-                throw new RecoverableException($"No entries for a core with id {id}. Was the core registered properly?");
+                throw new RecoverableException($"No entries for a cpu: {cpu.GetName()}. Was the cpu registered properly?");
             }
 
             long[] newAddresses;
             lock(invalidatedAddressesLock)
             {
-                var firstUnsentIndex = firstUnbroadcastedDirtyAddressIndex[id];
-                var addressesCount = invalidatedAddressesById[id].Count - firstUnsentIndex;
-                newAddresses = invalidatedAddressesById[id].GetRange(firstUnsentIndex, addressesCount).ToArray();
-                firstUnbroadcastedDirtyAddressIndex[id] += addressesCount;
+                var firstUnsentIndex = firstUnbroadcastedDirtyAddressIndex[cpu];
+                var addressesCount = invalidatedAddressesByCpu[cpu].Count - firstUnsentIndex;
+                newAddresses = invalidatedAddressesByCpu[cpu].GetRange(firstUnsentIndex, addressesCount).ToArray();
+                firstUnbroadcastedDirtyAddressIndex[cpu] += addressesCount;
             }
             return newAddresses;
         }
 
-        public void AppendDirtyAddresses(uint cpuId, long[] addresses)
+        public void AppendDirtyAddresses(ICPU cpu, long[] addresses)
         {
-            if(!invalidatedAddressesById.ContainsKey(cpuId))
+            if(!invalidatedAddressesByCpu.ContainsKey(cpu))
             {
-                throw new RecoverableException($"Invalid cpuId: {cpuId}");
+                throw new RecoverableException($"Invalid cpu: {cpu.GetName()}");
             }
 
             lock(invalidatedAddressesLock)
             {
-                if(invalidatedAddressesById[cpuId].Count + addresses.Length > invalidatedAddressesById[cpuId].Capacity)
+                if(invalidatedAddressesByCpu[cpu].Count + addresses.Length > invalidatedAddressesByCpu[cpu].Capacity)
                 {
-                    TryReduceBroadcastedDirtyAddresses(cpuId);
+                    TryReduceBroadcastedDirtyAddresses(cpu);
                 }
-                invalidatedAddressesById[cpuId].AddRange(addresses);
+                invalidatedAddressesByCpu[cpu].AddRange(addresses);
             }
         }
 
@@ -950,55 +957,77 @@ namespace Antmicro.Renode.Core
             gdbStubs[port].LogsEnabled = enabled;
         }
 
-        public void StartGdbServer(int port, bool autostartEmulation)
+        public void StartGdbServer(int port, bool autostartEmulation = true, string cpuCluster = "")
         {
-            StartGdbServer(port, autostartEmulation, null);
-        }
-
-        public void StartGdbServer(int port, bool autostartEmulation = true, ICpuSupportingGdb cpu = null)
-        {
+            var cpus = SystemBus.GetCPUs().OfType<ICpuSupportingGdb>();
+            if(!cpus.Any())
+            {
+                throw new RecoverableException("Cannot start GDB server with no CPUs. Did you forget to load the platform description first?");
+            }
             try
             {
-                if(cpu == null)
+                // If all the CPUs are only of one architecture, implicitly allow to connect, without prompting about anything
+                if(cpus.Select(cpu => cpu.Model).Distinct().Count() <= 1)
                 {
-                    if(gdbStubs.ContainsKey(port))
+                    if(!String.IsNullOrEmpty(cpuCluster))
                     {
-                        throw new RecoverableException(string.Format("GDB server already started for this machine on port :{0}", port));
+                        this.Log(LogLevel.Warning, "{0} setting has no effect on non-heterogenous systems, and will be ignored", nameof(cpuCluster));
                     }
-                    var cpus = SystemBus.GetCPUs().Cast<ICpuSupportingGdb>();
-                    if(!cpus.Any())
-                    {
-                        throw new RecoverableException("Cannot start GDB server with no CPUs. Did you forget to load the platform description first?");
-                    }
-                    foreach(var c in cpus)
-                    {
-                        if(gdbStubs.Values.Any(x => x.IsCPUAttached(c)))
-                        {
-                            throw new RecoverableException("One or more CPUs already added to an existing GDB server");
-                        }
-                    }
-                    gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation));
+                    AddCpusToGdbStub(port, autostartEmulation, cpus);
                     this.Log(LogLevel.Info, "GDB server with all CPUs started on port :{0}", port);
-                    return;
-                }
-                if(gdbStubs.Values.Any(x => x.IsCPUAttached(cpu)))
-                {
-                    throw new RecoverableException(string.Format("CPU is already attached to a stub"));
-                }
-                if(gdbStubs.ContainsKey(port))
-                {
-                    gdbStubs[port].AttachCPU(cpu);
-                    this.Log(LogLevel.Info, "CPU was added to GDB server running on port :{0}", port);
                 }
                 else
                 {
-                    gdbStubs.Add(port, new GdbStub(this, new[] { cpu }, port, autostartEmulation));
-                    this.Log(LogLevel.Info, "CPU was added to new GDB server created on port :{0}", port);
+                    // It's not recommended to connect GDB to all CPUs in heterogeneous platforms
+                    // but let's permit this, if the user insists, with a log
+                    if(cpuCluster.ToLowerInvariant() == "all")
+                    {
+                        this.Log(LogLevel.Info, "Starting GDB server for CPUs of different architectures. Make sure, that your debugger supports this configuration");
+                        AddCpusToGdbStub(port, autostartEmulation, cpus);
+                        return;
+                    }
+
+                    // Otherwise, simple clustering, based on architecture
+                    var cpusOfArch = cpus.Where(cpu => cpu.Model == cpuCluster);
+                    if(!cpusOfArch.Any())
+                    {
+                        var response = new StringBuilder();
+                        if(String.IsNullOrEmpty(cpuCluster))
+                        {
+                            response.AppendLine("CPUs of different architectures are present in this platform. Specify cluster of CPUs to debug, or \"all\" to connect to all CPUs.");
+                            response.AppendLine("NOTE: when selecting \"all\" make sure that your debugger can handle CPUs of different architectures.");
+                        }
+                        else
+                        {
+                            response.AppendFormat("No CPUs available or no cluster named: \"{0}\" exists.\n", cpuCluster);
+                        }
+                        response.Append("Available clusters are: ");
+                        response.Append(Misc.PrettyPrintCollection(cpus.Select(c => c.Model).Distinct().Append("all"), c => $"\"{c}\""));
+                        throw new RecoverableException(response.ToString());
+                    }
+                    AddCpusToGdbStub(port, autostartEmulation, cpusOfArch);
                 }
             }
             catch(SocketException e)
             {
                 throw new RecoverableException(string.Format("Could not start GDB server: {0}", e.Message));
+            }
+        }
+
+        // Name of the last parameter is kept as 'cpu' for backward compatibility.
+        public void StartGdbServer(int port, bool autostartEmulation, ICluster<ICpuSupportingGdb> cpu)
+        {
+            var cluster = cpu;
+            foreach(var cpuSupportingGdb in cluster.Clustered)
+            {
+                try
+                {
+                    AddCpusToGdbStub(port, autostartEmulation, new [] { cpuSupportingGdb });
+                }
+                catch(SocketException e)
+                {
+                    throw new RecoverableException(string.Format("Could not start GDB server for {0}: {1}", cpuSupportingGdb.GetName(), e.Message));
+                }
             }
         }
 
@@ -1028,7 +1057,11 @@ namespace Antmicro.Renode.Core
 
         public override string ToString()
         {
-            return EmulationManager.Instance.CurrentEmulation[this];
+            if(EmulationManager.Instance.CurrentEmulation.TryGetMachineName(this, out var machineName))
+            {
+                return machineName;
+            }
+            return "Unregistered machine";
         }
 
         public void EnableProfiler(string outputPath = null)
@@ -1255,7 +1288,37 @@ namespace Antmicro.Renode.Core
         public const string UnnamedPeripheral = "[no-name]";
         public const string MachineKeyword = "machine";
 
-        private void TryReduceBroadcastedDirtyAddresses(uint cpuId)
+        private void CheckIsCpuAlreadyAttached(ICpuSupportingGdb cpu)
+        {
+            var owningStub = gdbStubs.Values.FirstOrDefault(x => x.IsCPUAttached(cpu));
+            if(owningStub != null)
+            {
+                throw new RecoverableException($"CPU: {cpu.GetName()} is already attached to an existing GDB server, running on port :{owningStub.Port}");
+            }
+        }
+
+        private void AddCpusToGdbStub(int port, bool autostartEmulation, IEnumerable<ICpuSupportingGdb> cpus)
+        {
+            foreach(var cpu in cpus)
+            {
+                CheckIsCpuAlreadyAttached(cpu);
+            }
+            if(gdbStubs.ContainsKey(port))
+            {
+                foreach(var cpu in cpus)
+                {
+                    gdbStubs[port].AttachCPU(cpu);
+                    this.Log(LogLevel.Info, "CPU: {0} was added to GDB server running on port :{1}", cpu.GetName(), port);
+                }
+            }
+            else
+            {
+                gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation));
+                this.Log(LogLevel.Info, "CPUs: {0} were added to a new GDB server created on port :{1}", Misc.PrettyPrintCollection(cpus, c => $"\"{c.GetName()}\""), port);
+            }
+        }
+
+        private void TryReduceBroadcastedDirtyAddresses(ICPU cpu)
         {
             var firstUnread = firstUnbroadcastedDirtyAddressIndex.Values.Min();
             if(firstUnread == 0)
@@ -1263,7 +1326,7 @@ namespace Antmicro.Renode.Core
                 return;
             }
 
-            invalidatedAddressesById[cpuId].RemoveRange(0, (int)firstUnread);
+            invalidatedAddressesByCpu[cpu].RemoveRange(0, (int)firstUnread);
             foreach(var key in firstUnbroadcastedDirtyAddressIndex.Keys.ToArray())
             {
                 firstUnbroadcastedDirtyAddressIndex[key] -= firstUnread;
@@ -1309,7 +1372,7 @@ namespace Antmicro.Renode.Core
                     newInvalidatedAddressesList = new List<long>() { Capacity = InitialDirtyListLength };
                     invalidatedAddressesByArchitecture.Add(cpu.Architecture, newInvalidatedAddressesList);
                 }
-                invalidatedAddressesById[cpu.Id] = newInvalidatedAddressesList;
+                invalidatedAddressesByCpu[cpu] = newInvalidatedAddressesList;
             }
         }
 
@@ -1330,7 +1393,7 @@ namespace Antmicro.Renode.Core
                             throw new RecoverableException($"{cpu.Model ?? "Unknown model"}: CPU architecture not provided");
                         }
                         InitializeInvalidatedAddressesList(cpu);
-                        firstUnbroadcastedDirtyAddressIndex[cpu.Id] = 0;
+                        firstUnbroadcastedDirtyAddressIndex[cpu] = 0;
                     }
                     if(ownLife != null)
                     {
@@ -1356,17 +1419,8 @@ namespace Antmicro.Renode.Core
                 }
             }
 
-            OnMachinePeripheralsChanged(peripheral, PeripheralsChangedEventArgs.PeripheralChangeType.Addition);
+            PeripheralsChanged?.Invoke(this, PeripheralsAddedEventArgs.Create(peripheral, registrationPoint));
             EmulationManager.Instance.CurrentEmulation.BackendManager.TryCreateBackend(peripheral);
-        }
-
-        private void OnMachinePeripheralsChanged(IPeripheral peripheral, PeripheralsChangedEventArgs.PeripheralChangeType operation)
-        {
-            var mpc = PeripheralsChanged;
-            if(mpc != null)
-            {
-                mpc(this, new PeripheralsChangedEventArgs(peripheral, operation));
-            }
         }
 
         private bool TryFindSubnodeByName(MultiTreeNode<IPeripheral, IRegistrationPoint> from, string path, out MultiTreeNode<IPeripheral, IRegistrationPoint> subnode,
@@ -1642,7 +1696,8 @@ namespace Antmicro.Renode.Core
                 lock(collectionSync)
                 {
                     registeredPeripherals.GetNode(parent).ReplaceConnectionWay(oldPoint, newPoint);
-                    OnMachinePeripheralsChanged(child, PeripheralsChangedEventArgs.PeripheralChangeType.Moved);
+                    var operation = PeripheralsChangedEventArgs.PeripheralChangeType.Moved;
+                    PeripheralsChanged?.Invoke(this, PeripheralsChangedEventArgs.Create(child, operation));
                 }
             }
             finally
@@ -1681,8 +1736,8 @@ namespace Antmicro.Renode.Core
          *  Variables used for memory invalidation
          */
         private const int InitialDirtyListLength = 1 << 10;
-        private readonly Dictionary<uint, int> firstUnbroadcastedDirtyAddressIndex;
-        private readonly Dictionary<uint, List<long>> invalidatedAddressesById;
+        private readonly Dictionary<ICPU, int> firstUnbroadcastedDirtyAddressIndex;
+        private readonly Dictionary<ICPU, List<long>> invalidatedAddressesByCpu;
         private readonly Dictionary<string, List<long>> invalidatedAddressesByArchitecture;
         private readonly object invalidatedAddressesLock;
 
@@ -1707,10 +1762,11 @@ namespace Antmicro.Renode.Core
 
         private sealed class PausedState : IDisposable
         {
-            public PausedState(IMachine machine)
+            // PausedState is used only within Machine so we can take Machine as an argument, instead of IMachine.
+            public PausedState(Machine machine)
             {
                 this.machine = machine;
-                sync = new object();
+                sync = machine.pausingSync;
             }
 
             public PausedState Enter()
@@ -1742,6 +1798,7 @@ namespace Antmicro.Renode.Core
                         else
                         {
                             wasPaused = false;
+                            pausedLifes = machine.ownLifes.Where(ownLife => ownLife.IsPaused).ToArray();
                             machine.Pause();
                         }
                     }
@@ -1757,7 +1814,7 @@ namespace Antmicro.Renode.Core
                     {
                         if(!wasPaused)
                         {
-                            machine.Start();
+                            machine.Start(ownLife => !pausedLifes.Contains(ownLife));
                         }
                     }
                     if(currentLevel == 0)
@@ -1773,7 +1830,8 @@ namespace Antmicro.Renode.Core
             [Transient]
             private int currentLevel;
             private bool wasPaused;
-            private readonly IMachine machine;
+            private IHasOwnLife[] pausedLifes;
+            private readonly Machine machine;
             private readonly object sync;
         }
 

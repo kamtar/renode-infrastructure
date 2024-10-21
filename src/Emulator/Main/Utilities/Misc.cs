@@ -22,6 +22,8 @@ using Antmicro.Renode.Network;
 using System.Diagnostics;
 using Antmicro.Renode.Core.Structure.Registers;
 using System.Threading;
+using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Logging.Profiling;
 
 namespace Antmicro.Renode.Utilities
 {
@@ -1756,6 +1758,44 @@ namespace Antmicro.Renode.Utilities
             {
                 collection.Add(item);
             }
+        }
+
+        public static MpuAccess MemoryOperationToMpuAccess(MemoryOperation operation)
+        {
+            switch(operation)
+            {
+                case MemoryOperation.InsnFetch:
+                    return MpuAccess.InstructionFetch;
+                case MemoryOperation.MemoryIOWrite:
+                case MemoryOperation.MemoryWrite:
+                    return MpuAccess.Write;
+                case MemoryOperation.MemoryIORead:
+                case MemoryOperation.MemoryRead:
+                    return MpuAccess.Read;
+                default:
+                    throw new ArgumentException("Invalid conversion from MemoryOperation to MpuAccess");
+            }
+        }
+
+        public static ulong GCD(ulong a, ulong b)
+        {
+            while(a != 0 && b != 0)
+            {
+                if(a > b)
+                {
+                    a %= b;
+                }
+                else
+                {
+                    b %= a;
+                }
+            }
+            return a | b;
+        }
+
+        public static ulong LCM(ulong a, ulong b)
+        {
+            return a / GCD(a, b) * b;
         }
 
         public static DateTime UnixEpoch = new DateTime(1970, 1, 1);

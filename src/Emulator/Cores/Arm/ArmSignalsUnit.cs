@@ -10,6 +10,8 @@ using System.Linq;
 using System.Runtime.InteropServices;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Structure;
+using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
@@ -20,15 +22,44 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class ArmSignalsUnit : IPeripheral
+    public class CortexR5SignalsUnit : ArmSignalsUnit
     {
-        public ArmSignalsUnit(IMachine machine)
+        public CortexR5SignalsUnit(IMachine machine) : base(machine, UnitType.CortexR5)
         {
-            InitSignals();
-            this.machine = machine;
+            // Intentionally left empty.
+        }
+    }
 
-            // PeripheralsBase initialization is postponed to the moment of adding SnoopControlUnit to the platform.
-            machine.PeripheralsChanged += OnMachinePeripheralsChanged;
+    public class CortexR8SignalsUnit : ArmSignalsUnit
+    {
+        public CortexR8SignalsUnit(IMachine machine, ArmSnoopControlUnit snoopControlUnit)
+            : base(machine, UnitType.CortexR8, snoopControlUnit)
+        {
+            // Intentionally left empty.
+        }
+    }
+
+    public class ArmSignalsUnit : IPeripheral, ISignalsUnit
+    {
+        protected ArmSignalsUnit(IMachine machine, UnitType unitType, ArmSnoopControlUnit snoopControlUnit = null)
+        {
+            this.machine = machine;
+            this.unitType = unitType;
+            InitSignals(unitType);
+
+            // SCU is required for Cortex-R8 PERIPHBASE logic but, for example, Cortex-R5 has neither PERIPHBASE nor is used with SCU.
+            if(unitType == UnitType.CortexR8)
+            {
+                this.snoopControlUnit = snoopControlUnit
+                    ?? throw new ConstructionException($"{nameof(snoopControlUnit)} is required in {unitType}SignalsUnit");
+
+                // PeripheralsBase initialization is postponed to the moment of adding SnoopControlUnit to the platform.
+                machine.PeripheralsChanged += OnMachinePeripheralsChanged;
+            }
+            else if(snoopControlUnit != null)
+            {
+                throw new ConstructionException($"{nameof(snoopControlUnit)} can't be used in {unitType}SignalsUnit");
+            }
         }
 
         public void FillConfigurationStateStruct(IntPtr allocatedStructPointer, Arm cpu)
@@ -76,12 +107,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return signal.IsEnabled();
         }
 
-        public bool IsSignalEnabledForCPU(string name, Arm cpu)
+        public bool IsSignalEnabledForCPU(string name, ICPU cpu)
         {
             return IsSignalEnabledForCPU(signals.Parse(name), cpu);
         }
 
-        public bool IsSignalEnabledForCPU(ArmSignals armSignal, Arm cpu)
+        public bool IsSignalEnabledForCPU(ArmSignals armSignal, ICPU cpu)
         {
             var signal = signals[armSignal];
             AssertSignalCPUIndexed(signal, inSetMethod: false);
@@ -90,16 +121,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return signals[armSignal].IsEnabled(cpuIndex);
         }
 
+        // Called in Arm constructors if ArmSignalsUnit passed.
         public void RegisterCPU(Arm cpu)
         {
             lock(registeredCPUs)
             {
+                AssertCPUModelIsSupported(cpu.Model);
+
                 // Bit offset for this CPU in CPU-indexed signals.
                 var cpuIndex = registeredCPUs.Count;
-                registeredCPUs[cpu] = new RegisteredCPU(cpu, this, cpuIndex, signals[ArmSignals.PeripheralsBase].ResetValue);
-                signals.SetCPUIndexedSignalsWidth(registeredCPUs.Count);
+                registeredCPUs[cpu] = new RegisteredCPU(machine, cpu, this, cpuIndex);
+                signals.SetCPUIndexedSignalsWidth((uint)registeredCPUs.Count);
             }
-            cpu.StateChanged += (_, oldState, __) => { if(oldState == CPUState.InReset) registeredCPUs[cpu].OnCPUOutOfReset(); };
+
+            cpu.StateChanged += (_, oldState, __) => {
+                if(oldState == CPUState.InReset)
+                {
+                    if(unitType == UnitType.CortexR8)
+                    {
+                        lock(registeredCPUs)
+                        {
+                            if(firstSCURegistration is NullRegistrationPoint && !scuRegisteredAtBus)
+                            {
+                                RegisterSCU();
+                                scuRegisteredAtBus = true;
+                            }
+                        }
+                    }
+                    registeredCPUs[cpu].OnCPUOutOfReset();
+                };
+            };
         }
 
         public void Reset()
@@ -154,12 +205,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             signal.SetState(checked((byte)index), state);
         }
 
-        public void SetSignalStateForCPU(string name, bool state, Arm cpu)
+        public void SetSignalStateForCPU(string name, bool state, ICPU cpu)
         {
             SetSignalStateForCPU(signals.Parse(name), state, cpu);
         }
 
-        public void SetSignalStateForCPU(ArmSignals armSignal, bool state, Arm cpu)
+        public void SetSignalStateForCPU(ArmSignals armSignal, bool state, ICPU cpu)
         {
             var signal = signals[armSignal];
             AssertSignalCPUIndexed(signal, inSetMethod: true);
@@ -168,7 +219,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             signal.SetState(cpuIndex, state);
         }
 
-        public int AddressWidth { get; } = 32;
+        public uint AddressWidth { get; } = 32;
+        public IEnumerable<ICPU> RegisteredCPUs => registeredCPUs.Keys;
+
+        private void AssertCPUModelIsSupported(string cpuModel)
+        {
+            var supportedModels = ModelsToUnitTypes.Where(kvPair => kvPair.Value == unitType).Select(kvPair => kvPair.Key);
+
+            if(!supportedModels.Contains(cpuModel))
+            {
+                var message = $"Tried to register unsupported CPU model to {unitType}SignalsUnit: {cpuModel}; supported CPUs are: {string.Join(", ", supportedModels)}";
+                throw new RecoverableException(message);
+            }
+        }
 
         private void AssertSignalCPUIndexed(Signal<ArmSignals> signal, bool inSetMethod)
         {
@@ -190,7 +253,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private RegisteredCPU GetRegisteredCPU(Arm cpu)
+        private RegisteredCPU GetRegisteredCPU(ICPU cpu)
         {
             if(!registeredCPUs.TryGetValue(cpu, out var registeredCPU))
             {
@@ -200,92 +263,166 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return registeredCPU;
         }
 
-        private void InitSignals()
+        private void InitSignals(UnitType type)
         {
             signals.InitSignal(this, "DBGROMADDR", ArmSignals.DebugROMAddress, width: 20);
             signals.InitSignal(this, "DBGROMADDRV", ArmSignals.DebugROMAddressValid, width: 1);
             signals.InitSignal(this, "DBGSELFADDR", ArmSignals.DebugSelfAddress, width: 15);
             signals.InitSignal(this, "DBGSELFADDRV", ArmSignals.DebugSelfAddressValid, width: 1);
-            signals.InitSignal(this, "MFILTEREN", ArmSignals.MasterFilterEnable, width: 1);
-            signals.InitSignal(this, "MFILTEREND", ArmSignals.MasterFilterEnd, width: 12);
-            signals.InitSignal(this, "MFILTERSTART", ArmSignals.MasterFilterStart, width: 12);
-            signals.InitSignal(this, "PERIPHBASE", ArmSignals.PeripheralsBase, width: PeripheralsBaseBits);
-            signals.InitSignal(this, "PFILTEREND", ArmSignals.PeripheralFilterEnd, width: 12);
-            signals.InitSignal(this, "PFILTERSTART", ArmSignals.PeripheralFilterStart, width: 12);
 
             // CPU-indexed signals have width equal to CPUs count since there's a single bit per CPU.
             signals.InitSignal(this, "INITRAM", ArmSignals.InitializeInstructionTCM, cpuIndexedSignal: true);
             signals.InitSignal(this, "VINITHI", ArmSignals.HighExceptionVectors, cpuIndexedSignal: true);
+
+            switch(type)
+            {
+            case UnitType.CortexR5:
+                // Cortex-R5 AHB/AXI peripheral interface signals, Virtual AXI has only base and size.
+                signals.InitSignal(this, "INITPPH", ArmSignals.AHBInitEnabled, cpuIndexedSignal: true);
+                signals.InitSignal(this, "INITPPX", ArmSignals.AXIInitEnabled, cpuIndexedSignal: true);
+
+                // Currently both CPUs share the same base and size values (R5 can only be dual-core).
+                signals.InitSignal(this, "PPHBASE", ArmSignals.AHBBaseAddress, width: 20);
+                signals.InitSignal(this, "PPXBASE", ArmSignals.AXIBaseAddress, width: 20);
+                signals.InitSignal(this, "PPVBASE", ArmSignals.VirtualAXIBaseAddress, width: 20);
+
+                signals.InitSignal(this, "PPHSIZE", ArmSignals.AHBSize, width: 5);
+                signals.InitSignal(this, "PPXSIZE", ArmSignals.AXISize, width: 5);
+                signals.InitSignal(this, "PPVSIZE", ArmSignals.VirtualAXISize, width: 5);
+                break;
+            case UnitType.CortexR8:
+                signals.InitSignal(this, "MFILTEREN", ArmSignals.MasterFilterEnable, width: 1);
+                signals.InitSignal(this, "MFILTEREND", ArmSignals.MasterFilterEnd, width: 12);
+                signals.InitSignal(this, "MFILTERSTART", ArmSignals.MasterFilterStart, width: 12);
+                signals.InitSignal(this, "PERIPHBASE", ArmSignals.PeripheralsBase, width: PeripheralsBaseBits);
+                signals.InitSignal(this, "PFILTEREND", ArmSignals.PeripheralFilterEnd, width: 12);
+                signals.InitSignal(this, "PFILTERSTART", ArmSignals.PeripheralFilterStart, width: 12);
+                break;
+            default:
+                throw new RecoverableException($"Invalid {nameof(type)} value: {type}");
+            }
         }
 
         private void OnMachinePeripheralsChanged(IMachine machine, PeripheralsChangedEventArgs args)
         {
-            if(args.Peripheral is ArmSnoopControlUnit snoopControlUnit
-                && args.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.Addition)
+            if(args.Peripheral == snoopControlUnit && args is PeripheralsAddedEventArgs addedArgs)
             {
-                OnSnoopControlUnitAdded(snoopControlUnit);
+                var peripheralsBase = signals[ArmSignals.PeripheralsBase];
+                lock(peripheralsBase)
+                {
+                    OnSnoopControlUnitAdded(peripheralsBase, addedArgs.RegistrationPoint);
+                }
             }
         }
 
-        private void OnSnoopControlUnitAdded(ArmSnoopControlUnit snoopControlUnit)
+        private void OnSnoopControlUnitAdded(Signal<ArmSignals> peripheralsBase, IRegistrationPoint registrationPoint)
         {
-            lock(signals[ArmSignals.PeripheralsBase])
+            this.DebugLog("Handling SCU's registration: {0}", registrationPoint);
+
+            if(registrationPoint is IBusRegistration busRegistration)
             {
-                if(peripheralsBaseInitializedFromSCU)
-                {
-                    // Don't log anything, it might be called when adding new registration points for CPU contexts.
-                    return;
-                }
-                peripheralsBaseInitializedFromSCU = true;
+                OnSnoopControlUnitAdded(peripheralsBase, busRegistration);
+            }
+            else if(registrationPoint is NullRegistrationPoint)
+            {
+                // This method can be called multiple times with IRegistrationPoint but at most once with NullRegistrationPoint.
+                DebugHelper.Assert(firstSCURegistration == null);
+            }
+            else
+            {
+                throw new RecoverableException($"{this.GetName()}: Added {nameof(ArmSnoopControlUnit)} with unsupported registration point!");
             }
 
-            var scus = machine.GetSystemBus(snoopControlUnit).GetRegistrationPoints(snoopControlUnit);
-            if(!scus.Any())
+            if(firstSCURegistration == null)
             {
-                throw new RecoverableException($"{this.GetName()}: Tried to register '{snoopControlUnit.GetName()}' but it has no registration points.");
-            }
-
-            if(scus.Count() > 1)
-            {
-                this.Log(LogLevel.Warning,
-                    "Multiple SnoopControlUnit registration points ({0})\n" +
-                    "using only the first one to calculate Peripherals Base Address.",
-                    string.Join(", ", scus));
-            }
-            var scuRegistrationPoint = scus.First();
-            var scuAddress = scuRegistrationPoint.Range.StartAddress;
-
-            // SnoopControlUnit's address depends directly on PeripheralsBase (offset = 0).
-            var peripheralsBase = signals[ArmSignals.PeripheralsBase];
-            peripheralsBase.SetFromAddress(AddressWidth, scuAddress);
-            peripheralsBase.ResetValue = peripheralsBase.Value;
-
-            lock(registeredCPUs)
-            {
-                foreach(var registeredCPU in registeredCPUs.Values)
-                {
-                    registeredCPU.PeripheralsBaseAtLastReset = peripheralsBase.Value;
-                }
+                firstSCURegistration = registrationPoint;
             }
         }
 
-        private bool peripheralsBaseInitializedFromSCU;
+        private void OnSnoopControlUnitAdded(Signal<ArmSignals> peripheralsBase, IBusRegistration busRegistration)
+        {
+            var context = busRegistration.CPU;
+            if(context != null && !registeredCPUs.ContainsKey(context))
+            {
+                this.DebugLog("Ignoring {0} registration for CPU unregistered in {1}: {2}",
+                    nameof(ArmSnoopControlUnit), nameof(ArmSignalsUnit), context
+                );
+                return;
+            }
+
+            if(firstSCURegistration == null)
+            {
+                // SnoopControlUnit's address indicates PeripheralsBase address cause its offset is 0x0.
+                peripheralsBase.SetFromAddress(AddressWidth, busRegistration.StartingPoint);
+                peripheralsBase.ResetValue = peripheralsBase.Value;
+            }
+            // Let's make sure the address has been the same in all bus registrations.
+            else if(firstSCURegistration is IBusRegistration firstSCUBusRegistration
+                    && busRegistration.StartingPoint != firstSCUBusRegistration.StartingPoint)
+            {
+                throw new RecoverableException("All SCU registrations must use the same address");
+            }
+
+            // Casting must be successful because `context` is in `registeredCPUs.Keys`.
+            var cpus = context == null ? registeredCPUs.Keys.ToArray() : new[] { (Arm)context };
+            foreach(var cpu in cpus)
+            {
+                if(context == null && registeredCPUs[cpu].PeripheralsBaseAtLastReset.HasValue)
+                {
+                    // It must've been already set using CPU-specific registration point.
+                    continue;
+                }
+                registeredCPUs[cpu].PeripheralsBaseAtLastReset = peripheralsBase.Value;
+            }
+        }
+
+        private void RegisterSCU()
+        {
+            // The name is lost when the peripheral gets unregistered. It's unregistered because there
+            // are no SCU registrations in `peripherals` command with `NullRegistrationPoint` left.
+            var scuName = machine.GetLocalName(snoopControlUnit);
+            machine.SystemBus.Unregister(snoopControlUnit);
+
+            foreach(var registeredCPU in registeredCPUs.Values)
+            {
+                registeredCPU.RegisterSCU(snoopControlUnit);
+            }
+            machine.SetLocalName(snoopControlUnit, scuName);
+        }
+
+        private IRegistrationPoint firstSCURegistration;
+        private bool scuRegisteredAtBus;
 
         private readonly IMachine machine;
-        private readonly Dictionary<Arm, RegisteredCPU> registeredCPUs = new Dictionary<Arm, RegisteredCPU>();
+        private readonly Dictionary<ICPU, RegisteredCPU> registeredCPUs = new Dictionary<ICPU, RegisteredCPU>();
         private readonly SignalsDictionary<ArmSignals> signals = new SignalsDictionary<ArmSignals>();
+        private readonly ArmSnoopControlUnit snoopControlUnit;
+        private readonly UnitType unitType;
 
         private const int PeripheralsBaseBits = 19;
 
+        private static readonly Dictionary<string, UnitType> ModelsToUnitTypes = new Dictionary<string, UnitType>
+        {
+            {"cortex-r5", UnitType.CortexR5},
+            {"cortex-r5f", UnitType.CortexR5},
+            {"cortex-r8", UnitType.CortexR8},
+        };
+
+        public enum UnitType
+        {
+            CortexR5,
+            CortexR8,
+        }
+
         private class RegisteredCPU
         {
-            public RegisteredCPU(Arm cpu, ArmSignalsUnit signalsUnit, int index, ulong peripheralsBaseAtLastReset)
+            public RegisteredCPU(IMachine machine, Arm cpu, ArmSignalsUnit signalsUnit, int index)
             {
                 this.cpu = cpu ?? throw new ArgumentNullException(nameof(cpu));
+                this.machine = machine;
                 this.signalsUnit = signalsUnit;
 
                 Index = (byte)index;
-                PeripheralsBaseAtLastReset = peripheralsBaseAtLastReset;
             }
 
             public void FillConfigurationStateStruct(IntPtr allocatedStructPointer)
@@ -293,6 +430,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var state = new ConfigurationSignalsState
                 {
                     IncludedSignalsMask = IncludedConfigurationSignalsMask.Create(
+                        signalsUnit.unitType,
                         signalsUnit.IsSignalEnabled(ArmSignals.DebugROMAddressValid),
                         signalsUnit.IsSignalEnabled(ArmSignals.DebugSelfAddressValid)
                     ),
@@ -304,9 +442,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                     HighExceptionVectors = signalsUnit.IsSignalEnabledForCPU(ArmSignals.HighExceptionVectors, cpu) ? 1u : 0u,
                     InitializeInstructionTCM = signalsUnit.IsSignalEnabledForCPU(ArmSignals.InitializeInstructionTCM, cpu) ? 1u : 0u,
-                    PeripheralsBase = (uint)signalsUnit.GetSignal(ArmSignals.PeripheralsBase),
                 };
 
+                switch(signalsUnit.unitType)
+                {
+                case UnitType.CortexR5:
+                    state.AHBRegionRegister = GetBusRegionRegister(ArmSignals.AHBBaseAddress, ArmSignals.AHBSize, ArmSignals.AHBInitEnabled);
+                    state.AXIRegionRegister = GetBusRegionRegister(ArmSignals.AXIBaseAddress, ArmSignals.AXISize, ArmSignals.AXIInitEnabled);
+                    state.VirtualAXIRegionRegister = GetBusRegionRegister(ArmSignals.VirtualAXIBaseAddress, ArmSignals.VirtualAXISize, initSignal: null);
+                    break;
+                case UnitType.CortexR8:
+                    state.PeripheralsBase = (uint)signalsUnit.GetSignal(ArmSignals.PeripheralsBase);
+                    break;
+                default:
+                    throw new RecoverableException($"Invalid {nameof(signalsUnit.unitType)} value: {signalsUnit.unitType}");
+                }
                 Marshal.StructureToPtr(state, allocatedStructPointer, fDeleteOld: true);
             }
 
@@ -318,30 +468,62 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     cpu.PC = 0xFFFF0000;
                 }
 
-                // PeripheralsBase
-                var peripheralsBase = signalsUnit.GetSignal(ArmSignals.PeripheralsBase);
-                var peripheralsBaseAddress = signalsUnit.GetAddress(ArmSignals.PeripheralsBase);
-                if(PeripheralsBaseAtLastReset != peripheralsBase)
+                if(signalsUnit.unitType == UnitType.CortexR8)
                 {
-                    PeripheralsBaseAtLastReset = peripheralsBase;
-                    var pFilterStart = signalsUnit.GetAddress(ArmSignals.PeripheralFilterStart);
-                    var pFilterEnd = signalsUnit.GetAddress(ArmSignals.PeripheralFilterEnd);
-                    if(peripheralsBaseAddress < pFilterStart || peripheralsBaseAddress > pFilterEnd)
+                    var peripheralsBase = signalsUnit.GetSignal(ArmSignals.PeripheralsBase);
+                    if(PeripheralsBaseAtLastReset != peripheralsBase)
                     {
-                        signalsUnit.Log(LogLevel.Warning, "{0} address 0x{1:X} should be between {2} address (0x{3:X}) and {4} address (0x{5:X})",
-                            Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralsBase), peripheralsBaseAddress,
-                            Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralFilterStart), pFilterStart,
-                            Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralFilterEnd), pFilterEnd);
+                        PeripheralsBaseChanged();
+                        PeripheralsBaseAtLastReset = peripheralsBase;
                     }
-                    MovePeripherals(peripheralsBaseAddress);
                 }
             }
 
+            public void PeripheralsBaseChanged()
+            {
+                var peripheralsBaseAddress = signalsUnit.GetAddress(ArmSignals.PeripheralsBase);
+
+                var pFilterStart = signalsUnit.GetAddress(ArmSignals.PeripheralFilterStart);
+                var pFilterEnd = signalsUnit.GetAddress(ArmSignals.PeripheralFilterEnd);
+
+                // The signals are just uninitialized if pFilterEnd is 0 so let's not log warnings then.
+                if(pFilterEnd != 0 && (peripheralsBaseAddress < pFilterStart || peripheralsBaseAddress > pFilterEnd))
+                {
+                    signalsUnit.Log(LogLevel.Warning, "{0} address 0x{1:X} should be between {2} address (0x{3:X}) and {4} address (0x{5:X})",
+                        Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralsBase), peripheralsBaseAddress,
+                        Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralFilterStart), pFilterStart,
+                        Enum.GetName(typeof(ArmSignals), ArmSignals.PeripheralFilterEnd), pFilterEnd);
+                }
+                MovePeripherals(peripheralsBaseAddress);
+            }
+
+            public void RegisterSCU(ArmSnoopControlUnit scu)
+            {
+                var address = signalsUnit.GetAddress(ArmSignals.PeripheralsBase) + (ulong)PeriphbaseOffsets.SnoopControlUnit;
+                var registrationPoint = new BusRangeRegistration(address.By(checked((ulong)scu.Size)), cpu: cpu);
+                machine.SystemBus.Register(scu, registrationPoint);
+            }
+
             public byte Index { get; }
-            public ulong PeripheralsBaseAtLastReset { get; set; }
+
+            public ulong? PeripheralsBaseAtLastReset;
+
+            private uint GetBusRegionRegister(ArmSignals baseSignal, ArmSignals sizeSignal, ArmSignals? initSignal)
+            {
+                var value = 0u;
+                BitHelper.SetMaskedValue(ref value, (uint)signalsUnit.GetSignal(baseSignal), 12, 20);
+                BitHelper.SetMaskedValue(ref value, (uint)signalsUnit.GetSignal(sizeSignal), 2, 5);
+                if(initSignal != null)
+                {
+                    BitHelper.SetBit(ref value, 0, signalsUnit.IsSignalEnabledForCPU(initSignal.Value, cpu));
+                }
+                return value;
+            }
 
             private void MovePeripherals(ulong peripheralsBaseAddress)
             {
+                signalsUnit.DebugLog("Moving GIC, SCU and timers for CPU {0} relatively to new PERIPHBASE value: 0x{1:X}", cpu, peripheralsBaseAddress);
+
                 Func<PeriphbaseOffsets, ulong> getAddress = offset => peripheralsBaseAddress + (ulong)offset;
                 MoveOrRegisterPeripheralWithinContext<ARM_GenericInterruptController>(peripheralsBaseAddress + (ulong)PeriphbaseOffsets.GIC_CPUInterface, "cpuInterface");
                 MoveOrRegisterPeripheralWithinContext<ARM_GenericInterruptController>(peripheralsBaseAddress + (ulong)PeriphbaseOffsets.GIC_Distributor, "distributor");
@@ -356,30 +538,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(!TryGetSingleBusRegistered<T>(region, out var busRegistered))
                 {
                     // Peripheral not found or there are multiple peripherals of the specified type in the given context.
+                    var registrationName = string.IsNullOrWhiteSpace(region) ? "" : $"region {region} of" + typeof(T).Name;
+                    signalsUnit.DebugLog("No registration found for {0}; won't be moved to 0x{1:X}", registrationName, newAddress);
                     return;
                 }
                 var peripheral = busRegistered.Peripheral;
                 var registrationPoint = busRegistered.RegistrationPoint;
                 var size = registrationPoint.Range.Size;
 
-                var newRegistrationPoint = registrationPoint is BusMultiRegistration
+                var newRegistration = registrationPoint is BusMultiRegistration
                     ? new BusMultiRegistration(newAddress, size, region, cpu)
                     : new BusRangeRegistration(newAddress, size, cpu: cpu);
 
                 if(registrationPoint.CPU == cpu)
                 {
-                    if(registrationPoint is BusMultiRegistration multi)
+                    if(newRegistration is BusMultiRegistration newMultiRP)
                     {
-                        SystemBus.MoveBusMultiRegistrationWithinContext(peripheral, newAddress, cpu, region);
+                        machine.SystemBus.MoveBusMultiRegistrationWithinContext(peripheral, newMultiRP, cpu);
                     }
                     else
                     {
-                        SystemBus.MoveRegistrationWithinContext(peripheral, newAddress, cpu);
+                        machine.SystemBus.MoveRegistrationWithinContext(peripheral, newRegistration, cpu);
                     }
                 }
                 else
                 {
-                    SystemBus.Register(peripheral, newRegistrationPoint);
+                    machine.SystemBus.Register(peripheral, newRegistration);
                 }
             }
 
@@ -387,7 +571,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private bool TryGetSingleBusRegistered<T>(string region, out IBusRegistered<IBusPeripheral> busRegistered) where T : IBusPeripheral
             {
                 busRegistered = null;
-                var busRegisteredEnumerable = SystemBus.GetRegisteredPeripherals(cpu).Where(_busRegistered => _busRegistered.Peripheral is T);
+                var busRegisteredEnumerable = machine.SystemBus.GetRegisteredPeripherals(cpu).Where(_busRegistered => _busRegistered.Peripheral is T);
 
                 if(busRegisteredEnumerable.Any() && !string.IsNullOrEmpty(region))
                 {
@@ -403,7 +587,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     busRegisteredEnumerable = busRegisteredEnumerable.Where(_busRegistered => _busRegistered.RegistrationPoint.CPU == cpu);
                 }
 
-                if(busRegisteredEnumerable.Count() > 1)
+                var count = (uint)busRegisteredEnumerable.Count();
+                if(count > 1)
                 {
                     var logLine = "Multiple matching {0}"
                         .AppendIf(!string.IsNullOrEmpty(region), $" (region: {region})")
@@ -416,34 +601,34 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return busRegistered != default(IBusRegistered<IBusPeripheral>);
             }
 
-            // `RegisteredCPU` constructor is called before its CPU gets registered in the machine.
-            // Since `GetMachine` won't work there, `SystemBus` is set when it's first used.
-            private IBusController SystemBus
-            {
-                get
-                {
-                    if(systemBus == null)
-                    {
-                        systemBus = cpu.GetMachine().SystemBus;
-                    }
-                    return systemBus;
-                }
-            }
-
-            private IBusController systemBus;
-
             private readonly Arm cpu;
+            private readonly IMachine machine;
             private readonly ArmSignalsUnit signalsUnit;
 
             private static class IncludedConfigurationSignalsMask
             {
-                public static ulong Create(bool debugRomAddressValid, bool debugSelfAddressValid)
+                public static ulong Create(UnitType unitType, bool debugRomAddressValid, bool debugSelfAddressValid)
                 {
-                    return (debugRomAddressValid ? 1u : 0u) << (int)SignalsEnumSharedWithTlib.DebugROMAddress
+                    var mask = (debugRomAddressValid ? 1u : 0u) << (int)SignalsEnumSharedWithTlib.DebugROMAddress
                         | (debugSelfAddressValid ? 1u : 0u) << (int)SignalsEnumSharedWithTlib.DebugSelfAddress
                         | 1u << (int)SignalsEnumSharedWithTlib.HighExceptionVectors
                         | 1u << (int)SignalsEnumSharedWithTlib.InitializeInstructionTCM
-                        | 1u << (int)SignalsEnumSharedWithTlib.PeripheralsBase;
+                    ;
+
+                    switch(unitType)
+                    {
+                    case UnitType.CortexR5:
+                        mask |= 1u << (int)SignalsEnumSharedWithTlib.AHBRegionRegister;
+                        mask |= 1u << (int)SignalsEnumSharedWithTlib.AXIRegionRegister;
+                        mask |= 1u << (int)SignalsEnumSharedWithTlib.VirtualAXIRegionRegister;
+                        break;
+                    case UnitType.CortexR8:
+                        mask |= 1u << (int)SignalsEnumSharedWithTlib.PeripheralsBase;
+                        break;
+                    default:
+                        throw new RecoverableException($"Invalid {nameof(unitType)} value: {unitType}");
+                    }
+                    return mask;
                 }
 
                 // Copy of ConfigurationSignals enum in tlib's arm/configuration_signals.h
@@ -454,6 +639,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     HighExceptionVectors,
                     InitializeInstructionTCM,
                     PeripheralsBase,
+                    AHBRegionRegister,
+                    AXIRegionRegister,
+                    VirtualAXIRegionRegister,
                 }
             }
 
@@ -471,6 +659,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 public uint HighExceptionVectors;
                 public uint InitializeInstructionTCM;
                 public uint PeripheralsBase;
+
+                public uint AHBRegionRegister;
+                public uint AXIRegionRegister;
+                public uint VirtualAXIRegionRegister;
             }
 
             private enum PeriphbaseOffsets : ulong
@@ -494,7 +686,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            public void InitSignal(IEmulationElement parent, string name, TEnum signal, int width = 0,
+            public void InitSignal(IPeripheral parent, string name, TEnum signal, uint width = 0,
                 ulong resetValue = 0x0, Func<ulong, ulong> getter = null, Action<ulong, ulong> setter = null,
                 bool callSetterAtInitAndReset = false, bool cpuIndexedSignal = false)
             {
@@ -538,7 +730,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     var allNames = signalNames.Keys.Select(_name => $"{_name} ({signalNames[_name]})");
                     throw new RecoverableException(
                         $"No such signal: '{name}'\n" +
-                        $"Available signals are:\n * { string.Join("\n * ", allNames) }"
+                        $"Available signals are:\n * {string.Join("\n * ", allNames)}"
                         );
                 }
                 return signal;
@@ -552,7 +744,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            public void SetCPUIndexedSignalsWidth(int width)
+            public void SetCPUIndexedSignalsWidth(uint width)
             {
                 foreach(var signal in cpuIndexedSignals)
                 {
@@ -570,7 +762,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private class Signal<TEnum>
             where TEnum: struct
         {
-            public Signal(IEmulationElement parent, TEnum signal, int width, ulong resetValue = 0x0)
+            public Signal(IPeripheral parent, TEnum signal, uint width, ulong resetValue = 0x0)
             {
                 if(!typeof(TEnum).IsEnum)  // System.Enum as a constraint isn't available in C# 7.2.
                 {
@@ -592,12 +784,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             /// <returns>Top <c>Value</c> bits shifted as top bits up to <c>addressWidth</c>.</returns>
-            public ulong GetAddress(int addressWidth)
+            public ulong GetAddress(uint addressWidth)
             {
                 AssertAddressWidth(addressWidth, Width);
 
                 var offset = addressWidth - Width;
-                return Value << offset;
+                return Value << (int)offset;
             }
 
             public bool IsEnabled()
@@ -618,27 +810,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return BitHelper.IsBitSet(Value, index);
             }
 
-            public void Log(LogLevel level, string message, params object[] args)
-            {
-                parent.Log(level, $"{Name}: {message}", args);
-            }
-
             public virtual void Reset()
             {
-                Value = ResetValue;
+                value = ResetValue;
             }
 
             /// <summary>Top <c>Value</c> bits will be set from the address bits up to <c>Width</c>.</summary>
-            public void SetFromAddress(int addressWidth, ulong address)
+            public void SetFromAddress(uint addressWidth, ulong address)
             {
                 AssertAddressWidth(addressWidth, Width);
 
-                if((address & BitHelper.CalculateMask(Width, 0)) != 0)
-                {
-                    Log(LogLevel.Warning, $"{Width}-bit value shouldn't be created from 0x{address:X} address");
-                }
                 var offset = addressWidth - Width;
-                Value = address >> offset;
+                if((address & BitHelper.CalculateMask((int)Width, (int)offset)) != address)
+                {
+                    ThrowException($"{Width}-bit signal in a {addressWidth}-bit unit shouldn't be set from 0x{address:X} address");
+                }
+                Value = address >> (int)offset;
             }
 
             public void SetState(byte index, bool state)
@@ -651,7 +838,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public string Name { get; }
             public ulong ResetValue { get => resetValue; set => SetValue(ref resetValue, value); }
             public virtual ulong Value { get => value; set => SetValue(ref this.value, value); }
-            public int Width
+            public uint Width
             {
                 get => width;
                 set
@@ -663,34 +850,39 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            private static void AssertAddressWidth(int addressWidth, int valueWidth)
+            private void AssertAddressWidth(uint addressWidth, uint valueWidth)
             {
                 if(addressWidth < valueWidth)
                 {
-                    throw new ArgumentException($"Can't convert {valueWidth}-bit signal from or to address with lower address width", nameof(addressWidth));
+                    ThrowException($"Can't convert {valueWidth}-bit signal from or to {addressWidth}-bit address");
                 }
             }
 
             private void SetValue(ref ulong destination, ulong value)
             {
-                destination = BitHelper.GetMaskedValue(value, 0, Width);
-                if(destination != value)
+                if(BitHelper.GetMaskedValue(value, 0, (int)Width) != value)
                 {
-                    Log(LogLevel.Warning, "Tried to set {0}-bit signal to 0x{1:X}, it will be set to 0x{2:X}", Width, value, destination);
+                    ThrowException($"Tried to set {Width}-bit signal to 0x{value:X}");
                 }
+                destination = value;
+            }
+
+            private void ThrowException(string message)
+            {
+                throw new RecoverableException($"{parent.GetName()}: {Name}: {message}");
             }
 
             private ulong resetValue;
             private ulong value;
-            private int width;
+            private uint width;
 
-            private readonly IEmulationElement parent;
+            private readonly IPeripheral parent;
         }
 
         private class SignalWithImmediateEffect<TEnum> : Signal<TEnum>
             where TEnum: struct
         {
-            public static SignalWithImmediateEffect<TEnum> CreateInput(IEmulationElement parent, TEnum signal, int width,
+            public static SignalWithImmediateEffect<TEnum> CreateInput(IPeripheral parent, TEnum signal, uint width,
                             Action<ulong, ulong> setter, bool callSetterAtInitAndReset = false, ulong resetValue = 0)
             {
                 if(setter == null)
@@ -700,7 +892,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return new SignalWithImmediateEffect<TEnum>(parent, signal, width, null, setter, callSetterAtInitAndReset, resetValue);
             }
 
-            public static SignalWithImmediateEffect<TEnum> CreateOutput(IEmulationElement parent, TEnum signal, int width, Func<ulong, ulong> getter)
+            public static SignalWithImmediateEffect<TEnum> CreateOutput(IPeripheral parent, TEnum signal, uint width, Func<ulong, ulong> getter)
             {
                 if(getter == null)
                 {
@@ -709,7 +901,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return new SignalWithImmediateEffect<TEnum>(parent, signal, width, getter);
             }
 
-            private SignalWithImmediateEffect(IEmulationElement parent, TEnum signal, int width, Func<ulong, ulong> getter = null,
+            private SignalWithImmediateEffect(IPeripheral parent, TEnum signal, uint width, Func<ulong, ulong> getter = null,
                             Action<ulong, ulong> setter = null, bool callSetterAtInitAndReset = false, ulong resetValue = 0)
                             : base(parent, signal, width, resetValue)
             {
@@ -770,5 +962,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         PeripheralsBase,
         PeripheralFilterEnd,
         PeripheralFilterStart,
+
+        // Cortex-R5 AHB/AXI peripheral interface region signals based on:
+        //   https://developer.arm.com/documentation/ddi0460/d/Signal-Descriptions/Configuration-signals
+        // There's no "enabled out-of-reset" signal for virtual AXI peripheral interface
+        AHBBaseAddress,
+        AHBInitEnabled,
+        AHBSize,
+        AXIBaseAddress,
+        AXIInitEnabled,
+        AXISize,
+        VirtualAXIBaseAddress,
+        VirtualAXISize,
     }
 }

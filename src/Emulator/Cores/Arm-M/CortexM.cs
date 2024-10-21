@@ -23,7 +23,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public partial class CortexM : Arm
     {
-        public CortexM(string cpuType, IMachine machine, NVIC nvic, uint id = 0, Endianess endianness = Endianess.LittleEndian, uint? fpuInterruptNumber = null, uint? numberOfMPURegions = null) : base(cpuType, machine, id, endianness, numberOfMPURegions)
+        public CortexM(string cpuType, IMachine machine, NVIC nvic, [NameAlias("id")] uint cpuId = 0, Endianess endianness = Endianess.LittleEndian, uint? fpuInterruptNumber = null, uint? numberOfMPURegions = null) : base(cpuType, machine, cpuId, endianness, numberOfMPURegions)
         {
             if(nvic == null)
             {
@@ -101,6 +101,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public override MemorySystemArchitectureType MemorySystemArchitecture => NumberOfMPURegions > 0 ? MemorySystemArchitectureType.Physical_PMSA : MemorySystemArchitectureType.None;
+
+        public override uint ExceptionVectorAddress
+        {
+            get => VectorTableOffset;
+            set => VectorTableOffset = value;
+        }
 
         public uint VectorTableOffset
         {

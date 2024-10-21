@@ -22,13 +22,13 @@ using Antmicro.Renode.Hooks;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU.Assembler;
 using Antmicro.Renode.Peripherals.CPU.Disassembler;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Utilities.Binding;
 using ELFSharp.ELF;
 using Machine = Antmicro.Renode.Core.Machine;
-using Antmicro.Renode.Disassembler.LLVM;
 
 using Range = Antmicro.Renode.Core.Range;
 
@@ -49,7 +49,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
     }
 
-    public abstract partial class TranslationCPU : BaseCPU, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, IDisassemblable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU
+    /// <summary>
+    /// <see cref="TranslationCPU"/> implements <see cref="ICluster{T}"/> interface
+    /// to seamlessly handle either cluster or CPU as a parameter to different methods.
+    /// </summary>
+    public abstract partial class TranslationCPU : BaseCPU, ICluster<TranslationCPU>, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU
     {
         protected TranslationCPU(string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32)
         : this(0, cpuType, machine, endianness, bitness)
@@ -59,9 +63,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected TranslationCPU(uint id, string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32)
             : base(id, cpuType, machine, endianness, bitness)
         {
-            this.translationCacheSize = DefaultTranslationCacheSize;
             atomicId = -1;
-            translationCacheSync = new object();
             pauseGuard = new CpuThreadPauseGuard(this);
             decodedIrqs = new Dictionary<Interrupt, HashSet<int>>();
             hooks = new Dictionary<ulong, HookDescriptor>();
@@ -70,7 +72,12 @@ namespace Antmicro.Renode.Peripherals.CPU
             Init();
             InitDisas();
             externalMmuWindowsCount = TlibGetMmuWindowsCount();
+            Clustered = new TranslationCPU[] { this };
         }
+
+        public new IEnumerable<ICluster<TranslationCPU>> Clusters { get; } = new List<ICluster<TranslationCPU>>(0);
+
+        public new IEnumerable<TranslationCPU> Clustered { get; }
 
         public abstract string GDBArchitecture { get; }
 
@@ -99,23 +106,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             set
             {
                 TlibSetChainingEnabled(value ? 1u : 0u);
-            }
-        }
-
-        public ulong TranslationCacheSize
-        {
-            get
-            {
-                return translationCacheSize;
-            }
-            set
-            {
-                if(value == translationCacheSize)
-                {
-                    return;
-                }
-                translationCacheSize = value;
-                SubmitTranslationCacheSizeUpdate();
             }
         }
 
@@ -189,7 +179,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override ulong ExecutedInstructions { get {return TlibGetTotalExecutedInstructions(); } }
 
-        public int Slot { get{if(!slot.HasValue) slot = machine.SystemBus.GetCPUId(this); return slot.Value;} private set {slot = value;} }
+        public int Slot { get{if(!slot.HasValue) slot = machine.SystemBus.GetCPUSlot(this); return slot.Value;} private set {slot = value;} }
         private int? slot;
 
         public override string ToString()
@@ -212,35 +202,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             using(machine?.ObtainPausedState(true))
             {
                 TlibInvalidateTranslationCache();
-            }
-        }
-
-        private void SubmitTranslationCacheSizeUpdate()
-        {
-            lock(translationCacheSync)
-            {
-                var currentTCacheSize = translationCacheSize;
-                // disabled until segmentation fault will be resolved
-                currentTimer = new Timer(x => UpdateTranslationCacheSize(currentTCacheSize), null, -1, -1);
-            }
-        }
-
-        private void UpdateTranslationCacheSize(ulong sizeAtThatTime)
-        {
-            lock(translationCacheSync)
-            {
-                if(sizeAtThatTime != translationCacheSize)
-                {
-                    // another task will take care
-                    return;
-                }
-                currentTimer = null;
-                using(machine?.ObtainPausedState(true))
-                {
-                    PrepareState();
-                    DisposeInner(true);
-                    RestoreState();
-                }
             }
         }
 
@@ -403,9 +364,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void MapMemory(IMappedSegment segment)
         {
-            if(segment.StartingOffset > bitness.GetMaxAddress() || segment.Size > bitness.GetMaxAddress())
+            if(segment.StartingOffset > bitness.GetMaxAddress() || segment.StartingOffset + segment.Size - 1 > bitness.GetMaxAddress())
             {
-                throw new RecoverableException("Could not map memory segment: starting offset or size are too high");
+                throw new RecoverableException("Could not map memory segment: it does not fit into address space");
             }
 
             using(machine?.ObtainPausedState(true))
@@ -413,10 +374,6 @@ namespace Antmicro.Renode.Peripherals.CPU
                 currentMappings.Add(new SegmentMapping(segment));
                 mappedMemory.Add(segment.GetRange());
                 SetAccessMethod(segment.GetRange(), true);
-                checked
-                {
-                    TranslationCacheSize += segment.Size / 4;
-                }
             }
             this.NoisyLog("Registered memory at 0x{0:X}, size 0x{1:X}.", segment.StartingOffset, segment.Size);
         }
@@ -454,10 +411,6 @@ namespace Antmicro.Renode.Peripherals.CPU
                 // remove mappings that are not used anymore
                 currentMappings = currentMappings.
                     Where(x => TlibIsRangeMapped(x.Segment.StartingOffset, x.Segment.StartingOffset + x.Segment.Size) == 1).ToList();
-                checked
-                {
-                    TranslationCacheSize -= range.Size / 4;
-                }
                 mappedMemory.Remove(range);
                 RebuildMemoryMappings();
             }
@@ -557,7 +510,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public void SetHookAtMemoryAccess(Action<ulong, MemoryOperation, ulong, ulong> hook)
+        public void SetHookAtMemoryAccess(Action<ulong, MemoryOperation, ulong, ulong, ulong> hook)
         {
             TlibOnMemoryAccessEventEnabled(hook != null ? 1 : 0);
             memoryAccessHook = hook;
@@ -758,9 +711,23 @@ namespace Antmicro.Renode.Peripherals.CPU
             return $"Undecoded {exceptionIndex}";
         }
 
-        public abstract void SetRegisterUnsafe(int register, RegisterValue value);
+        public abstract void SetRegister(int register, RegisterValue value);
 
-        public abstract RegisterValue GetRegisterUnsafe(int register);
+        public void SetRegisterUnsafe(int register, RegisterValue value)
+        {
+            // This is obsolete API, left here only for compatibility
+            this.Log(LogLevel.Warning, "Using `SetRegisterUnsafe` API is obsolete. Please change to `SetRegister`.");
+            SetRegister(register, value);
+        }
+
+        public abstract RegisterValue GetRegister(int register);
+
+        public RegisterValue GetRegisterUnsafe(int register)
+        {
+            // This is obsolete API, left here only for compatibility
+            this.Log(LogLevel.Warning, "Using `GetRegisterUnsafe` API is obsolete. Please change to `GetRegister`.");
+            return GetRegister(register);
+        }
 
         public abstract IEnumerable<CPURegister> GetRegisters();
 
@@ -1068,9 +1035,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
-        private void OnMemoryAccess(ulong pc, uint operation, ulong address, ulong value)
+        private void OnMemoryAccess(ulong pc, uint operation, ulong virtualAddress, ulong value)
         {
-            memoryAccessHook?.Invoke(pc, (MemoryOperation)operation, address, value);
+            // We don't care if translation fails here (the address is unchanged in this case)
+            TryTranslateAddress(virtualAddress, Misc.MemoryOperationToMpuAccess((MemoryOperation)operation), out var physicalAddress);
+            memoryAccessHook?.Invoke(pc, (MemoryOperation)operation, virtualAddress, physicalAddress, value);
         }
 
         [Export]
@@ -1078,7 +1047,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             var tempArray = new long[size];
             Marshal.Copy(arrayStart, tempArray, 0, size);
-            machine.AppendDirtyAddresses(Id, tempArray);
+            machine.AppendDirtyAddresses(this, tempArray);
         }
 
         [Transient]
@@ -1087,7 +1056,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private IntPtr GetDirty(IntPtr size)
         {
-            var dirtyAddressesList = machine.GetNewDirtyAddressesForCore(Id); 
+            var dirtyAddressesList = machine.GetNewDirtyAddressesForCore(this); 
             var newAddressesCount = dirtyAddressesList.Length;
 
             if(newAddressesCount > 0)
@@ -1117,11 +1086,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private void OnTranslationCacheSizeChange(ulong realSize)
         {
-            if(realSize != translationCacheSize)
-            {
-                translationCacheSize = realSize;
-                this.Log(LogLevel.Warning, "Translation cache size was corrected to {0}B ({1}B).", Misc.NormalizeBinary(realSize), realSize);
-            }
+            this.Log(LogLevel.Debug, "Translation cache size was corrected to {0}B ({1}B).", Misc.NormalizeBinary(realSize), realSize);
         }
 
         private void HandleRamSetup()
@@ -1289,8 +1254,15 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
 
             binder = new NativeBinder(this, libraryFile);
-            TlibSetTranslationCacheSize(checked((IntPtr)translationCacheSize));
             MaximumBlockSize = DefaultMaximumBlockSize;
+
+            // Need to call these before initializing TCG, so to save us an immediate TB flush
+            // Note, that there is an additional hard limit within the translation library itself,
+            // that can prevent setting the new size of translation cache, with a warning log
+            var translationCacheSizeMin = (ulong)ConfigurationManager.Instance.Get("translation", "min-tb-size", DefaultMinimumTranslationCacheSize);
+            var translationCacheSizeMax = (ulong)ConfigurationManager.Instance.Get("translation", "max-tb-size", DefaultMaximumTranslationCacheSize);
+            TlibSetTranslationCacheConfiguration(translationCacheSizeMin, translationCacheSizeMax);
+
             var result = TlibInit(Model);
             if(result == -1)
             {
@@ -1348,15 +1320,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         
         [Transient]
         private string libraryFile;
-
-        private ulong translationCacheSize;
-        private readonly object translationCacheSync;
-
-        [Transient]
-        // the reference here is necessary for the timer to not be garbage collected
-        #pragma warning disable 0414
-        private Timer currentTimer;
-        #pragma warning restore 0414
 
         [Transient]
         private SimpleMemoryManager memoryManager;
@@ -1471,7 +1434,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private Action<ulong> interruptBeginHook;
         private Action<ulong> interruptEndHook;
         private Action<ulong, AccessType, int> mmuFaultHook;
-        private Action<ulong, MemoryOperation, ulong, ulong> memoryAccessHook;
+        private Action<ulong, MemoryOperation, ulong, ulong, ulong> memoryAccessHook;
         private Action<bool> wfiStateChangeHook;
 
         private List<SegmentMapping> currentMappings;
@@ -1728,8 +1691,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             public IntPtr HostPointer;
         }
 
-        #region IDisassemblable implementation
-
         private bool logTranslatedBlocks;
         public bool LogTranslatedBlocks
         {
@@ -1749,9 +1710,40 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        /// <summary>
+        /// Translates a logical (virtual) address to a physical address for the specified access type.
+        /// </summary>
+        /// <param name="logicalAddress">The logical (virtual) address to be translated.</param>
+        /// <param name="accessType">The type of access (read, write, fetch), represented as an <see cref="MpuAccess"/> value.</param>
+        /// <returns>
+        /// The translated physical address if the translation was successful; otherwise, <c>ulong.MaxValue</c>.
+        /// </returns>
         public ulong TranslateAddress(ulong logicalAddress, MpuAccess accessType)
         {
             return TlibTranslateToPhysicalAddress(logicalAddress, (uint)accessType);
+        }
+
+        /// <summary>
+        /// Attempts to translate a logical (virtual) address to a physical address for the specified access type.
+        /// </summary>
+        /// <param name="logicalAddress">The logical (virtual) address to be translated.</param>
+        /// <param name="accessType">The type of access (read, write, fetch), represented as an <see cref="MpuAccess"/> value.</param>
+        /// <param name="physicalAddress">At return, contains the translated physical address if the translation is successful.
+        /// If there is no page table entry for the requested logical address, this output will contain the original logical address.
+        /// </param>
+        /// <returns>
+        /// <c>true</c> if the translation was successful; otherwise, <c>false</c>. In this case the result is the original address.
+        /// </returns>
+        public bool TryTranslateAddress(ulong logicalAddress, MpuAccess accessType, out ulong physicalAddress)
+        {
+            var result = TranslateAddress(logicalAddress, accessType);
+            if(result == ulong.MaxValue) // No translation
+            {
+                physicalAddress = logicalAddress;
+                return false;
+            }
+            physicalAddress = result;
+            return true;
         }
 
         public void NativeUnwind()
@@ -1770,10 +1762,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 this.Log(LogLevel.Warning, "Could not initialize disassembly engine");
             }
+            try
+            {
+                assembler = new LLVMAssembler(this);
+            }
+            catch(ArgumentOutOfRangeException)
+            {
+                this.Log(LogLevel.Warning, "Could not initialize assembly engine");
+            }
             dirtyAddressesPtr = IntPtr.Zero;
         }
-
-        #endregion
 
         public uint PageSize
         {
@@ -1804,8 +1802,24 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibSetBlockBeginHookPresent((blockBeginInternalHook != null || blockBeginUserHook != null || IsSingleStepMode || isAnyInactiveHook) ? 1u : 0u);
         }
 
+        public void EnableReadCache(ulong accessAddress, ulong lowerAccessCount, ulong upperAccessCount = 0)
+        {
+            if(lowerAccessCount == 0)
+            {
+                throw new RecoverableException("Lower access count to address cannot be zero!");
+            }
+            if((upperAccessCount != 0) && ((upperAccessCount <= lowerAccessCount)))
+            {
+                throw new RecoverableException("Upper access count to address has to be bigger than lower access count!");
+            }
+            TlibEnableReadCache(accessAddress, lowerAccessCount, upperAccessCount);
+        }
+
         // 649:  Field '...' is never assigned to, and will always have its default value null
 #pragma warning disable 649
+
+        [Import]
+        private ActionUInt64UInt64UInt64 TlibEnableReadCache;
 
         [Import]
         private ActionUInt32 TlibSetChainingEnabled;
@@ -1883,7 +1897,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private ActionInt32 TlibSetOnBlockTranslationEnabled;
 
         [Import]
-        private ActionIntPtr TlibSetTranslationCacheSize;
+        private ActionUInt64UInt64 TlibSetTranslationCacheConfiguration;
 
         [Import]
         private Action TlibInvalidateTranslationCache;
@@ -2007,8 +2021,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
 #pragma warning restore 649
 
-        protected const int DefaultTranslationCacheSize = 32 * 1024 * 1024;
-
         [Export]
         protected virtual void LogAsCpu(int level, string s)
         {
@@ -2064,13 +2076,13 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         /// <summary>
-        /// This function returns <see cref="CPUCore.Id" /> instead of <see cref="Slot" />, since <see cref="Slot" /> is assigned at platform creation time.
-        /// It's usually not what is needed to identify a core in multi-processing context - instead `cpuId` (passed in CPU constructor) is used.
+        /// See <see cref="CPUCore.MultiprocessingId" /> for explanation on how this property should be interpreted and used.
+        /// Here, we can propagate this value to translation library, e.g. so it can be reflected in CPU's registers
         /// </summary>
         [Export]
         private uint GetMpIndex()
         {
-            return Id;
+            return MultiprocessingId;
         }
 
         public string DisassembleBlock(ulong addr = ulong.MaxValue, uint blockSize = 40, uint flags = 0)
@@ -2084,25 +2096,44 @@ namespace Antmicro.Renode.Peripherals.CPU
                 addr = PC;
             }
 
-            var translatedAddr = TranslateAddress(addr, MpuAccess.InstructionFetch);
-            if(translatedAddr != ulong.MaxValue)
-            {
-                addr = translatedAddr;
-            }
+            // Instruction fetch access used as we want to be able to read even pages mapped for execution only
+            // We don't care if translation fails here (the address is unchanged in this case)
+            TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
 
             var opcodes = Bus.ReadBytes(addr, (int)blockSize, true, context: this);
             Disassembler.DisassembleBlock(addr, opcodes, flags, out var result);
             return result;
         }
 
+        public uint AssembleBlock(ulong addr, string instructions, uint flags = 0)
+        {
+            if(Assembler == null)
+            {
+                throw new RecoverableException("Assembler not available");
+            }
+
+            // Instruction fetch access used as we want to be able to write even pages mapped for execution only
+            // We don't care if translation fails here (the address is unchanged in this case)
+            TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
+
+            var result = Assembler.AssembleBlock(addr, instructions, flags);
+            Bus.WriteBytes(result, addr, true, context: this);
+            return (uint)result.Length;
+        }
+
         [Transient]
         private LLVMDisassembler disassembler;
+        [Transient]
+        private LLVMAssembler assembler;
 
         public LLVMDisassembler Disassembler => disassembler;
+        public LLVMAssembler Assembler => assembler;
 
         protected static readonly Exception InvalidInterruptNumberException = new InvalidOperationException("Invalid interrupt number.");
 
         private const int DefaultMaximumBlockSize = 0x7FF;
+        private const int DefaultMinimumTranslationCacheSize = 32 * 1024 * 1024; // 32 MiB
+        private const int DefaultMaximumTranslationCacheSize = 512 * 1024 * 1024; // 512 MiB
         private bool externalMmuEnabled;
         private readonly uint externalMmuWindowsCount;
 
@@ -2181,13 +2212,13 @@ namespace Antmicro.Renode.Peripherals.CPU
                 machine.Profiler.Log(new ExceptionEntry(exceptionIndex));
             });
 
-            SetHookAtMemoryAccess((_, operation, address, value) =>
+            SetHookAtMemoryAccess((_, operation, __, physicalAddress, value) =>
             {
                 switch(operation)
                 {
                     case MemoryOperation.MemoryIORead:
                     case MemoryOperation.MemoryIOWrite:
-                        machine.Profiler?.Log(new PeripheralEntry((byte)operation, address));
+                        machine.Profiler?.Log(new PeripheralEntry((byte)operation, physicalAddress));
                         break;
                     case MemoryOperation.MemoryRead:
                     case MemoryOperation.MemoryWrite:

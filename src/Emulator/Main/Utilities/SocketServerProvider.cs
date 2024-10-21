@@ -15,38 +15,25 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Sockets;
 using Antmicro.Renode.Exceptions;
 
 namespace Antmicro.Renode.Utilities
 {
     public class SocketServerProvider : IDisposable
     {
-        public SocketServerProvider(bool emitConfigBytes = true, bool flushOnConnect = false)
+        public SocketServerProvider(bool emitConfigBytes = true, bool flushOnConnect = false, string serverName = "")
         {
             queue = new ConcurrentQueue<byte[]>();
             enqueuedEvent = new AutoResetEvent(false);
             this.emitConfigBytes = emitConfigBytes;
             this.flushOnConnect = flushOnConnect;
+            this.serverName = serverName;
         }
 
         public void Start(int port)
         {
-            server = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-
-            // Opt out of optimizing TCP traffic by combining multiple smaller
-            // packets into larger ones. The default behavior caused massive
-            // delays in outgoing GDBStub communication.
-            server.NoDelay = true;
-
-            try
-            {
-                server.Bind(new IPEndPoint(IPAddress.Any, port));
-            }
-            catch(Exception e)
-            {
-                throw new RecoverableException(e);
-            }
-            server.Listen(1);
+            server = SocketsManager.Instance.AcquireSocket(null ,AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp, new IPEndPoint(IPAddress.Any, port), listeningBacklog: 1, nameAppendix: this.serverName);
 
             listenerThread = new Thread(ListenerThreadBody)
             {
@@ -62,8 +49,10 @@ namespace Antmicro.Renode.Utilities
         {
             if(server != null)
             {
-                server.Close();
-                server.Dispose();
+                if(!SocketsManager.Instance.TryDropSocket(server))
+                {
+                    Logger.LogAs(this, LogLevel.Debug, "Failed to drop socket from the manager");
+                }
             }
             socket?.Close();
             stopRequested = true;
@@ -206,10 +195,10 @@ namespace Antmicro.Renode.Utilities
                     if(emitConfigBytes)
                     {
                         var initBytes = new byte[] {
-                            255, 253, 000, // IAC DO    BINARY
-                            255, 251, 001, // IAC WILL  ECHO
-                            255, 251, 003, // IAC WILL  SUPPRESS_GO_AHEAD
-                            255, 252, 034, // IAC WONT  LINEMODE
+                            255, 253,   0, // IAC DO    BINARY
+                            255, 251,   1, // IAC WILL  ECHO
+                            255, 251,   3, // IAC WILL  SUPPRESS_GO_AHEAD
+                            255, 252,  34, // IAC WONT  LINEMODE
                         };
                         stream.Write(initBytes, 0, initBytes.Length);
                         // we expect 9 bytes as a result of sending
@@ -279,6 +268,7 @@ namespace Antmicro.Renode.Utilities
         private AutoResetEvent enqueuedEvent;
         private bool emitConfigBytes;
         private bool flushOnConnect;
+        private readonly string serverName;
         private volatile bool stopRequested;
         private Thread listenerThread;
         private Thread readerThread;

@@ -39,7 +39,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             stream.WriteByte((byte)(IncludeOpcode ? 1 : 0));
             if(IncludeOpcode)
             {
-                AttachedCPU.Disassembler.GetTripleAndModelKey(0, out var triple, out var model);
+                LLVMArchitectureMapping.GetTripleAndModelKey(AttachedCPU, 0, out var triple, out var model);
                 var tripleAndModelString = $"{triple} {model}";
                 usesThumbFlag = tripleAndModelString.Contains("armv7a");
                 var byteCount = Encoding.ASCII.GetByteCount(tripleAndModelString);
@@ -53,6 +53,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override void Write(ExecutionTracer.Block block)
         {
             var pc = block.FirstInstructionPC;
+            var pcVirtual = block.FirstInstructionVirtualPC;
             var counter = 0u;
     
             var hasAdditionalData = block.AdditionalDataInTheBlock.TryDequeue(out var insnAdditionalData);
@@ -82,7 +83,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     WriteByteToBuffer((byte)opcode.Length);
                     WriteBytesToBuffer(opcode);
                 }
-                while(hasAdditionalData && insnAdditionalData.PC == pc)
+                while(hasAdditionalData && insnAdditionalData.PC == pcVirtual)
                 {
                     WriteByteToBuffer((byte)insnAdditionalData.Type);
                     WriteBytesToBuffer(insnAdditionalData.GetBinaryRepresentation());
@@ -91,6 +92,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 WriteByteToBuffer((byte)AdditionalDataType.None);
 
                 pc += (ulong)opcode.Length;
+                pcVirtual += (ulong)opcode.Length;
                 counter++;
 
                 if(bufferPosition >= BufferFlushLevel)
@@ -178,7 +180,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly int pcWidth;
 
         private const string FormatSignature = "ReTrace";
-        private const byte FormatVersion = 3;
+        private const byte FormatVersion = 4;
 
         private const int CacheSize = 100000;
         private const int BufferSize = 10000;

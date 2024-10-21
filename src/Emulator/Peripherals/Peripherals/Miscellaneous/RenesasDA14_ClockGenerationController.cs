@@ -13,10 +13,11 @@ using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
+    // XTAL32M registers are in the RenesasDA14_XTAL32MRegisters model.
     [AllowedTranslations(AllowedTranslation.WordToDoubleWord | AllowedTranslation.ByteToDoubleWord)]
-    public class RenesasDA14_GeneralRegisters : IDoubleWordPeripheral, IProvidesRegisterCollection<DoubleWordRegisterCollection>, IKnownSize
+    public class RenesasDA14_ClockGenerationController : IDoubleWordPeripheral, IProvidesRegisterCollection<DoubleWordRegisterCollection>, IKnownSize
     {
-        public RenesasDA14_GeneralRegisters(IMachine machine, RenesasDA14_XTAL32MRegisters xtal32m, MappedMemory rom, MappedMemory eflashDataText)
+        public RenesasDA14_ClockGenerationController(IMachine machine, RenesasDA14_XTAL32MRegisters xtal32m, MappedMemory rom, MappedMemory eflashDataText)
         {
             this.machine = machine;
             this.xtal32m = xtal32m;
@@ -144,7 +145,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 this.Log(LogLevel.Error, "Tried to initialize remapping of {0} to 0x0, but it is currently unsupported. Ignoring this operation", remapAddress.ToString());
                                 return;
                             }
-                            // we need to cast to ICPUWithRegisters to access SetRegisterUnsafe
+                            // we need to cast to ICPUWithRegisters to access SetRegister
                             ICPUWithRegisters cpuWithRegisters = cpu as ICPUWithRegisters;
                             if(cpuWithRegisters == null)
                             {
@@ -165,9 +166,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 const int PCValueInELF = 0x4;
                                 const int SPValueInELF = 0x0;
                                 cpuWithRegisters.PC = systemBus.ReadDoubleWord(PCValueInELF);
-                                cpuWithRegisters.SetRegisterUnsafe(SP, systemBus.ReadDoubleWord(SPValueInELF));
+                                cpuWithRegisters.SetRegister(SP, systemBus.ReadDoubleWord(SPValueInELF));
                                 cpuWithRegisters.Log(LogLevel.Info, "Succesfully remapped eflash to address 0x0. Restarting machine.");
-                                cpuWithRegisters.Log(LogLevel.Info, "PC set to 0x{0:X}, SP set to 0x{1:X}", cpuWithRegisters.PC.RawValue, cpuWithRegisters.GetRegisterUnsafe(SP).RawValue);
+                                cpuWithRegisters.Log(LogLevel.Info, "PC set to 0x{0:X}, SP set to 0x{1:X}", cpuWithRegisters.PC.RawValue, cpuWithRegisters.GetRegister(SP).RawValue);
                                 cpuWithRegisters.IsHalted = false;
                             });
                         })

@@ -35,7 +35,11 @@ using Machine = Antmicro.Renode.Core.Machine;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public abstract class BaseCPU : CPUCore, ICPU, IDisposable, ITimeSink, IInitableCPU
+    /// <summary>
+    /// <see cref="BaseCPU"/> implements <see cref="ICluster{T}"/> interface
+    /// to seamlessly handle either cluster or CPU as a parameter to different methods.
+    /// </summary>
+    public abstract class BaseCPU : CPUCore, ICluster<BaseCPU>, ICPU, IDisposable, ITimeSink, IInitableCPU
     {
         protected BaseCPU(uint id, string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32)
             : base(id)
@@ -54,46 +58,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             singleStepSynchronizer = new Synchronizer();
             EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged += () => UpdateHaltedState();
-        }
 
-        public string[,] GetRegistersValues()
-        {
-            var result = new Dictionary<string, ulong>();
-            var properties = GetType().GetProperties();
-
-            //uint may be marked with [Register]
-            var registerInfos = properties.Where(x => x.CanRead && x.GetCustomAttributes(false).Any(y => y is RegisterAttribute));
-            foreach(var registerInfo in registerInfos)
-            {
-                try
-                {
-                    result.Add(registerInfo.Name, (ulong)((dynamic)registerInfo.GetGetMethod().Invoke(this, null)));
-                }
-                catch(TargetInvocationException ex)
-                {
-                    if(!(ex.InnerException is RegisterValueUnavailableException))
-                    {
-                        // Something actually went wrong, unwrap exception
-                        ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
-                    }
-                    // Otherwise value is not available, ignore
-                }
-            }
-
-            //every field that is IRegister, contains properties interpreted as registers.
-            var compoundRegisters = properties.Where(x => typeof(IRegisters).IsAssignableFrom(x.PropertyType));
-            foreach(var register in compoundRegisters)
-            {
-                var compoundRegister = (IRegisters)register.GetGetMethod().Invoke(this, null);
-                foreach(var key in compoundRegister.Keys)
-                {
-                    result.Add("{0}{1}".FormatWith(register.Name, key), (ulong)(((dynamic)compoundRegister)[key]));
-                }
-
-            }
-            var table = new Table().AddRow("Name", "Value");
-            table.AddRows(result, x => x.Key, x => "0x{0:X}".FormatWith(x.Value));
-            return table.ToArray();
+            Clustered = new BaseCPU[] { this };
         }
 
         public virtual void InitFromElf(IELF elf)
@@ -206,6 +172,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         public Endianess Endianness { get; }
 
         public IBusController Bus => machine.SystemBus;
+
+        public IEnumerable<ICluster<BaseCPU>> Clusters { get; } = new List<ICluster<BaseCPU>>(0);
+
+        public IEnumerable<BaseCPU> Clustered { get; }
 
         public string Model { get; }
 
@@ -356,6 +326,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         public abstract ulong ExecutedInstructions { get; }
         public abstract RegisterValue PC { get; set; }
 
+        public bool IsPaused => isPaused;
+
         protected virtual void InnerPause(bool onCpuThread, bool checkPauseGuard)
         {
             RequestPause();
@@ -448,6 +420,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             started = false;
             Pause(new HaltArguments(HaltReason.Abort, this), checkPauseGuard: false);
+            singleStepSynchronizer.Enabled = false;
         }
 
         protected void InvokeHalted(HaltArguments arguments)
@@ -598,11 +571,9 @@ restart:
             {
                 this.Trace($"CPU thread body in progress; {instructionsLeftThisRound} instructions left...");
 
-                var instructionsToNearestLimit = InstructionsToNearestLimit();
-
                 // this puts a limit on instructions to execute in one round
                 // and makes timers update independent of the current quantum
-                var toExecute = Math.Min(instructionsToNearestLimit, instructionsLeftThisRound);
+                var toExecute = Math.Min(InstructionsToNearestLimit(), instructionsLeftThisRound);
 
                 if(skipInstructions > 0)
                 {
@@ -627,7 +598,7 @@ restart:
 
                     result = ExecuteInstructions(toExecute, out var executed);
                     this.Trace($"CPU executed {executed} instructions and returned {result}");
-                    machine.Profiler?.Log(new InstructionEntry((byte)Id, ExecutedInstructions));
+                    machine.Profiler?.Log(new InstructionEntry(machine.SystemBus.GetCPUSlot(this), ExecutedInstructions));
                     ReportProgress(executed);
                 }
                 if(ExecutionFinished(result))
@@ -643,12 +614,14 @@ restart:
                         var instructionsToSkip = Math.Min(InstructionsToNearestLimit(), instructionsLeftThisRound);
 
                         virtualTimeAhead = machine.LocalTimeSource.ElapsedVirtualHostTimeDifference;
-                        if(!machine.LocalTimeSource.AdvanceImmediately && virtualTimeAhead.Ticks > 0)
+                        if(!machine.LocalTimeSource.AdvanceImmediately && virtualTimeAhead.Ticks > 0 && instructionsToSkip > 0)
                         {
                             // Don't fall behind realtime by sleeping
                             var intervalToSleep = TimeInterval.FromCPUCycles(instructionsToSkip, PerformanceInMips, out var cyclesResiduum).WithTicksMin(virtualTimeAhead.Ticks);
-                            sleeper.Sleep(intervalToSleep.ToTimeSpan(), out var intervalSlept);
-                            instructionsToSkip = TimeInterval.FromTimeSpan(intervalSlept).ToCPUCycles(PerformanceInMips, out var _) + cyclesResiduum;
+                            sleeper.Sleep(intervalToSleep.ToTimeSpan(out var nsResiduum), out var intervalSlept);
+                            // If we have a CPU of less than 10 MIPS, it might be the case that the interval slept (which is in units of 100 ns)
+                            // is less than 1 instruction. Just round up it in this case.
+                            instructionsToSkip = Math.Max(TimeInterval.FromTimeSpan(intervalSlept, nsResiduum).ToCPUCycles(PerformanceInMips, out var _) + cyclesResiduum, 1);
                         }
 
                         ReportProgress(instructionsToSkip);
@@ -675,8 +648,10 @@ restart:
 
             // If AdvanceImmediately is not enabled, and virtual time has surpassed host time,
             // sleep to make up the difference.
+            // However, if pause was requested, we want to exit as soon as possible without sleeping,
+            // because it was requested from interactive context (e.g. "pause" monitor command).
             virtualTimeAhead = machine.LocalTimeSource.ElapsedVirtualHostTimeDifference;
-            if(!machine.LocalTimeSource.AdvanceImmediately && virtualTimeAhead.Ticks > 0)
+            if(!machine.LocalTimeSource.AdvanceImmediately && virtualTimeAhead.Ticks > 0 && !isPaused)
             {
                 // Ignore the return value, if the sleep is interrupted we'll make up any extra
                 // remaining difference next time. Preserve the interrupt request so that if this
@@ -708,7 +683,7 @@ restart:
                 // reportedInstructions + executedResiduum + instructionsLeft = instructionsToExecuteThisRound
                 // reportedInstructions is divisible by instructionsPerTick and instructionsToExecuteThisRound is divisible by instructionsPerTick
                 // so instructionsLeft + executedResiduum is divisible by instructionsPerTick and residuum is 0
-                var timeLeft = TimeInterval.FromCPUCycles(instructionsLeft + executedResiduum, PerformanceInMips, out var residuum) + TimeInterval.FromTicks(ticksResiduum);
+                var timeLeft = TimeInterval.FromCPUCycles(instructionsLeft + executedResiduum, PerformanceInMips, out var residuum) + TimeInterval.FromMicroseconds(ticksResiduum);
                 DebugHelper.Assert(residuum == 0);
                 if(instructionsLeft > 0)
                 {

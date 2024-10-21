@@ -9,6 +9,7 @@ using System;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Sockets;
 using Antmicro.Renode.Utilities;
 using System.IO;
 using System.Text;
@@ -208,6 +209,7 @@ namespace Antmicro.Renode.UserInterface
             BindStatic(EmulationToken, () => Emulation);
             BindStatic("plugins", () => TypeManager.Instance.PluginManager);
             BindStatic("EmulationManager", () => emulationManager);
+            BindStatic("sockets", () => SocketsManager.Instance);
 
             var includeCommand = new IncludeFileCommand(this, (x, y) => pythonRunner.TryExecutePythonScript(x, y), x => TryExecuteScript(x), (x, y) => TryCompilePlugin(x, y), (x,y) => TryLoadPlatform(x,y));
             Commands.Add(new HelpCommand(this, () =>
@@ -226,7 +228,6 @@ namespace Antmicro.Renode.UserInterface
             Commands.Add(new QuitCommand(this, x => currentMachine = x, () => Quitted));
             Commands.Add(new PeripheralsCommand(this, () => currentMachine));
             Commands.Add(new MonitorPathCommand(this, monitorPath));
-            Commands.Add(new UsingCommand(this, () => usings));
             Commands.Add(new StartCommand(this, includeCommand));
             Commands.Add(new SetCommand(this, "set", "VARIABLE", (x, y) => SetVariable(x, y, variables), (x, y) => EnableStringEater(x, y, VariableType.Variable),
                 DisableStringEater, () => stringEaterMode, GetVariableName));
