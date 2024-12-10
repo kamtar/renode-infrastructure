@@ -24,11 +24,11 @@ namespace Antmicro.Renode.Peripherals.Memory
             array = source;
         }
 
-        public ArrayMemory(int size)
+        public ArrayMemory(ulong size)
         {
-            if(size <= 0)
+            if(size > MaxSize)
             {
-                throw new ConstructionException($"Memory size should be positive, but tried to configure it to: {size}");
+                throw new ConstructionException($"Memory size cannot be larger than 0x{MaxSize:X}, requested: 0x{size:X}");
             }
             array = new byte[size];
         }
@@ -37,7 +37,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(ulong)))
             {
-                LogOffsetError(offset);
                 return 0;
             }
             var intOffset = (int)offset;
@@ -49,7 +48,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(ulong)))
             {
-                LogOffsetError(offset);
                 return;
             }
             var bytes = BitConverter.GetBytes(value);
@@ -60,7 +58,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(uint)))
             {
-                LogOffsetError(offset);
                 return 0;
             }
             var intOffset = (int)offset;
@@ -72,7 +69,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(uint)))
             {
-                LogOffsetError(offset);
                 return;
             }
             var bytes = BitConverter.GetBytes(value);
@@ -88,7 +84,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(ushort)))
             {
-                LogOffsetError(offset);
                 return 0;
             }
             var intOffset = (int)offset;
@@ -100,7 +95,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(ushort)))
             {
-                LogOffsetError(offset);
                 return;
             }
             var bytes = BitConverter.GetBytes(value);
@@ -111,7 +105,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(byte)))
             {
-                LogOffsetError(offset);
                 return 0;
             }
             var intOffset = (int)offset;
@@ -123,7 +116,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, sizeof(byte)))
             {
-                LogOffsetError(offset);
                 return;
             }
             var intOffset = (int)offset;
@@ -134,7 +126,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, count))
             {
-                LogOffsetError(offset);
                 return new byte[count];
             }
             var result = new byte[count];
@@ -146,7 +137,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(!IsCorrectOffset(offset, count))
             {
-                LogOffsetError(offset);
                 return;
             }
             Array.Copy(bytes, startingIndex, array, offset, count);
@@ -173,12 +163,19 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private bool IsCorrectOffset(long offset, int size)
         {
-            return offset >= 0 && offset <= array.Length - size;
+            var result = offset >= 0 && offset <= array.Length - size;
+            if(!result)
+            {
+                this.Log(LogLevel.Error, "Tried to read {0} byte(s) at offset 0x{1:X} outside the range of the peripheral 0x0 - 0x{2:X}", size, offset, array.Length - 1);
+            }
+            return result;
         }
 
-        private void LogOffsetError(long offset)
-        {
-            this.Log(LogLevel.Error, "Tried to read byte at offset 0x{0:X} outside the range of the peripheral 0x0 - 0x{1:X}", offset, array.Length - 1);
-        }
+        // Objects bigger than 2GB are supported in .NET Framework with `gcAllowVeryLargeObjects`
+        // enabled and in .NET by default but there can be no more elements than that in a single
+        // dimension of an array. We could, e.g., double it by using more dimensions but generally
+        // ArrayMemory is mostly intended to be used for memory smaller than page size, which is
+        // required by MappedMemory, so this is much more than should be needed for ArrayMemory.
+        private const ulong MaxSize = 0x7FFFFFC7;
     }
 }

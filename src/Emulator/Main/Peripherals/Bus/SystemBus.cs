@@ -189,11 +189,21 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
             }
+            UnregisterAccessFlags(busRegistered.RegistrationPoint, context);
             peripheralsCollectionByContext[context].Move(busRegistered, newRegistration);
             Machine.ExchangeRegistrationPointForPeripheral(this, peripheral, busRegistered.RegistrationPoint, newRegistration);
             if(wasMapped)
             {
                 AddMappingsForPeripheral(peripheral, newRegistration, context);
+            }
+
+            if(peripheral is ArrayMemory)
+            {
+                foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
+                {
+                    var range = newRegistration.Range;
+                    cpu.RegisterAccessFlags(range.StartAddress, range.Size, isIoMemory: true);
+                }
             }
         }
 
@@ -370,6 +380,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             return id;
         }
 
+        public IEnumerable<ICPU> GetAllContextKeys()
+        {
+            return peripheralsCollectionByContext.GetAllContextKeys();
+        }
+
         private void HandleChangedSymbols()
         {
             OnSymbolsChanged?.Invoke(Machine);
@@ -517,11 +532,23 @@ namespace Antmicro.Renode.Peripherals.Bus
                 .FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
         }
 
+        public bool IsMemory(ulong address, ICPU context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Any(x => x.Peripheral is IMemory && x.RegistrationPoint.Range.Contains(address));
+        }
+
         public IEnumerable<IBusRegistered<IMapped>> GetMappedPeripherals(ICPU context = null)
         {
             return GetAccessiblePeripheralsForContext(context)
                 .Where(x => x.Peripheral is IMapped)
                 .Convert<IBusPeripheral, IMapped>();
+        }
+
+        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegistrationsForPeripheralType<T>(ICPU context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Where(x => x.Peripheral is T);
         }
 
         public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegisteredPeripherals(ICPU context = null)
@@ -636,12 +663,9 @@ namespace Antmicro.Renode.Peripherals.Bus
         // Specifying `textAddress` will override the address of the program text - the symbols will be applied
         // as if the first loaded segment started at the specified address. This is equivalent to the ADDR parameter
         // to GDB's add-symbol-file.
-        public void LoadSymbolsFrom(ReadFilePath fileName, bool useVirtualAddress = false, ulong? textAddress = null, ICPU context = null)
+        public void LoadSymbolsFrom(IELF elf, bool useVirtualAddress = false, ulong? textAddress = null, ICPU context = null)
         {
-            using(var elf = GetELFFromFile(fileName))
-            {
-                GetOrCreateLookup(context).LoadELF(elf, useVirtualAddress, textAddress);
-            }
+            GetOrCreateLookup(context).LoadELF(elf, useVirtualAddress, textAddress);
             pcCache.Invalidate();
         }
 
@@ -658,23 +682,6 @@ namespace Antmicro.Renode.Peripherals.Bus
                 GetOrCreateLookup(context).InsertSymbol(name, address.StartAddress, address.Size);
             }
             pcCache.Invalidate();
-        }
-
-        // Name of the last parameter is kept as 'cpu' for backward compatibility.
-        public void LoadELF(ReadFilePath fileName, bool useVirtualAddress = false, bool allowLoadsOnlyToMemory = true, ICluster<IInitableCPU> cpu = null)
-        {
-            var cluster = cpu;
-            if(cluster == null)
-            {
-                LoadELFInner(fileName, useVirtualAddress, allowLoadsOnlyToMemory);
-            }
-            else
-            {
-                foreach(var cpuInitable in cluster.Clustered)
-                {
-                    LoadELFInner(fileName, useVirtualAddress, allowLoadsOnlyToMemory, cpuInitable);
-                }
-            }
         }
 
         public void LoadUImage(ReadFilePath fileName, IInitableCPU cpu = null)
@@ -1201,52 +1208,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        private void LoadELFInner(ReadFilePath fileName, bool useVirtualAddress = false, bool allowLoadsOnlyToMemory = true, IInitableCPU cpu = null)
-        {
-            if(!Machine.IsPaused)
-            {
-                throw new RecoverableException("Cannot load ELF on an unpaused machine.");
-            }
-            this.DebugLog("Loading ELF {0}.", fileName);
-            using(var elf = GetELFFromFile(fileName))
-            {
-                var segmentsToLoad = elf.Segments.Where(x => x.Type == SegmentType.Load);
-                if(!segmentsToLoad.Any())
-                {
-                    throw new RecoverableException($"ELF '{fileName}' has no loadable segments.");
-                }
-
-                foreach (var s in segmentsToLoad)
-                {
-                    var contents = s.GetContents();
-                    var loadAddress = useVirtualAddress ? s.GetSegmentAddress() : s.GetSegmentPhysicalAddress();
-                    this.Log(LogLevel.Info,
-                        "Loading segment of {0} bytes length at 0x{1:X}.",
-                        s.GetSegmentSize(),
-                        loadAddress
-                    );
-                    this.WriteBytes(contents, loadAddress, allowLoadsOnlyToMemory, cpu);
-                    UpdateLowestLoadedAddress(loadAddress);
-                    this.DebugLog("Segment loaded.");
-                }
-                GetOrCreateLookup(cpu).LoadELF(elf, useVirtualAddress);
-                pcCache.Invalidate();
-
-                if(cpu != null)
-                {
-                    cpu.InitFromElf(elf);
-                }
-                else
-                {
-                    foreach(var c in GetCPUs().OfType<IInitableCPU>())
-                    {
-                        c.InitFromElf(elf);
-                    }
-                }
-                AddFingerprint(fileName);
-            }
-        }
-
         private void UnregisterInner(IBusPeripheral peripheral)
         {
             RemoveMappingsForPeripheral(peripheral);
@@ -1646,7 +1607,8 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             using(Machine.ObtainPausedState(true))
             {
-                var intersecting = GetAccessiblePeripheralsForContext(context).FirstOrDefault(x => x.RegistrationPoint.Range.Intersects(registrationPoint.Range));
+                var busRegisteredInContext = peripheralsCollectionByContext[context].Peripherals;
+                var intersecting = busRegisteredInContext.FirstOrDefault(x => x.RegistrationPoint.Range.Intersects(registrationPoint.Range));
                 if(intersecting != null)
                 {
                     throw new RegistrationException($"Given address {registrationPoint.Range} for peripheral {peripheral} conflicts with address {intersecting.RegistrationPoint.Range} of peripheral {intersecting.Peripheral}", "address");
@@ -1795,23 +1757,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        private static IELF GetELFFromFile(ReadFilePath fileName)
-        {
-            try
-            {
-                if(!ELFReader.TryLoad(fileName, out var result))
-                {
-                    throw new RecoverableException($"Could not load ELF from path: {fileName}");
-                }
-                return result;
-            }
-            catch(Exception e)
-            {
-                // ELF creating exception are recoverable in the sense of emulator state
-                throw new RecoverableException(string.Format("Error while loading ELF: {0}.", e.Message), e);
-            }
-        }
-
         private void ClearAll()
         {
             lock(cpuSync)
@@ -1910,6 +1855,15 @@ namespace Antmicro.Renode.Peripherals.Bus
             var segments = mappedPeripheral.MappedSegments;
             var mappings = segments.Select(x => FromRegistrationPointToSegmentWrapper(x, registrationPoint, cpuWithMappedMemory)).Where(x => x != null);
             AddMappings(mappings, mappedPeripheral);
+        }
+
+        private void UnregisterAccessFlags(BusRangeRegistration registrationPoint, ICPU context)
+        {
+            foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
+            {
+                var range = registrationPoint.Range;
+                cpu.RegisterAccessFlags(range.StartAddress, range.Size);
+            }
         }
 
         private bool RemoveMappingsForPeripheral(IBusPeripheral peripheral)

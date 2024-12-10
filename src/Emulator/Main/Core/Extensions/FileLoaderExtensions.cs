@@ -11,23 +11,28 @@ using System.IO;
 using System.Linq;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Utilities;
+using ELFSharp.ELF.Segments;
 
 namespace Antmicro.Renode.Core.Extensions
 {
     public static class FileLoaderExtensions
     {
-        public static void LoadBinary(this ICanLoadFiles loader, ReadFilePath fileName, ulong loadPoint, ICPU cpu = null)
+        public static void LoadBinary(this ICanLoadFiles loader, ReadFilePath fileName, ulong loadPoint, ICPU cpu = null, long offset = 0)
         {
             const int bufferSize = 100 * 1024;
             List<FileChunk> chunks = new List<FileChunk>();
 
+            Logger.LogAs(loader, LogLevel.Debug, "Loading binary file {0}.", fileName);
             try
             {
                 using(var reader = new FileStream(fileName, FileMode.Open, FileAccess.Read))
                 {
+                    reader.Seek(offset, SeekOrigin.Current);
+
                     var buffer = new byte[bufferSize];
                     var bytesCount = reader.Read(buffer, 0, buffer.Length);
                     var addr = loadPoint;
@@ -46,6 +51,7 @@ namespace Antmicro.Renode.Core.Extensions
                 throw new RecoverableException(string.Format("Exception while loading file {0}: {1}", fileName, e.Message));
             }
 
+            chunks = SortAndJoinConsecutiveFileChunks(chunks);
             loader.LoadFileChunks(fileName, chunks, cpu);
         }
 
@@ -58,6 +64,7 @@ namespace Antmicro.Renode.Core.Extensions
             bool endOfFileReached = false;
             List<FileChunk> chunks = new List<FileChunk>();
 
+            Logger.LogAs(loader, LogLevel.Debug, "Loading HEX file {0}.", fileName);
             try
             {
                 using(var file = new System.IO.StreamReader(fileName))
@@ -76,7 +83,7 @@ namespace Antmicro.Renode.Core.Extensions
                         if(line[0] != ':'
                             || !int.TryParse(line.Substring(1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var length)
                             || !ulong.TryParse(line.Substring(3, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address)
-                            || !byte.TryParse(line.Substring(7, 2), NumberStyles.HexNumber,CultureInfo.InvariantCulture, out var type))
+                            || !byte.TryParse(line.Substring(7, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var type))
                         {
                             throw new RecoverableException($"Parsing error at line #{lineNum}: {line}. Could not parse header");
                         }
@@ -158,6 +165,7 @@ namespace Antmicro.Renode.Core.Extensions
                 throw new RecoverableException($"Exception while loading file {fileName}: {(e.Message)}");
             }
 
+            chunks = SortAndJoinConsecutiveFileChunks(chunks);
             loader.LoadFileChunks(fileName, chunks, cpu);
         }
 
@@ -171,11 +179,11 @@ namespace Antmicro.Renode.Core.Extensions
             List<FileChunk> chunks = new List<FileChunk>();
             Range? currentSegmentInfo = null;
 
+            Logger.LogAs(loader, LogLevel.Debug, "Loading S-record file {0}.", fileName);
             try
             {
                 using(var file = new System.IO.StreamReader(fileName))
                 {
-                    Logger.Log(LogLevel.Debug, "S-record loader: Loading {0}", fileName);
                     while((line = file.ReadLine()) != null)
                     {
                         if(endOfFileReached)
@@ -283,7 +291,6 @@ namespace Antmicro.Renode.Core.Extensions
                                 {
                                     throw new RecoverableException($"Invalid Header record at line #{lineNum}:\n\"{line}\"");
                                 }
-                                Logger.Log(LogLevel.Info, "S-record loader: Header: \"{0}\"", System.Text.Encoding.ASCII.GetString(data.ToArray()));
                                 break;
                             case SRecPurpose.Data:
                                 if(!currentSegmentInfo.HasValue)
@@ -296,10 +303,8 @@ namespace Antmicro.Renode.Core.Extensions
                                 }
                                 else
                                 {
-                                    Logger.Log(LogLevel.Info, "S-record loader: Parsed segment of {0} bytes length at 0x{1:X}", currentSegmentInfo.Value.Size, currentSegmentInfo.Value.StartAddress);
                                     currentSegmentInfo = address.By(dataLength);
                                 }
-
                                 chunks.Add(new FileChunk() { Data = data.ToArray(), OffsetToLoad = address });
                                 break;
                             case SRecPurpose.Count:
@@ -311,7 +316,6 @@ namespace Antmicro.Renode.Core.Extensions
                                 {
                                     throw new RecoverableException($"Data record count mismatch error (calculated: {chunks.Count}, given: {address}) at line #{lineNum}:\n\"{line}\"");
                                 }
-                                Logger.Log(LogLevel.Debug, "S-record loader: Loaded {0} data records", chunks.Count);
                                 break;
                             case SRecPurpose.Termination:
                                 if(dataLength != 0)
@@ -359,14 +363,92 @@ namespace Antmicro.Renode.Core.Extensions
                 return;
             }
 
-            if(currentSegmentInfo.HasValue)
+            chunks = SortAndJoinConsecutiveFileChunks(chunks);
+            loader.LoadFileChunks(fileName, chunks, cpu);
+        }
+
+        // Name of the last parameter is kept as 'cpu' for backward compatibility.
+        public static void LoadELF(this IBusController loader, ReadFilePath fileName, bool useVirtualAddress = false, bool allowLoadsOnlyToMemory = true, ICluster<IInitableCPU> cpu = null)
+        {
+            if(!loader.Machine.IsPaused)
             {
-                Logger.Log(LogLevel.Info, "S-record loader: Parsed segment of {0} bytes length at 0x{1:X}", currentSegmentInfo.Value.Size, currentSegmentInfo.Value.StartAddress);
+                throw new RecoverableException("Cannot load ELF on an unpaused machine.");
+            }
+            Logger.LogAs(loader, LogLevel.Debug, "Loading ELF file {0}.", fileName);
+
+            using(var elf = ELFUtils.LoadELF(fileName))
+            {
+                var segmentsToLoad = elf.Segments.Where(x => x.Type == SegmentType.Load);
+                if(!segmentsToLoad.Any())
+                {
+                    throw new RecoverableException($"ELF '{fileName}' has no loadable segments.");
+                }
+
+                List<FileChunk> chunks = new List<FileChunk>();
+                foreach(var s in segmentsToLoad)
+                {
+                    var contents = s.GetContents();
+                    var loadAddress = useVirtualAddress ? s.GetSegmentAddress() : s.GetSegmentPhysicalAddress();
+                    chunks.Add(new FileChunk() { Data = contents, OffsetToLoad = loadAddress});
+                }
+
+                // If cluster is passed as parameter, we setup ELF locally so it only affects cpus in cluster.
+                // Otherwise, we initialize all cpus on sysbus and load symbols to global lookup.
+                if(cpu != null)
+                {
+                    foreach(var initableCpu in cpu.Clustered)
+                    {
+                        loader.LoadFileChunks(fileName, chunks, initableCpu);
+                        loader.LoadSymbolsFrom(elf, useVirtualAddress, context: initableCpu);
+                        initableCpu.InitFromElf(elf);
+                    }
+                }
+                else
+                {
+                    loader.LoadFileChunks(fileName, chunks, null);
+                    loader.LoadSymbolsFrom(elf, useVirtualAddress);
+                    foreach(var initableCpu in loader.GetCPUs().OfType<IInitableCPU>())
+                    {
+                        initableCpu.InitFromElf(elf);
+                    }
+                }
+            }
+        }
+
+        private static List<FileChunk> SortAndJoinConsecutiveFileChunks(List<FileChunk> chunks)
+        {
+            if(chunks.Count == 0)
+            {
+                return chunks;
             }
 
-            Logger.Log(LogLevel.Debug, "S-record loader: Loaded {0} data records", chunks.Count);
+            chunks.Sort((lhs, rhs) => lhs.OffsetToLoad.CompareTo(rhs.OffsetToLoad));
 
-            loader.LoadFileChunks(fileName, chunks, cpu);
+            List<FileChunk> joinedChunks = new List<FileChunk>();
+            var nextOffset = chunks[0].OffsetToLoad;
+            var firstChunkIdx = 0;
+
+            for(var chunkIdx = 0; chunkIdx < chunks.Count; ++chunkIdx)
+            {
+                var chunk = chunks[chunkIdx];
+                if(chunk.OffsetToLoad != nextOffset)
+                {
+                    joinedChunks.Add(JoinFileChunks(chunks.GetRange(firstChunkIdx, chunkIdx - firstChunkIdx)));
+                    firstChunkIdx = chunkIdx;
+                }
+                var chunkSize = chunk.Data.Count();
+                nextOffset = chunk.OffsetToLoad + (ulong)chunkSize;
+            }
+            joinedChunks.Add(JoinFileChunks(chunks.GetRange(firstChunkIdx, chunks.Count - firstChunkIdx)));
+
+            return joinedChunks;
+        }
+
+        private static FileChunk JoinFileChunks(List<FileChunk> chunks)
+        {
+            var loadOffset = chunks[0].OffsetToLoad;
+            var data = chunks.SelectMany(chunk => chunk.Data);
+            return new FileChunk() { Data = data, OffsetToLoad = loadOffset };
         }
 
         private const char SRecStartOfRecord = 'S';

@@ -48,7 +48,6 @@ namespace Antmicro.Renode.Utilities
                 bus.WriteDoubleWord(addr, elem);
                 addr += 4;
             }
-
         }
 
         public static void LoadFdt(this IBusController sysbus, string file, ulong address, string bootargs = null, bool append = true, string disabledNodes = "", ICPU context = null)
@@ -111,6 +110,11 @@ namespace Antmicro.Renode.Utilities
 
             fdtBlob = fdt.GetBinaryBlob();
             sysbus.WriteBytes(fdtBlob, address, true, context);
+        }
+
+        public static void WriteASCIIString(this IBusController sysbus, ulong address, string stringToLoad, ICPU context = null)
+        {
+            sysbus.WriteBytes(Encoding.ASCII.GetBytes(stringToLoad), address, true, context);
         }
 
         public static Dictionary<PeripheralTreeEntry, IEnumerable<IRegistrationPoint>> GetPeripheralsWithAllRegistrationPoints(this IMachine machine)

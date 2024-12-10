@@ -378,6 +378,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.NoisyLog("Registered memory at 0x{0:X}, size 0x{1:X}.", segment.StartingOffset, segment.Size);
         }
 
+        public void RegisterAccessFlags(ulong startAddress, ulong size, bool isIoMemory = false)
+        {
+            TlibRegisterAccessFlagsForRange(startAddress, size, isIoMemory ? 1u : 0u);
+        }
+
         public void SetMappedMemoryEnabled(Range range, bool enabled)
         {
             using(machine?.ObtainPausedState(true))
@@ -913,13 +918,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         private void ValidateMemoryRangeAndThrow(Range range)
         {
             var pageSize = TlibGetPageSize();
-            if((range.StartAddress % pageSize) != 0)
+            var startUnaligned = (range.StartAddress % pageSize) != 0;
+            var sizeUnaligned = (range.Size % pageSize) != 0;
+            if(startUnaligned || sizeUnaligned)
             {
-                throw new RecoverableException("Memory offset has to be aligned to guest page size.");
-            }
-            if(range.Size % pageSize != 0)
-            {
-                throw new RecoverableException("Memory size has to be aligned to guest page size.");
+                throw new RecoverableException($"Could not register memory at offset 0x{range.StartAddress:X} and size 0x{range.Size:X} - the {(startUnaligned ? "registration address" : "size")} has to be aligned to guest page size 0x{pageSize:X}.");
             }
         }
 
@@ -1672,17 +1675,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             TargetExternal3 = 1 << 9,
         }
 
-        private class SegmentMapping
-        {
-            public IMappedSegment Segment { get; private set; }
-            public bool Touched { get; set; }
-
-            public SegmentMapping(IMappedSegment segment)
-            {
-                Segment = segment;
-            }
-        }
-
         [StructLayout(LayoutKind.Sequential, Pack = 1)]
         private struct HostMemoryBlock
         {
@@ -1862,6 +1854,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private ActionUInt64UInt64 TlibUnmapRange;
+
+        [Import]
+        private ActionUInt64UInt64UInt32 TlibRegisterAccessFlagsForRange;
 
         [Import]
         private FuncUInt32UInt64UInt64 TlibIsRangeMapped;

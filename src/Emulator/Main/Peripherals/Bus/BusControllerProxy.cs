@@ -141,6 +141,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.GetCPUs();
         }
 
+        public IEnumerable<ICPU> GetAllContextKeys()
+        {
+            return ParentController.GetAllContextKeys();
+        }
+
         public virtual int GetCPUSlot(ICPU cpu)
         {
             return ParentController.GetCPUSlot(cpu);
@@ -159,6 +164,11 @@ namespace Antmicro.Renode.Peripherals.Bus
         public virtual IEnumerable<IBusRegistered<IBusPeripheral>> GetRegisteredPeripherals(ICPU context = null)
         {
             return ParentController.GetRegisteredPeripherals(context);
+        }
+
+        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegistrationsForPeripheralType<T>(ICPU context = null)
+        {
+            return ParentController.GetRegistrationsForPeripheralType<T>(context);
         }
 
         public virtual IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral peripheral)
@@ -341,9 +351,9 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.FindMemory(address, context);
         }
 
-        public virtual void LoadELF(ReadFilePath fileName, bool useVirtualAddress = false, bool allowLoadsOnlyToMemory = true, ICluster<IInitableCPU> cpu = null)
+        public virtual bool IsMemory(ulong address, ICPU context = null)
         {
-            ParentController.LoadELF(fileName, useVirtualAddress, allowLoadsOnlyToMemory, cpu);
+            return ParentController.IsMemory(address, context);
         }
 
         public virtual void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, ICPU cpu)
@@ -359,6 +369,11 @@ namespace Antmicro.Renode.Peripherals.Bus
         public virtual void ApplySVD(string path)
         {
             ParentController.ApplySVD(path);
+        }
+
+        public void LoadSymbolsFrom(IELF elf, bool useVirtualAddress = false, ulong? textAddress = null, ICPU context = null)
+        {
+            ParentController.LoadSymbolsFrom(elf, useVirtualAddress, textAddress, context);
         }
 
         public virtual void LoadUImage(ReadFilePath fileName, IInitableCPU cpu = null)

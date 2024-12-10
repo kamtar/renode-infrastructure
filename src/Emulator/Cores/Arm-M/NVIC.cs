@@ -29,19 +29,31 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             priorities = new byte[IRQCount];
             activeIRQs = new Stack<int>();
             pendingIRQs = new SortedSet<int>();
-            systick = new LimitTimer(machine.ClockSource, systickFrequency, this, nameof(systick), uint.MaxValue, Direction.Descending, false, eventEnabled: true, autoUpdate: true);
+            // We set initial limit to the maximum 24-bit value, and don't modify it afterwards.
+            // Instead we reload counter with RELOAD value when counter reaches 0.
+            systick = new LimitTimer(machine.ClockSource, systickFrequency, this, nameof(systick), SysTickMaxValue, Direction.Descending, false, eventEnabled: true);
             this.machine = machine;
             this.priorityMask = priorityMask;
-            this.haltSystickOnDeepSleep = haltSystickOnDeepSleep;
+            defaultHaltSystickOnDeepSleep = haltSystickOnDeepSleep;
             irqs = new IRQState[IRQCount];
             IRQ = new GPIO();
             resetMachine = machine.RequestReset;
             systick.LimitReached += () =>
             {
-                countFlag = true;
-                if(eventEnabled)
+                countFlag.Value = true;
+                if(eventEnabled.Value)
                 {
                     SetPendingIRQ((int)SystemException.SysTick);
+                }
+
+                // If the systick timer is running and the reload value is 0, this has the effect of disabling the counter on the expiration.
+                if(systickReload.Value == 0)
+                {
+                    systick.Enabled = false;
+                }
+                else
+                {
+                    systick.Value = systickReload.Value;
                 }
             };
             RegisterCollection = new DoubleWordRegisterCollection(this);
@@ -63,6 +75,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 DefineTightlyCoupledMemoryControlRegisters();
             }
+
+            cpu.AddHookAtWfiStateChange(HandleWfiStateChange);
         }
 
         public bool MaskedInterruptPresent { get { return maskedInterruptPresent; } }
@@ -98,6 +112,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        public bool HaltSystickOnDeepSleep { get; set; }
+
         public uint ReadDoubleWord(long offset)
         {
             if(offset >= PriorityStart && offset < PriorityEnd)
@@ -130,10 +146,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
             switch((Registers)offset)
             {
-            case Registers.SysTickCalibrationValue:
-                // bits [0, 23] TENMS
-                // Note that some reference manuals state that this value is for 1ms interval and not for 10ms
-                return 0xFFFFFF & (uint)(systick.Frequency / 100);
             case Registers.VectorTableOffset:
                 return cpu.VectorTableOffset;
             case Registers.CPUID:
@@ -161,20 +173,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     return 0;
                 }
                 return cpu.FPDSCR;
-            case Registers.SysTickControl:
-                var currentCountFlag = countFlag ? 1u << 16 : 0;
-                countFlag = false;
-                return (currentCountFlag
-                        | 4u // core clock CLKSOURCE
-                        | ((eventEnabled ? 1u : 0u) << 1)
-                        | (systick.Enabled ? 1u : 0u));
-            case Registers.SysTickReloadValue:
-                return (uint)systick.Limit;
-            case Registers.SysTickValue:
-                cpu?.SyncTime();
-                return (uint)systick.Value;
-            case Registers.SystemControlRegister:
-                return currentSevOnPending ? SevOnPending : 0x0;
             case Registers.ConfigurationAndControl:
                 return ccr;
             case Registers.SystemHandlerPriority1:
@@ -230,22 +228,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
             switch((Registers)offset)
             {
-            case Registers.SysTickControl:
-                eventEnabled = ((value & 2) >> 1) != 0;
-                this.NoisyLog("Systick interrupt {0}.", eventEnabled ? "enabled" : "disabled");
-                systick.Enabled = (value & 1) != 0;
-                this.NoisyLog("Systick timer {0}.", systick.Enabled ? "enabled" : "disabled");
-                break;
-            case Registers.SysTickReloadValue:
-                systick.Limit = value & SysTickMaximumValue;
-                if(value > SysTickMaximumValue)
-                {
-                    this.Log(LogLevel.Warning, "Given value {0} exceeds maximum available {1}. Writing {2}", value, SysTickMaximumValue, systick.Limit);
-                }
-                break;
-            case Registers.SysTickValue:
-                systick.Value = systick.Limit;
-                break;
             case Registers.VectorTableOffset:
                 cpu.VectorTableOffset = value & 0xFFFFFF80;
                 break;
@@ -261,42 +243,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 {
                     resetMachine();
                 }
-                break;
-            case Registers.SystemControlRegister:
-                var sevOnPending = (value & SevOnPending) != 0;
-                var deepSleep = (value & DeepSleep) != 0;
-                var unknownFlags = value & ~(DeepSleep|SevOnPending);
-
-                if(unknownFlags != 0)
-                {
-                    this.Log(LogLevel.Warning, "Unhandled value written to System Control Register: 0x{0:X}.", unknownFlags);
-                }
-                if(deepSleep && haltSystickOnDeepSleep)
-                {
-                    systick.Enabled = false;
-                    // Clean Pending Status of SysTick IRQ when it is set,
-                    // otherwise, we would be instantly waken up.
-                    // This SysTick IRQ status isn't restored on exit from deep-sleep,
-                    // system needs to account for this.
-                    var sysTickIRQ = irqs[(int)SystemException.SysTick];
-                    if((sysTickIRQ & IRQState.Pending) > 0)
-                    {
-                        sysTickIRQ &= ~IRQState.Pending;
-                        pendingIRQs.Remove((int)SystemException.SysTick);
-                        // call 'FindPendingInterrupt' to update 'maskedInterruptPresent'
-                        // this variable is used to wake up CPU in tlib
-                        FindPendingInterrupt();
-                    }
-                    this.NoisyLog("Entering deep sleep");
-                }
-
-                // This register gets written pretty often, this aims to reduce the number of C#->C call
-                if(currentSevOnPending != sevOnPending)
-                {
-                    SetSevOnPendingOnAllCPUs(sevOnPending);
-                    currentSevOnPending = sevOnPending;
-                }
-
                 break;
             case Registers.ConfigurableFaultStatus:
                 cpu.FaultStatus &= ~value;
@@ -395,12 +341,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
             activeIRQs.Clear();
             systick.Reset();
-            eventEnabled = false;
-            systick.AutoUpdate = true;
             IRQ.Unset();
-            countFlag = false;
-            currentSevOnPending = false;
             mpuControlRegister = 0;
+            HaltSystickOnDeepSleep = defaultHaltSystickOnDeepSleep;
 
             // bit [16] DC / Cache enable. This is a global enable bit for data and unified caches.
             ccr = 0x10000;
@@ -501,11 +444,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
             if(pendingInterrupt != SpuriousInterrupt && value)
             {
-                if(systick.Enabled == false)
+                if(systickEnabled.Value && systick.Enabled == false)
                 {
                     this.NoisyLog("Waking up from deep sleep");
                 }
-                systick.Enabled |= value && systick.Limit != 0;
+                systick.Enabled |= value && systickEnabled.Value && systickReload.Value != 0;
             }
         }
 
@@ -521,8 +464,66 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private void DefineRegisters()
         {
+            Registers.SysTickControl.Define(RegisterCollection)
+                .WithFlag(0, out systickEnabled, changeCallback: (_, value) =>
+                {
+                    if(value && systickReload.Value == 0)
+                    {
+                        this.DebugLog("Systick enabled but it won't be started as long as reload value is zero");
+                        return;
+                    }
+                    this.NoisyLog("Systick {0}", value ? "enabled" : "disabled");
+                    systick.Enabled = value;
+                }, name: "ENABLE")
+                .WithFlag(1, out eventEnabled, changeCallback: (_, newValue) =>
+                {
+                    this.NoisyLog("Systick interrupt {0}.", newValue ? "enabled" : "disabled");
+                }, name: "TICKINT")
+                // If no external clock is provided, this bit reads as 1 and ignores writes.
+                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => true, name: "CLKSOURCE") // SysTick uses the processor clock
+                .WithReservedBits(3, 13)
+                .WithFlag(16, out countFlag, FieldMode.ReadToClear, name: "COUNTFLAG")
+                .WithReservedBits(17, 15);
+
+            Registers.SysTickReloadValue.Define(RegisterCollection)
+                .WithValueField(0, 24, out systickReload, changeCallback: (oldValue, newValue) =>
+                {
+                    if(systickEnabled.Value && oldValue == 0 && !systick.Enabled)
+                    {
+                        // We explicitly enable underlying SysTick counter only in the case it was blocked by RELOAD=0.
+                        // We ignore other cases, as we don't want to accidentally enable counter in DEEPSLEEP just by writing to this register.
+                        this.DebugLog("Resuming systick counter due to reload value change from 0x0 to 0x{0:X}", newValue);
+                        systick.Value = newValue;
+                        systick.Enabled = true;
+                    }
+                }, name: "RELOAD")
+                .WithReservedBits(24, 8);
+
+            Registers.SysTickValue.Define(RegisterCollection)
+                .WithValueField(0, 24, writeCallback: (_, __) =>
+                {
+                    if(systickReload.Value != 0)
+                    {
+                        // Write to this register does not trigger the SysTick exception logic - we can't write zero to timer value as it would trigger an event.
+                        systick.Value = systickReload.Value;
+                    }
+                    countFlag.Value = false;
+                },
+                valueProviderCallback: _ =>
+                {
+                    cpu?.SyncTime();
+                    return (uint)systick.Value;
+                }, name: "CURRENT");
+
+            Registers.SysTickCalibrationValue.Define(RegisterCollection)
+                // Note that some reference manuals state that this value is for 1ms interval and not for 10ms
+                .WithValueField(0, 24, FieldMode.Read, valueProviderCallback: _ => SysTickMaxValue & (uint)(systick.Frequency / SysTickCalibration100Hz), name: "TENMS")
+                .WithReservedBits(24, 6)
+                .WithFlag(30, FieldMode.Read, valueProviderCallback: _ => systick.Frequency % SysTickCalibration100Hz != 0, name: "SKEW")
+                .WithFlag(31, FieldMode.Read, valueProviderCallback: _ => true, name: "NOREF");
+
             Registers.InterruptControlState.Define(RegisterCollection)
-                .WithTag("VECTACTIVE", 0, 9)
+                .WithValueField(0, 9, FieldMode.Read, valueProviderCallback: _ => (uint)(activeIRQs.Count == 0 ? 0 : activeIRQs.Peek()), name: "VECTACTIVE")
                 .WithReservedBits(9, 2)
                 .WithTaggedFlag("RETTOBASE", 11)
                 .WithValueField(12, 9, FieldMode.Read, valueProviderCallback: _ => (uint)FindPendingInterrupt(), name: "VECTPENDING")
@@ -574,6 +575,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     }
                 }, valueProviderCallback: _ => irqs[(int)SystemException.NMI].HasFlag(IRQState.Pending), name: "PENDNMISET");
 
+            Registers.SystemControlRegister.Define(RegisterCollection)
+                .WithReservedBits(0, 1)
+                .WithTaggedFlag("SLEEPONEXIT", 1)
+                .WithFlag(2, out deepSleepEnabled, name: "SLEEPDEEP")
+                .WithReservedBits(3, 1)
+                .WithFlag(4, out currentSevOnPending, name: "SEVONPEND",
+                    changeCallback: (_, value) => SetSevOnPendingOnAllCPUs(value))
+                .WithReservedBits(5, 27);
+
             Registers.SystemHandlerControlAndState.Define(RegisterCollection)
                 .WithTaggedFlag("MEMFAULTACT (Memory Manage Active)", 0)
                 .WithTaggedFlag("BUSFAULTACT (Bus Fault Active)", 1)
@@ -591,9 +601,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 .WithTaggedFlag("SVCALLPENDED (SV Call Pending)", 15)
                 // The enable flags only store written data.
                 // Changing them doesn't change a behavior of the model.
-                .WithFlag(16, name: "MEMFAULTENA (Memory Manage Fault Enable)") 
-                .WithFlag(17, name: "BUSFAULTENA (Bus Fault Enable)") 
-                .WithFlag(18, name: "USGFAULTENA (Usage Fault Enable)") 
+                .WithFlag(16, name: "MEMFAULTENA (Memory Manage Fault Enable)")
+                .WithFlag(17, name: "BUSFAULTENA (Bus Fault Enable)")
+                .WithFlag(18, name: "USGFAULTENA (Usage Fault Enable)")
                 .WithReservedBits(19, 13)
                 .WithChangeCallback((_, val) =>
                     this.Log(LogLevel.Warning, "Changing value of the SHCSR register to 0x{0:X}, the register isn't supported by Renode", val)
@@ -867,6 +877,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             return returnValue;
         }
 
+        private void HandleWfiStateChange(bool enteredWfi)
+        {
+            if(enteredWfi && deepSleepEnabled.Value && HaltSystickOnDeepSleep)
+            {
+                systick.Enabled = false;
+                this.NoisyLog("Entering deep sleep");
+            }
+        }
+
         private void EnableOrDisableInterrupt(int offset, uint value, bool enable)
         {
             lock(irqs)
@@ -928,7 +947,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
             // when SEVONPEND is set all interrupts (even those masked)
             // generate an event when entering the pending state
-            if(before != irqs[i] && currentSevOnPending)
+            if(before != irqs[i] && currentSevOnPending.Value)
             {
                 foreach(var cpu in machine.SystemBus.GetCPUs().OfType<CortexM>())
                 {
@@ -1152,25 +1171,25 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             MediaAndFPFeature0 = 0xF40, // MVFR0
             MediaAndFPFeature1 = 0xF44, // MVFR1
             MediaAndFPFeature2 = 0xF48, // MVFR2
-            ICacheInvalidateAllToPoUaIgnored = 0xF50, // ICIALLU 
-            ICacheInvalidateByMVAToPoUaAddress = 0xF58, // ICIMVAU 
-            DCacheInvalidateByMVAToPoCAddress = 0xF5C, // DCIMVAC 
-            DCacheInvalidateBySetWay= 0xF60, // DCISW 
-            DCacheCleanByMVAToPoUAddress = 0xF64, // DCCMVAU 
-            DCacheCleanByMVAToPoCAddress = 0xF68, // DCCMVAC 
-            DCacheCleanBySetWay= 0xF6C, // DCCSW 
-            DCacheCleanAndInvalidateByMVAToPoCAddress = 0xF70, // DCCIMVAC 
-            DCacheCleanAndInvalidateBySetWay= 0xF74, // DCCISW 
-            BranchPredictorInvalidateAllIgnored = 0xF78, // BPIALL 
+            ICacheInvalidateAllToPoUaIgnored = 0xF50, // ICIALLU
+            ICacheInvalidateByMVAToPoUaAddress = 0xF58, // ICIMVAU
+            DCacheInvalidateByMVAToPoCAddress = 0xF5C, // DCIMVAC
+            DCacheInvalidateBySetWay= 0xF60, // DCISW
+            DCacheCleanByMVAToPoUAddress = 0xF64, // DCCMVAU
+            DCacheCleanByMVAToPoCAddress = 0xF68, // DCCMVAC
+            DCacheCleanBySetWay= 0xF6C, // DCCSW
+            DCacheCleanAndInvalidateByMVAToPoCAddress = 0xF70, // DCCIMVAC
+            DCacheCleanAndInvalidateBySetWay= 0xF74, // DCCISW
+            BranchPredictorInvalidateAllIgnored = 0xF78, // BPIALL
 
             // Registers with addresses from 0xF90 to 0xFCF are implementation defined.
             // The following ones are valid for Cortex-M7.
-            InstructionTightlyCoupledMemoryControl = 0xF90, // ITCMCR 
-            DataTightlyCoupledMemoryControl = 0xF94, // DTCMCR 
-            AHBPControl = 0xF98, // AHBPCR 
-            L1CacheControl = 0xF9C, // CACR 
-            AHBSlaveControl = 0xFA0, // AHBSCR 
-            AuxiliaryBusFaultStatus = 0xFA8, // ABFSR 
+            InstructionTightlyCoupledMemoryControl = 0xF90, // ITCMCR
+            DataTightlyCoupledMemoryControl = 0xF94, // DTCMCR
+            AHBPControl = 0xF98, // AHBPCR
+            L1CacheControl = 0xF9C, // CACR
+            AHBSlaveControl = 0xFA0, // AHBSCR
+            AuxiliaryBusFaultStatus = 0xFA8, // ABFSR
         }
 
         private enum RegistersV7
@@ -1221,11 +1240,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         // bit [16] DC / Cache enable. This is a global enable bit for data and unified caches.
         private uint ccr = 0x10000;
 
-        private bool eventEnabled;
-        private readonly bool haltSystickOnDeepSleep;
-        private bool countFlag;
+        private readonly bool defaultHaltSystickOnDeepSleep;
         private byte priorityMask;
-        private bool currentSevOnPending;
         private Stack<int> activeIRQs;
         private ISet<int> pendingIRQs;
         private int binaryPointPosition; // from the right
@@ -1233,6 +1249,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private MPUVersion mpuVersion;
 
         private bool maskedInterruptPresent;
+        private IFlagRegisterField systickEnabled;
+        private IFlagRegisterField eventEnabled;
+        private IFlagRegisterField countFlag;
+        private IValueRegisterField systickReload;
 
         private readonly IRQState[] irqs;
         private readonly byte[] priorities;
@@ -1241,6 +1261,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private readonly LimitTimer systick;
         private readonly IMachine machine;
         private uint cpuId;
+
+        private IFlagRegisterField deepSleepEnabled;
+        private IFlagRegisterField currentSevOnPending;
 
         private const int MPUStart             = 0xD90;
         private const int MPUEnd               = 0xDC4;    // resized for compat. with V8 MPU
@@ -1262,11 +1285,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private const int VectKey              = 0x5FA;
         private const int VectKeyStat          = 0xFA05;
         private const uint SysTickMaximumValue = 0x00FFFFFF;
-        private const uint DeepSleep           = 0x4;
-        private const uint SevOnPending        = 0x10;
 
         private const uint InterruptProgramStatusRegisterMask = 0x1FF;
         private const uint NonMaskableInterruptIRQ = 2;
+        private const int SysTickCalibration100Hz = 100;
+        private const int SysTickMaxValue = (1 << 24) - 1;
     }
 }
-

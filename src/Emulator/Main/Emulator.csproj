@@ -85,9 +85,6 @@
     <Reference Include="Nini">
       <HintPath>..\..\..\..\..\lib\resources\libraries\Nini.dll</HintPath>
     </Reference>
-    <Reference Include="Lucene.Net">
-      <HintPath>..\..\..\..\..\lib\resources\libraries\Lucene.Net.dll</HintPath>
-    </Reference>
     <Reference Include="LZ4">
       <HintPath>..\..\..\..\..\lib\resources\libraries\LZ4.dll</HintPath>
     </Reference>
@@ -443,12 +440,6 @@
     <Compile Include="Logging\Backends\NetworkBackend.cs" />
     <Compile Include="Logging\Backends\LoggerBackend.cs" />
     <Compile Include="Logging\Backends\TextBackend.cs" />
-    <Compile Include="Logging\Lucene\Direction.cs" />
-    <Compile Include="Logging\Lucene\Range.cs" />
-    <Compile Include="Logging\Lucene\ViewFilter.cs" />
-    <Compile Include="Logging\Lucene\SearchResults.cs" />
-    <Compile Include="Logging\Lucene\SearchContext.cs" />
-    <Compile Include="Logging\Backends\LuceneLoggerBackend.cs" />
     <Compile Include="Logging\Backends\DummyLoggerBackend.cs" />
     <Compile Include="Peripherals\Timers\LimitTimer.cs" />
     <Compile Include="Peripherals\Bus\ConnectionRegionAttribute.cs" />
@@ -471,6 +462,7 @@
     <Compile Include="Peripherals\Video\AutoRepaintingVideo.cs" />
     <Compile Include="Peripherals\Python\PythonPeripheral.cs" />
     <Compile Include="Peripherals\Memory\MappedMemory.cs" />
+    <Compile Include="Peripherals\Memory\ArrayMemory.cs" />
     <Compile Include="Peripherals\Input\IPS2Peripheral.cs" />
     <Compile Include="Peripherals\Input\IPS2Controller.cs" />
     <Compile Include="Peripherals\Network\EthernetPhysicalLayer.cs" />
@@ -637,6 +629,7 @@
     <Compile Include="Peripherals\Sensor\IADC.cs" />
     <Compile Include="Peripherals\Bus\IIndirectCSRPeripheral.cs" />
     <Compile Include="Utilities\Fraction.cs" />
+    <Compile Include="Utilities\ELFUtils.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <ItemGroup />
