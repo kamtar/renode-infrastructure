@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -601,7 +601,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
-        protected virtual ulong ReadByteFromBus(ulong offset)
+        protected ulong ReadByteFromBus(ulong offset, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -609,15 +609,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForReading(offset, SysbusAccessWidth.Byte))
             {
-                var res = guard.InterruptTransaction
+                // If the transaction was interrupted while handling a watchpoint, return 0 immediately to avoid
+                // duplicating the access' side effect.
+                return guard.InterruptTransaction
                     ? 0
-                    : (ulong)machine.SystemBus.ReadByte(offset, this);
-                return res;
+                    : (ulong)machine.SystemBus.ReadByte(offset, this, cpuState);
             }
         }
 
         [Export]
-        protected virtual ulong ReadWordFromBus(ulong offset)
+        protected ulong ReadWordFromBus(ulong offset, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -625,14 +626,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForReading(offset, SysbusAccessWidth.Word))
             {
+                // If the transaction was interrupted while handling a watchpoint, return 0 immediately to avoid
+                // duplicating the access' side effect.
                 return guard.InterruptTransaction
                     ? 0
-                    : (ulong)machine.SystemBus.ReadWord(offset, this);
+                    : (ulong)machine.SystemBus.ReadWord(offset, this, cpuState);
             }
         }
 
         [Export]
-        protected virtual ulong ReadDoubleWordFromBus(ulong offset)
+        protected ulong ReadDoubleWordFromBus(ulong offset, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -640,14 +643,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForReading(offset, SysbusAccessWidth.DoubleWord))
             {
+                // If the transaction was interrupted while handling a watchpoint, return 0 immediately to avoid
+                // duplicating the access' side effect.
                 return guard.InterruptTransaction
                     ? 0
-                    : machine.SystemBus.ReadDoubleWord(offset, this);
+                    : machine.SystemBus.ReadDoubleWord(offset, this, cpuState);
             }
         }
 
         [Export]
-        protected virtual ulong ReadQuadWordFromBus(ulong offset)
+        protected ulong ReadQuadWordFromBus(ulong offset, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -655,14 +660,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForReading(offset, SysbusAccessWidth.QuadWord))
             {
+                // If the transaction was interrupted while handling a watchpoint, return 0 immediately to avoid
+                // duplicating the access' side effect.
                 return guard.InterruptTransaction
                     ? 0
-                    : machine.SystemBus.ReadQuadWord(offset, this);
+                    : machine.SystemBus.ReadQuadWord(offset, this, cpuState);
             }
         }
 
         [Export]
-        protected virtual void WriteByteToBus(ulong offset, ulong value)
+        protected void WriteByteToBus(ulong offset, ulong value, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -670,15 +677,17 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForWriting(offset, SysbusAccessWidth.Byte, value))
             {
+                // If the transaction was interrupted while handling a watchpoint, don't perform the write to avoid
+                // duplicating the access' side effect.
                 if(!guard.InterruptTransaction)
                 {
-                    machine.SystemBus.WriteByte(offset, unchecked((byte)value), this);
+                    machine.SystemBus.WriteByte(offset, unchecked((byte)value), this, cpuState);
                 }
             }
         }
 
         [Export]
-        protected virtual void WriteWordToBus(ulong offset, ulong value)
+        protected void WriteWordToBus(ulong offset, ulong value, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -686,15 +695,17 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForWriting(offset, SysbusAccessWidth.Word, value))
             {
+                // If the transaction was interrupted while handling a watchpoint, don't perform the write to avoid
+                // duplicating the access' side effect.
                 if(!guard.InterruptTransaction)
                 {
-                    machine.SystemBus.WriteWord(offset, unchecked((ushort)value), this);
+                    machine.SystemBus.WriteWord(offset, unchecked((ushort)value), this, cpuState);
                 }
             }
         }
 
         [Export]
-        protected virtual void WriteDoubleWordToBus(ulong offset, ulong value)
+        protected void WriteDoubleWordToBus(ulong offset, ulong value, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -702,15 +713,17 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForWriting(offset, SysbusAccessWidth.DoubleWord, value))
             {
+                // If the transaction was interrupted while handling a watchpoint, don't perform the write to avoid
+                // duplicating the access' side effect.
                 if(!guard.InterruptTransaction)
                 {
-                    machine.SystemBus.WriteDoubleWord(offset, (uint)value, this);
+                    machine.SystemBus.WriteDoubleWord(offset, (uint)value, this, cpuState);
                 }
             }
         }
 
         [Export]
-        protected void WriteQuadWordToBus(ulong offset, ulong value)
+        protected void WriteQuadWordToBus(ulong offset, ulong value, ulong cpuState)
         {
             if(UpdateContextOnLoadAndStore)
             {
@@ -718,11 +731,53 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             using(var guard = ObtainPauseGuardForWriting(offset, SysbusAccessWidth.QuadWord, value))
             {
+                // If the transaction was interrupted while handling a watchpoint, don't perform the write to avoid
+                // duplicating the access' side effect.
                 if(!guard.InterruptTransaction)
                 {
-                    machine.SystemBus.WriteQuadWord(offset, value, this);
+                    machine.SystemBus.WriteQuadWord(offset, value, this, cpuState);
                 }
             }
+        }
+
+        protected ulong ReadByteFromBus(ulong offset)
+        {
+            return ReadByteFromBus(offset, GetCPUStateForMemoryTransaction());
+        }
+
+        protected ulong ReadWordFromBus(ulong offset)
+        {
+            return ReadWordFromBus(offset, GetCPUStateForMemoryTransaction());
+        }
+
+        protected ulong ReadDoubleWordFromBus(ulong offset)
+        {
+            return ReadDoubleWordFromBus(offset, GetCPUStateForMemoryTransaction());
+        }
+
+        protected ulong ReadQuadWordFromBus(ulong offset)
+        {
+            return ReadQuadWordFromBus(offset, GetCPUStateForMemoryTransaction());
+        }
+
+        protected void WriteByteToBus(ulong offset, ulong value)
+        {
+            WriteByteToBus(offset, value, GetCPUStateForMemoryTransaction());
+        }
+
+        protected void WriteWordToBus(ulong offset, ulong value)
+        {
+            WriteWordToBus(offset, value, GetCPUStateForMemoryTransaction());
+        }
+
+        protected void WriteDoubleWordToBus(ulong offset, ulong value)
+        {
+            WriteDoubleWordToBus(offset, value, GetCPUStateForMemoryTransaction());
+        }
+
+        protected void WriteQuadWordToBus(ulong offset, ulong value)
+        {
+            WriteQuadWordToBus(offset, value, GetCPUStateForMemoryTransaction());
         }
 
         protected virtual string GetExceptionDescription(ulong exceptionIndex)
@@ -1307,10 +1362,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             CyclesPerInstruction = 1;
         }
 
-        protected override ulong SkipInstructions
+        public override ulong SkipInstructions
         {
             get => base.SkipInstructions;
-            set
+            protected set
             {
                 if(!OnPossessedThread)
                 {
@@ -1326,7 +1381,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Transient]
-        private ActionUInt64 onTranslationBlockFetch;
+        private Action<ulong> onTranslationBlockFetch;
         private byte[] cpuState;
 
         /// <summary>
@@ -1347,7 +1402,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private void TouchHostBlock(ulong offset)
         {
             this.NoisyLog("Trying to find the mapping for offset 0x{0:X}.", offset);
-            var mapping = currentMappings.FirstOrDefault(x => x.Segment.StartingOffset <= offset && offset < x.Segment.StartingOffset + x.Segment.Size);
+            var mapping = currentMappings.FirstOrDefault(x => x.Segment.StartingOffset <= offset && offset <= x.Segment.StartingOffset + (x.Segment.Size - 1));
             if(mapping == null)
             {
                 throw new InvalidOperationException(string.Format("Could not find mapped segment for offset 0x{0:X}.", offset));
@@ -1797,6 +1852,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibAfterLoad(statePtr);
         }
 
+        protected ulong GetCPUStateForMemoryTransaction()
+        {
+            return TlibGetCpuStateForMemoryTransaction();
+        }
+
         [Export]
         private uint IsInDebugMode()
         {
@@ -1825,28 +1885,28 @@ namespace Antmicro.Renode.Peripherals.CPU
 #pragma warning disable 649
 
         [Import]
-        private ActionUInt64UInt64UInt64 TlibEnableReadCache;
+        private Action<ulong, ulong, ulong> TlibEnableReadCache;
 
         [Import]
-        private ActionUInt32 TlibSetChainingEnabled;
+        private Action<uint> TlibSetChainingEnabled;
 
         [Import]
-        private FuncUInt32 TlibGetChainingEnabled;
+        private Func<uint> TlibGetChainingEnabled;
 
         [Import]
-        private ActionUInt32 TlibSetTbCacheEnabled;
+        private Action<uint> TlibSetTbCacheEnabled;
 
         [Import]
-        private FuncUInt32 TlibGetTbCacheEnabled;
+        private Func<uint> TlibGetTbCacheEnabled;
 
         [Import]
-        private ActionUInt32 TlibSetSyncPcEveryInstructionDisabled;
+        private Action<uint> TlibSetSyncPcEveryInstructionDisabled;
 
         [Import]
-        private FuncUInt32 TlibGetSyncPcEveryInstructionDisabled;
+        private Func<uint> TlibGetSyncPcEveryInstructionDisabled;
 
         [Import]
-        private FuncInt32String TlibInit;
+        private Func<string, int> TlibInit;
 
         [Import]
         private Action TlibDispose;
@@ -1855,184 +1915,184 @@ namespace Antmicro.Renode.Peripherals.CPU
         private Action TlibReset;
 
         [Import]
-        private FuncInt32Int32 TlibExecute;
+        private Func<int, int> TlibExecute;
 
         [Import]
-        protected ActionInt32 TlibRequestTranslationBlockInterrupt;
+        protected Action<int> TlibRequestTranslationBlockInterrupt;
 
         [Import]
         protected Action TlibSetReturnRequest;
 
         [Import]
-        private FuncInt32IntPtrInt32 TlibAtomicMemoryStateInit;
+        private Func<IntPtr, int, int> TlibAtomicMemoryStateInit;
 
         [Import]
-        private FuncUInt32 TlibGetPageSize;
+        private Func<uint> TlibGetPageSize;
 
         [Import]
-        private ActionUInt64UInt64 TlibMapRange;
+        private Action<ulong, ulong> TlibMapRange;
 
         [Import]
-        private ActionUInt64UInt64 TlibUnmapRange;
+        private Action<ulong, ulong> TlibUnmapRange;
 
         [Import]
-        private ActionUInt64UInt64UInt32 TlibRegisterAccessFlagsForRange;
+        private Action<ulong, ulong, uint> TlibRegisterAccessFlagsForRange;
 
         [Import]
-        private FuncUInt32UInt64UInt64 TlibIsRangeMapped;
+        private Func<ulong, ulong, uint> TlibIsRangeMapped;
 
         [Import]
-        private ActionIntPtrIntPtr TlibInvalidateTranslationBlocks;
+        private Action<IntPtr, IntPtr> TlibInvalidateTranslationBlocks;
 
         [Import]
-        protected FuncUInt64UInt64UInt32 TlibTranslateToPhysicalAddress;
+        protected Func<ulong, uint, ulong> TlibTranslateToPhysicalAddress;
 
         [Import]
-        private ActionIntPtrInt32 RenodeSetHostBlocks;
+        private Action<IntPtr, int> RenodeSetHostBlocks;
 
         [Import]
         private Action RenodeFreeHostBlocks;
 
         [Import]
-        private ActionInt32Int32 TlibSetIrq;
+        private Action<int, int> TlibSetIrq;
 
         [Import]
-        private FuncUInt32 TlibIsIrqSet;
+        private Func<uint> TlibIsIrqSet;
 
         [Import]
-        private ActionUInt64 TlibAddBreakpoint;
+        private Action<ulong> TlibAddBreakpoint;
 
         [Import]
-        private ActionUInt64 TlibRemoveBreakpoint;
+        private Action<ulong> TlibRemoveBreakpoint;
 
         [Import]
-        private ActionIntPtr RenodeAttachLogTranslationBlockFetch;
+        private Action<IntPtr> RenodeAttachLogTranslationBlockFetch;
 
         [Import]
-        private ActionInt32 TlibSetOnBlockTranslationEnabled;
+        private Action<int> TlibSetOnBlockTranslationEnabled;
 
         [Import]
-        private ActionUInt64UInt64 TlibSetTranslationCacheConfiguration;
+        private Action<ulong, ulong> TlibSetTranslationCacheConfiguration;
 
         [Import]
         private Action TlibInvalidateTranslationCache;
 
         [Import]
-        private FuncUInt32UInt32 TlibSetMaximumBlockSize;
+        private Func<uint, uint> TlibSetMaximumBlockSize;
 
         [Import]
-        private ActionUInt64 TlibFlushPage;
+        private Action<ulong> TlibFlushPage;
 
         [Import]
-        private FuncUInt32 TlibGetMaximumBlockSize;
+        private Func<uint> TlibGetMaximumBlockSize;
 
         [Import]
-        private ActionUInt32 TlibSetMillicyclesPerInstruction;
+        private Action<uint> TlibSetMillicyclesPerInstruction;
 
         [Import]
-        private FuncUInt32 TlibGetMillicyclesPerInstruction;
+        private Func<uint> TlibGetMillicyclesPerInstruction;
 
         [Import]
-        private FuncInt32 TlibRestoreContext;
+        private Func<int> TlibRestoreContext;
 
         [Import]
-        private FuncIntPtr TlibExportState;
+        private Func<IntPtr> TlibExportState;
 
         [Import]
-        private FuncInt32 TlibGetStateSize;
+        private Func<int> TlibGetStateSize;
 
         [Import]
-        protected FuncUInt64 TlibGetExecutedInstructions;
+        protected Func<ulong> TlibGetExecutedInstructions;
 
         [Import]
-        private ActionUInt32 TlibSetBlockFinishedHookPresent;
+        private Action<uint> TlibSetBlockFinishedHookPresent;
 
         [Import]
-        private ActionUInt32 TlibSetBlockBeginHookPresent;
+        private Action<uint> TlibSetBlockBeginHookPresent;
 
         [Import]
-        protected ActionUInt64 TlibResetExecutedInstructions;
+        private Action<uint> TlibSetInterruptBeginHookPresent;
 
         [Import]
-        private ActionUInt32 TlibSetInterruptBeginHookPresent;
+        private Action<uint> TlibSetCpuWfiStateChangeHookPresent;
 
         [Import]
-        private ActionUInt32 TlibSetCpuWfiStateChangeHookPresent;
+        private Action<uint> TlibSetInterruptEndHookPresent;
 
         [Import]
-        private ActionUInt32 TlibSetInterruptEndHookPresent;
+        private Func<ulong> TlibGetTotalExecutedInstructions;
 
         [Import]
-        private FuncUInt64 TlibGetTotalExecutedInstructions;
-
-        [Import]
-        private ActionInt32 TlibOnMemoryAccessEventEnabled;
+        private Action<int> TlibOnMemoryAccessEventEnabled;
 
         [Import]
         private Action TlibCleanWfiProcState;
 
         [Import]
-        private ActionUInt64 TlibSetPageIoAccessed;
+        private Action<ulong> TlibSetPageIoAccessed;
 
         [Import]
-        private ActionUInt64 TlibClearPageIoAccessed;
+        private Action<ulong> TlibClearPageIoAccessed;
 
         [Import]
-        private FuncUInt32 TlibGetCurrentTbDisasFlags;
+        private Func<uint> TlibGetCurrentTbDisasFlags;
 
         [Import(UseExceptionWrapper = false)]
         private Action TlibUnwind;
 
         [Import]
-        private FuncUInt32 TlibGetMmuWindowsCount;
+        private Func<uint> TlibGetMmuWindowsCount;
 
         [Import]
-        private ActionUInt32 TlibRaiseException;
+        private Action<uint> TlibRaiseException;
 
         [Import]
-        private ActionUInt32 TlibEnableExternalWindowMmu;
+        private Action<uint> TlibEnableExternalWindowMmu;
 
         [Import]
-        private FuncInt32UInt32 TlibAcquireMmuWindow;
+        private Func<uint, int> TlibAcquireMmuWindow;
 
         [Import]
-        private ActionUInt32 TlibResetMmuWindow;
+        private Action<uint> TlibResetMmuWindow;
 
         [Import]
-        private ActionUInt32UInt64 TlibSetMmuWindowStart;
+        private Action<uint, ulong> TlibSetMmuWindowStart;
 
         [Import]
-        private ActionUInt32UInt64UInt32 TlibSetMmuWindowEnd;
+        private Action<uint, ulong, uint> TlibSetMmuWindowEnd;
 
         [Import]
-        private ActionUInt32UInt32 TlibSetWindowPrivileges;
+        private Action<uint, uint> TlibSetWindowPrivileges;
 
         [Import]
-        private ActionUInt32UInt64 TlibSetMmuWindowAddend;
+        private Action<uint, ulong> TlibSetMmuWindowAddend;
 
         [Import]
-        private FuncUInt64UInt32 TlibGetMmuWindowStart;
+        private Func<uint, ulong> TlibGetMmuWindowStart;
 
         [Import]
-        private FuncUInt64UInt32 TlibGetMmuWindowEnd;
+        private Func<uint, ulong> TlibGetMmuWindowEnd;
 
         [Import]
-        private FuncUInt32UInt32 TlibGetWindowPrivileges;
+        private Func<uint, uint> TlibGetWindowPrivileges;
 
         [Import]
-        private FuncUInt64UInt32 TlibGetMmuWindowAddend;
+        private Func<uint, ulong> TlibGetMmuWindowAddend;
 
         [Import]
-        private ActionInt32 TlibSetBroadcastDirty;
+        private Action<int> TlibSetBroadcastDirty;
 
         [Import]
         private Action TlibOnLeavingResetState;
 
         [Import]
-        private ActionIntPtr TlibBeforeSave;
+        private Action<IntPtr> TlibBeforeSave;
 
         [Import]
-        private ActionIntPtr TlibAfterLoad;
+        private Action<IntPtr> TlibAfterLoad;
+
+        [Import(UseExceptionWrapper = false)] // Not wrapped for performance
+        private Func<ulong> TlibGetCpuStateForMemoryTransaction;
 
 #pragma warning restore 649
 

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -38,6 +38,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new ConstructionException($"Failed to attach CPU to Generic Interrupt Controller: {e.Message}", e);
             }
             TlibSetMpuRegionsCount(mpuRegionsCount, mpuHyperRegionsCount);
+            TlibSetGicCpuRegisterInterfaceVersion((uint)(gic.ArchitectureVersionAtLeast3 ? GICCPUInterfaceVersion.Version30Or40 : GICCPUInterfaceVersion.None));
             Reset();
         }
 
@@ -313,24 +314,27 @@ namespace Antmicro.Renode.Peripherals.CPU
 
 #pragma warning disable 649
         [Import]
-        private FuncUInt32StringUInt32 TlibCheckSystemRegisterAccess;
+        private Action<uint> TlibSetGicCpuRegisterInterfaceVersion;
+
+        [Import]
+        private Func<string, uint, uint> TlibCheckSystemRegisterAccess;
 
         [Import]
         // The arguments are: char *name, bool log_unhandled_access.
-        private FuncUInt64StringUInt32 TlibGetSystemRegister;
+        private Func<string, uint, ulong> TlibGetSystemRegister;
 
         [Import]
-        private FuncUInt32UInt32UInt32 TlibSetAvailableEls;
+        private Func<uint, uint, uint> TlibSetAvailableEls;
 
         [Import]
         // The arguments are: char *name, uint64_t value, bool log_unhandled_access.
-        private ActionStringUInt64UInt32 TlibSetSystemRegister;
+        private Action<string, ulong, uint> TlibSetSystemRegister;
 
         [Import]
-        private ActionUInt32UInt32 TlibSetMpuRegionsCount;
+        private Action<uint, uint> TlibSetMpuRegionsCount;
 
         [Import]
-        private ActionUInt32UInt64UInt64 TlibRegisterTcmRegion;
+        private Action<uint, ulong, ulong> TlibRegisterTcmRegion;
 #pragma warning restore 649
     }
 }

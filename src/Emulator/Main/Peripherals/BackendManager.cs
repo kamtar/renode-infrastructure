@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -32,6 +32,7 @@ namespace Antmicro.Renode.Peripherals
             {
                 analyzer.Dispose();
             }
+            TypeManager.Instance.AutoLoadedType -= HandleAutoLoadTypeFound;
         }
 
         public IEnumerable<string> GetAvailableAnalyzersFor(IAnalyzableBackend backend)
@@ -112,6 +113,7 @@ namespace Antmicro.Renode.Peripherals
 
             analyzer = CreateAndAttach(analyzerType, backend);
             activeAnalyzers.Add(analyzer);
+            PeripheralBackendAnalyzerCreated?.Invoke(analyzer);
             return true;
         }
 
@@ -129,6 +131,7 @@ namespace Antmicro.Renode.Peripherals
             {
                 analyzer = CreateAndAttach(analyzerType, backend);
                 activeAnalyzers.Add(analyzer);
+                PeripheralBackendAnalyzerCreated?.Invoke(analyzer);
                 return true;
             }
 
@@ -167,6 +170,8 @@ namespace Antmicro.Renode.Peripherals
             }
         }
 
+        public event Action<IAnalyzableBackendAnalyzer> PeripheralBackendAnalyzerCreated;
+
         private IAnalyzableBackendAnalyzer CreateAndAttach(Type analyzerType, object backend)
         {
             dynamic danalyzer = Activator.CreateInstance(analyzerType);
@@ -190,7 +195,7 @@ namespace Antmicro.Renode.Peripherals
 
         private void HandleAutoLoadTypeFound(Type t)
         {
-            var interestingInterfaces = t.GetInterfaces().Where(i => i.IsGenericType && 
+            var interestingInterfaces = t.GetInterfaces().Where(i => i.IsGenericType &&
                 (i.GetGenericTypeDefinition() == typeof(IAnalyzableBackendAnalyzer<>) ||
                     i.GetGenericTypeDefinition() == typeof(IAnalyzableBackend<>)));
 
@@ -241,10 +246,10 @@ namespace Antmicro.Renode.Peripherals
 
             foreach(var pas in preferredAnalyzersString)
             {
-                try 
+                try
                 {
                     preferredAnalyzer.Add(Type.GetType(pas.Key), Type.GetType(pas.Value));
-                } 
+                }
                 catch (Exception)
                 {
                     Logger.LogAs(this, LogLevel.Warning, "Could not restore preferred analyzer for {0}: {1}. Error while loading types", pas.Key, pas.Value);
