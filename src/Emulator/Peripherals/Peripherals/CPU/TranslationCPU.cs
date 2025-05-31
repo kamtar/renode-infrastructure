@@ -282,6 +282,11 @@ namespace Antmicro.Renode.Peripherals.CPU
                 logFile = value;
                 LogTranslatedBlocks = (value != null);
 
+                if(value == null)
+                {
+                    return;
+                }
+
                 try
                 {
                     // truncate the file
@@ -310,7 +315,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             base.InnerPause(onCpuThread, checkPauseGuard);
 
-            if(!onCpuThread && checkPauseGuard)
+            if(onCpuThread && checkPauseGuard)
             {
                 pauseGuard.OrderPause();
             }
@@ -551,7 +556,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void AddHookAtInterruptEnd(Action<ulong> hook)
         {
-            if(!Architecture.Contains("riscv") && !Architecture.Contains("arm"))
+            if(!Architecture.Contains("riscv") && !Architecture.Contains("arm") && !Architecture.Contains("sparc"))
             {
                 throw new RecoverableException("Hooks at the end of interrupt are supported only in the RISC-V and ARM architectures");
             }
@@ -1255,7 +1260,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected override void DisposeInner(bool silent = false)
         {
             base.DisposeInner(silent);
-            TimeHandle.Dispose();
+            TimeHandle?.Dispose();
             RemoveAllHooks();
             TlibDispose();
             RenodeFreeHostBlocks();
@@ -1381,7 +1386,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Transient]
-        private Action<ulong> onTranslationBlockFetch;
+        private TranslationBlockFetchCallback onTranslationBlockFetch;
         private byte[] cpuState;
 
         /// <summary>
@@ -1395,6 +1400,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Transient]
         private SimpleMemoryManager memoryManager;
+
+        private delegate void TranslationBlockFetchCallback(ulong pc);
 
         public uint IRQ{ get { return TlibIsIrqSet(); } }
 

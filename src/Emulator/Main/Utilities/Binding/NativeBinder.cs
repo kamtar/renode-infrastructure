@@ -159,7 +159,10 @@ namespace Antmicro.Renode.Utilities.Binding
             var invoke = importType.GetMethod("Invoke");
             Type[] paramTypes = invoke.GetParameters().Select(p => p.ParameterType).ToArray();
             Type[] paramTypesWithWrappersType = new Type[] { wrappersType }.Concat(paramTypes).ToArray();
-            DynamicMethod method = new DynamicMethod(importField.Name, invoke.ReturnType, paramTypesWithWrappersType, wrappersType);
+            // We need skipVisibility to handle methods that have a protected or private type as a parameter or return value.
+            // Interesting tidbit: this access check is only performed by .NET Framework, Mono and .NET Core allow it
+            // without skipVisibility.
+            DynamicMethod method = new DynamicMethod(importField.Name, invoke.ReturnType, paramTypesWithWrappersType, wrappersType, skipVisibility: true);
             var il = method.GetILGenerator();
 
             il.Emit(OpCodes.Ldarg_0); // wrappersType instance
@@ -296,7 +299,9 @@ namespace Antmicro.Renode.Utilities.Binding
             var symbols = SharedLibraries.GetAllSymbols(libraryFileName);
             var classMethods = classToBind.GetType().GetAllMethods().ToArray();
             var exportedMethods = new List<MethodInfo>();
-            foreach(var originalCandidate in symbols.Where(x => x.Contains("renode_external_attach")))
+            // When tlib is built with gcov coverage reporting it creates functions prefixed with __gcov for each function in the binary
+            // so we need to exclude those since they should not be bound here
+            foreach(var originalCandidate in symbols.Where(x => x.Contains("renode_external_attach") && !x.StartsWith("__gcov")))
             {
                 var candidate  = FilterCppName(originalCandidate);
                 var parts = candidate.Split(new [] { "__" }, StringSplitOptions.RemoveEmptyEntries);

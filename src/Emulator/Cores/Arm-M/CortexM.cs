@@ -30,6 +30,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             if(nvic == null)
             {
+                // Free unmanaged resources allocated by the base class constructor
+                Dispose();
                 throw new RecoverableException(new ArgumentNullException("nvic"));
             }
 
@@ -69,7 +71,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(RecoverableException e)
             {
-                // Rethrow attachment error as ConstructionException, so the CreationDriver doesn't crash
+                // Rethrow attachment error as ConstructionException, so the CreationDriver doesn't crash. Also
+                // free unmanaged resources allocated by the base class constructor
+                Dispose();
                 throw new ConstructionException("Exception occurred when attaching NVIC: ", e);
             }
         }
@@ -203,20 +207,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get
             {
-                var secure = 0u;
-                if(TrustZoneEnabled)
-                {
-                    secure = SecureState ? 1u : 0u;
-                }
-                return tlibGetInterruptVectorBase(secure);
+                return tlibGetInterruptVectorBase(ShouldAccessBeSecure());
             }
             set
             {
-                var secure = 0u;
-                if(TrustZoneEnabled)
-                {
-                    secure = SecureState ? 1u : 0u;
-                }
                 vtorInitialized = true;
                 if(!machine.SystemBus.IsMemory(value, this))
                 {
@@ -224,7 +218,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     return;
                 }
                 this.NoisyLog("VectorTableOffset set to 0x{0:X}.", value);
-                tlibSetInterruptVectorBase(value, secure);
+                tlibSetInterruptVectorBase(value, ShouldAccessBeSecure());
             }
         }
 
@@ -329,21 +323,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get
             {
-                var secure = 0u;
-                if(TrustZoneEnabled)
-                {
-                    secure = SecureState ? 1u : 0u;
-                }
-                return tlibGetFaultStatus(secure);
+                return tlibGetFaultStatus(ShouldAccessBeSecure());
             }
             set
             {
-                var secure = 0u;
-                if(TrustZoneEnabled)
-                {
-                    secure = SecureState ? 1u : 0u;
-                }
-                tlibSetFaultStatus(value, secure);
+                tlibSetFaultStatus(value, ShouldAccessBeSecure());
             }
         }
 
@@ -365,12 +349,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get
             {
-                var secure = 0u;
-                if(TrustZoneEnabled)
-                {
-                    secure = SecureState ? 1u : 0u;
-                }
-                return tlibGetMemoryFaultAddress(secure);
+                return tlibGetMemoryFaultAddress(ShouldAccessBeSecure());
             }
         }
 
@@ -419,72 +398,216 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get
             {
-                return tlibGetPmsav8Ctrl();
+                return tlibGetPmsav8Ctrl(ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Ctrl(value);
+                tlibSetPmsav8Ctrl(value, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8Ctrl_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Ctrl_NS), () => tlibGetPmsav8Ctrl(0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Ctrl_NS), val => tlibSetPmsav8Ctrl(val, 0), value);
         }
 
         public UInt32 PmsaV8Rnr
         {
             get
             {
-                return tlibGetPmsav8Rnr();
+                return tlibGetPmsav8Rnr(ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Rnr(value);
+                tlibSetPmsav8Rnr(value, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8Rnr_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rnr_NS), () => tlibGetPmsav8Rnr(0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rnr_NS), val => tlibSetPmsav8Rnr(val, 0), value);
         }
 
         public UInt32 PmsaV8Rbar
         {
             get
             {
-                return tlibGetPmsav8Rbar();
+                return tlibGetPmsav8Rbar(0, ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Rbar(value);
+                tlibSetPmsav8Rbar(value, 0, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8RbarAlias1
+        {
+            get
+            {
+                return tlibGetPmsav8Rbar(1, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rbar(value, 1, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8RbarAlias2
+        {
+            get
+            {
+                return tlibGetPmsav8Rbar(2, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rbar(value, 2, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8RbarAlias3
+        {
+            get
+            {
+                return tlibGetPmsav8Rbar(3, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rbar(value, 3, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8Rbar_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), () => tlibGetPmsav8Rbar(0, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), val => tlibSetPmsav8Rbar(val, 0, 0), value);
+        }
+
+        public UInt32 PmsaV8RbarAlias1_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), () => tlibGetPmsav8Rbar(1, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), val => tlibSetPmsav8Rbar(val, 1, 0), value);
+        }
+
+        public UInt32 PmsaV8RbarAlias2_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), () => tlibGetPmsav8Rbar(2, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), val => tlibSetPmsav8Rbar(val, 2, 0), value);
+        }
+
+        public UInt32 PmsaV8RbarAlias3_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), () => tlibGetPmsav8Rbar(3, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rbar_NS), val => tlibSetPmsav8Rbar(val, 3, 0), value);
         }
 
         public UInt32 PmsaV8Rlar
         {
             get
             {
-                return tlibGetPmsav8Rlar();
+                return tlibGetPmsav8Rlar(0, ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Rlar(value);
+                tlibSetPmsav8Rlar(value, 0, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8RlarAlias1
+        {
+            get
+            {
+                return tlibGetPmsav8Rlar(1, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rlar(value, 1, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8RlarAlias2
+        {
+            get
+            {
+                return tlibGetPmsav8Rlar(2, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rlar(value, 2, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8RlarAlias3
+        {
+            get
+            {
+                return tlibGetPmsav8Rlar(3, ShouldAccessBeSecure());
+            }
+            set
+            {
+                tlibSetPmsav8Rlar(value, 3, ShouldAccessBeSecure());
+            }
+        }
+
+        public UInt32 PmsaV8Rlar_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), () => tlibGetPmsav8Rlar(0, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), val => tlibSetPmsav8Rlar(val, 0, 0), value);
+        }
+
+        public UInt32 PmsaV8RlarAlias1_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), () => tlibGetPmsav8Rlar(1, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), val => tlibSetPmsav8Rlar(val, 1, 0), value);
+        }
+
+        public UInt32 PmsaV8RlarAlias2_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), () => tlibGetPmsav8Rlar(2, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), val => tlibSetPmsav8Rlar(val, 2, 0), value);
+        }
+
+        public UInt32 PmsaV8RlarAlias3_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), () => tlibGetPmsav8Rlar(3, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rlar_NS), val => tlibSetPmsav8Rlar(val, 3, 0), value);
         }
 
         public UInt32 PmsaV8Mair0
         {
             get
             {
-                return tlibGetPmsav8Mair(0);
+                return tlibGetPmsav8Mair(0, ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Mair(0, value);
+                tlibSetPmsav8Mair(0, value, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8Mair0_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Mair0_NS), () => tlibGetPmsav8Mair(0, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Mair0_NS), val => tlibSetPmsav8Mair(0, val, 0), value);
         }
 
         public UInt32 PmsaV8Mair1
         {
             get
             {
-                return tlibGetPmsav8Mair(1);
+                return tlibGetPmsav8Mair(1, ShouldAccessBeSecure());
             }
             set
             {
-                tlibSetPmsav8Mair(1, value);
+                tlibSetPmsav8Mair(1, value, ShouldAccessBeSecure());
             }
+        }
+
+        public UInt32 PmsaV8Mair1_NS
+        {
+            get => GetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), () => tlibGetPmsav8Mair(1, 0));
+            set => SetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), val => tlibSetPmsav8Mair(1, val, 0), value);
         }
 
         public bool MPUEnabled
@@ -621,6 +744,16 @@ namespace Antmicro.Renode.Peripherals.CPU
                 InitPCAndSP();
             }
             base.OnLeavingResetState();
+        }
+
+        private uint ShouldAccessBeSecure()
+        {
+            var secure = 0u;
+            if(TrustZoneEnabled)
+            {
+                secure = SecureState ? 1u : 0u;
+            }
+            return secure;
         }
 
         /// <remarks>Use <see cref="GetTrustZoneRelatedRegister"/> and <see cref="SetTrustZoneRelatedRegister"/> to wrap accesses which have to succeed.</remarks>
@@ -1042,34 +1175,34 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         /* PMSAv8 MPU */
         [Import]
-        private Action<uint> tlibSetPmsav8Ctrl;
+        private Action<uint, uint> tlibSetPmsav8Ctrl;
 
         [Import]
-        private Action<uint> tlibSetPmsav8Rnr;
+        private Action<uint, uint> tlibSetPmsav8Rnr;
 
         [Import]
-        private Action<uint> tlibSetPmsav8Rbar;
+        private Action<uint, uint, uint> tlibSetPmsav8Rbar;
 
         [Import]
-        private Action<uint> tlibSetPmsav8Rlar;
+        private Action<uint, uint, uint> tlibSetPmsav8Rlar;
 
         [Import]
-        private Action<uint, uint> tlibSetPmsav8Mair;
+        private Action<uint, uint, uint> tlibSetPmsav8Mair;
 
         [Import]
-        private Func<uint> tlibGetPmsav8Ctrl;
+        private Func<uint, uint> tlibGetPmsav8Ctrl;
 
         [Import]
-        private Func<uint> tlibGetPmsav8Rnr;
+        private Func<uint, uint> tlibGetPmsav8Rnr;
 
         [Import]
-        private Func<uint> tlibGetPmsav8Rbar;
+        private Func<uint, uint, uint> tlibGetPmsav8Rbar;
 
         [Import]
-        private Func<uint> tlibGetPmsav8Rlar;
+        private Func<uint, uint, uint> tlibGetPmsav8Rlar;
 
         [Import]
-        private Func<uint, uint> tlibGetPmsav8Mair;
+        private Func<uint, uint, uint> tlibGetPmsav8Mair;
 
         #pragma warning restore 649
     }

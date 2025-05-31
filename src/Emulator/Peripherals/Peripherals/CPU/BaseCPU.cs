@@ -57,7 +57,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             isPaused = true;
 
             singleStepSynchronizer = new Synchronizer();
-            EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged += () => UpdateHaltedState();
+            EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged += UpdateHaltedState;
 
             Clustered = new BaseCPU[] { this };
         }
@@ -336,7 +336,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             RequestPause();
 
-            if(onCpuThread)
+            if(!onCpuThread)
             {
                 bool success = false;
                 do
@@ -385,11 +385,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 // cpuThread can get null as a result of `InnerPause` call
                 var cpuThreadCopy = cpuThread;
-                var onCpuThread = (cpuThreadCopy != null && Thread.CurrentThread.ManagedThreadId != cpuThreadCopy.ManagedThreadId);
+                var onCpuThread = (cpuThreadCopy != null && Thread.CurrentThread.ManagedThreadId == cpuThreadCopy.ManagedThreadId);
 
                 InnerPause(onCpuThread, checkPauseGuard);
 
-                if(onCpuThread)
+                if(!onCpuThread)
                 {
                     singleStepSynchronizer.Enabled = false;
                     this.NoisyLog("Waiting for thread to pause.");
@@ -448,6 +448,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected virtual void DisposeInner(bool silent = false)
         {
+            // Take a copy of the CPU thread because it will be cleared at the end of its body
+            var cpuThreadCopy = cpuThread;
             disposing = true;
             if(!silent)
             {
@@ -456,6 +458,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             started = false;
             Pause(new HaltArguments(HaltReason.Abort, this), checkPauseGuard: false);
             singleStepSynchronizer.Enabled = false;
+            cpuThreadCopy?.Join();
+            EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged -= UpdateHaltedState;
         }
 
         protected void InvokeHalted(HaltArguments arguments)
@@ -925,6 +929,12 @@ restart:
                 }
             }
             PC = entryPoint;
+        }
+
+        // For use as an event callback to allow unregistering.
+        private void UpdateHaltedState()
+        {
+            UpdateHaltedState(ignoreExecutionMode: false);
         }
 
         [Transient]
