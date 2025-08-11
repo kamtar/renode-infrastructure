@@ -138,7 +138,7 @@ namespace Antmicro.Renode.Peripherals.Cutter.SPIDevices
                 }
             }
 
-            return 0xFF;//high impedance
+            return 0x00; //should be in high impedance state
         }
         
         public void DeviceSelected()
