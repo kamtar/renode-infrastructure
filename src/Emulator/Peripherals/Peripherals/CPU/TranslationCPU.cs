@@ -453,9 +453,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         public bool DisableInterruptsWhileStepping { get; set; }
 
         // this is just for easier usage in Monitor
-        public void LogFunctionNames(bool value, bool removeDuplicates = false)
+        public void LogFunctionNames(bool value, bool removeDuplicates = false, bool useFunctionSymbolsOnly = true)
         {
-            LogFunctionNames(value, string.Empty, removeDuplicates);
+            LogFunctionNames(value, string.Empty, removeDuplicates, useFunctionSymbolsOnly);
         }
 
         public ulong GetCurrentInstructionsCount()
@@ -463,7 +463,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             return TlibGetTotalExecutedInstructions();
         }
 
-        public void LogFunctionNames(bool value, string spaceSeparatedPrefixes = "", bool removeDuplicates = false)
+        public void LogFunctionNames(bool value, string spaceSeparatedPrefixes = "", bool removeDuplicates = false, bool useFunctionSymbolsOnly = true)
         {
             if(!value)
             {
@@ -479,7 +479,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             SetInternalHookAtBlockBegin((pc, size) =>
             {
-                if(Bus.TryFindSymbolAt(pc, out var name, out var symbol, this))
+                if(Bus.TryFindSymbolAt(pc, out var name, out var symbol, this, useFunctionSymbolsOnly))
                 {
                     if(removeDuplicates && symbol == previousSymbol)
                     {
@@ -925,7 +925,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 // Overflow on 64bits currently not possible due to type constraints
                 if(this.bitness == CpuBitness.Bits32)
                 {
-                    useInclusiveEndRange = ((endAddress - 1) == UInt32.MaxValue); 
+                    useInclusiveEndRange = ((endAddress - 1) == UInt32.MaxValue);
                 }
 
                 if(useInclusiveEndRange)
@@ -1133,14 +1133,14 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private IntPtr GetDirty(IntPtr size)
         {
-            var dirtyAddressesList = machine.GetNewDirtyAddressesForCore(this); 
+            var dirtyAddressesList = machine.GetNewDirtyAddressesForCore(this);
             var newAddressesCount = dirtyAddressesList.Length;
 
             if(newAddressesCount > 0)
             {
                 dirtyAddressesPtr = memoryManager.Reallocate(dirtyAddressesPtr, new IntPtr(newAddressesCount * 8));
                 Marshal.Copy(dirtyAddressesList, 0, dirtyAddressesPtr, newAddressesCount);
-            }      
+            }
             Marshal.WriteInt64(size, newAddressesCount);
 
             return dirtyAddressesPtr;
@@ -1280,6 +1280,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private void ReportAbort(string message)
         {
             this.Log(LogLevel.Error, "CPU abort [PC=0x{0:X}]: {1}.", PC.RawValue, message);
+            /* If the trace writer runs asynchronyously, we need to disable it.
+             * Otherwise it might catch the CpuAbortException when we cross the tlib boundary
+             * since the tracer can read emulated CPU registers (tlib callbacks)
+             * and catch the exception there, before the CPU thread does.
+             */
+            ExecutionTracerExtensions.DisableExecutionTracing(this);
             throw new CpuAbortException(message);
         }
 
@@ -1289,7 +1295,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             It has to survive emulation reset, so the file names remain unique.
         */
         private static int CpuCounter = 0;
-        
+
         protected override bool UpdateHaltedState(bool ignoreExecutionMode = false)
         {
             if(!base.UpdateHaltedState(ignoreExecutionMode))
@@ -1394,7 +1400,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// It's used to restore the atomic state after deserialization
         /// </summary>
         private int atomicId;
-        
+
         [Transient]
         private string libraryFile;
 
@@ -1788,7 +1794,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// </returns>
         public ulong TranslateAddress(ulong logicalAddress, MpuAccess accessType)
         {
-            return TlibTranslateToPhysicalAddress(logicalAddress, (uint)accessType);
+            var physicalAddress = TlibTranslateToPhysicalAddress(logicalAddress, (uint)accessType);
+            if(physicalAddress == ulong.MaxValue)
+            {
+                throw new RecoverableException($"Failed to translate address: 0x{logicalAddress:X}");
+            }
+            return physicalAddress;
         }
 
         /// <summary>
@@ -1804,14 +1815,16 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// </returns>
         public bool TryTranslateAddress(ulong logicalAddress, MpuAccess accessType, out ulong physicalAddress)
         {
-            var result = TranslateAddress(logicalAddress, accessType);
-            if(result == ulong.MaxValue) // No translation
+            try
+            {
+                physicalAddress = TranslateAddress(logicalAddress, accessType);
+                return true;
+            }
+            catch (RecoverableException)
             {
                 physicalAddress = logicalAddress;
                 return false;
             }
-            physicalAddress = result;
-            return true;
         }
 
         public void NativeUnwind()
@@ -2121,7 +2134,11 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return;
             }
 
-            var phy = TranslateAddress(pc, MpuAccess.InstructionFetch);
+            if(!TryTranslateAddress(pc, MpuAccess.InstructionFetch, out var phy))
+            {
+                this.Log(LogLevel.Warning, "Failed to translate address 0x{0:X} while trying to log instruction disassembly", pc);
+                return;
+            }
             var symbol = Bus.FindSymbolAt(pc, this);
             var tab = Bus.ReadBytes(phy, (int)size, true, context: this);
             Disassembler.DisassembleBlock(pc, tab, flags, out var disas);

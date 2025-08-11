@@ -307,9 +307,9 @@ namespace Antmicro.Renode.Peripherals.Bus
             ParentController.SetPeripheralEnabled(peripheral, enabled);
         }
 
-        public virtual bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null)
+        public virtual bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null, bool functionOnly = false)
         {
-            return ParentController.TryFindSymbolAt(offset, out name, out symbol, context);
+            return ParentController.TryFindSymbolAt(offset, out name, out symbol, context, functionOnly);
         }
 
         public virtual ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuState = null)
@@ -372,6 +372,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             ParentController.MoveRegistrationWithinContext(peripheral, newRegistration, context, selector);
         }
 
+        public void ChangePeripheralAccessCondition(IBusPeripheral peripheral, string newCondition, string oldCondition = null)
+        {
+            ParentController.ChangePeripheralAccessCondition(peripheral, newCondition, oldCondition);
+        }
+
         void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
         {
             ((IPeripheralRegister<IBusPeripheral, BusMultiRegistration>)ParentController).Unregister(peripheral);
@@ -432,14 +437,14 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.IsMemory(address, context);
         }
 
-        public virtual void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, ICPU cpu)
+        public virtual void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, IPeripheral cpu)
         {
             ParentController.LoadFileChunks(path, chunks, cpu);
         }
 
-        public virtual void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false)
+        public virtual void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false)
         {
-            ParentController.Tag(range, tag, defaultValue, pausing);
+            ParentController.Tag(range, tag, defaultValue, pausing, silent);
         }
 
         public virtual void ApplySVD(string path)
@@ -470,6 +475,16 @@ namespace Antmicro.Renode.Peripherals.Bus
         public virtual SymbolLookup GetLookup(ICPU context = null)
         {
             return ParentController.GetLookup(context);
+        }
+
+        public virtual IReadOnlyDictionary<string, int> GetCommonStateBits()
+        {
+            return ParentController.GetCommonStateBits();
+        }
+
+        public virtual IReadOnlyDictionary<string, int> GetStateBits(string initiatorName)
+        {
+            return ParentController.GetStateBits(initiatorName);
         }
 
         public virtual bool TryGetAllSymbolAddresses(string symbolName, out IEnumerable<ulong> symbolAddresses, ICPU context = null)

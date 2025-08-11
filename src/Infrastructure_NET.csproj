@@ -29,6 +29,9 @@
     <Reference Include="IronPython.Modules">
       <HintPath>..\..\..\lib\resources\libraries\ironpython-netcore\IronPython.Modules.dll</HintPath>
     </Reference>
+    <Reference Include="Sprache">
+      <HintPath>../../../lib/resources/libraries/Sprache.dll</HintPath>
+    </Reference>
     <PackageReference Include="IronPython.StdLib" Version="2.7.12.0">
       <!-- We only need the Lib directory with python files, IronPython is referenced from our patched dll -->
       <IncludeAssets>contentFiles</IncludeAssets>
@@ -81,6 +84,9 @@
     <Compile Remove="**/obj/**/*AssemblyInfo.cs"/>
     <Compile Remove="**/obj/**/*AssemblyAttributes.cs"/>
   </ItemGroup>
+  <ItemGroup Condition="$(CurrentPlatform) != 'Linux' Or $(Architecture) != 'i386'">
+    <Compile Remove="Emulator/Cores/X86KVM/*" />
+  </ItemGroup>
 
   <Target Name="PrepareEmbeddedResources" BeforeTargets="ResolveReferences" >
     <ItemGroup>
@@ -125,6 +131,9 @@
       </EmbeddedResource>
       <EmbeddedResource Include="Emulator/Cores/bin/$(Configuration)/lib/translate-sparc-be.so">
         <LogicalName>Antmicro.Renode.translate-sparc-be.so</LogicalName>
+      </EmbeddedResource>
+      <EmbeddedResource Include="Emulator/Cores/bin/$(Configuration)/lib/kvm-$(Architecture).so" Condition="$(CurrentPlatform) == 'Linux' And $(Architecture) == 'i386'">
+          <LogicalName>Antmicro.Renode.kvm-$(Architecture).so</LogicalName>
       </EmbeddedResource>
     </ItemGroup>
   </Target>

@@ -36,6 +36,21 @@ namespace Antmicro.Renode.Core
             RebuildInstance();
         }
 
+        private EmulationManager()
+        {
+            var serializerMode = ConfigurationManager.Instance.Get("general", "serialization-mode", Antmicro.Migrant.Customization.Method.Generated);
+            
+            var settings = new Antmicro.Migrant.Customization.Settings(serializerMode, serializerMode,
+                Antmicro.Migrant.Customization.VersionToleranceLevel.AllowGuidChange, disableTypeStamping: true);
+            serializer = new Serializer(settings);
+            serializer.ForObject<PythonDictionary>().SetSurrogate(x => new PythonDictionarySurrogate(x));
+            serializer.ForSurrogate<PythonDictionarySurrogate>().SetObject(x => x.Restore());
+            currentEmulation = new Emulation();
+            ProgressMonitor = new ProgressMonitor();
+            stopwatch = new Stopwatch();
+            currentEmulationLock = new object();
+        }
+
         [HideInMonitor]
         public static void RebuildInstance()
         {
@@ -101,24 +116,33 @@ namespace Antmicro.Renode.Core
                                 ? (Stream) new GZipStream(fstream, CompressionMode.Decompress)
                                 : (Stream) fstream)
             {
-                var deserializationResult = serializer.TryDeserialize<string>(stream, out var version);
-                if(deserializationResult != DeserializationResult.OK)
+                var deserializationResult = serializer.TryDeserialize<Emulation>(stream, out var emulation, out var metadata);
+                string metadataStringFromFile = null;
+                
+                try
                 {
-                    throw new RecoverableException($"There was an error when deserializing the emulation: {deserializationResult}\n Underlying exception: {serializer.LastException.Message}\n{serializer.LastException.StackTrace}");
+                    if (metadata != null)
+                    {
+                        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+                        metadataStringFromFile = utf8.GetString(metadata);
+                    }
+                }
+                catch (Exception) // Metadata is not a valid UTF-8 byte sequence
+                {
+                    throw CreateLoadException(DeserializationResult.MetadataCorrupted, metadataStringFromFile);
                 }
 
-                deserializationResult = serializer.TryDeserialize<Emulation>(stream, out var emulation);
                 if(deserializationResult != DeserializationResult.OK)
                 {
-                    throw new RecoverableException($"There was an error when deserializing the emulation: {deserializationResult}\n Underlying exception: {serializer.LastException.Message}\n{serializer.LastException.StackTrace}");
+                    throw CreateLoadException(deserializationResult, metadataStringFromFile); 
                 }
 
                 CurrentEmulation = emulation;
                 CurrentEmulation.BlobManager.Load(stream, fstream.Name);
 
-                if(version != VersionString)
+                if(metadataStringFromFile != MetadataString)
                 {
-                    Logger.Log(LogLevel.Warning, "Version of deserialized emulation ({0}) does not match current one {1}. Things may go awry!", version, VersionString);
+                    Logger.Log(LogLevel.Warning, "Version of deserialized emulation ({0}) does not match current one ({1}). Things may go awry!", metadataStringFromFile, MetadataString);
                 }
             }
         }
@@ -134,8 +158,7 @@ namespace Antmicro.Renode.Core
                         try
                         {
                             CurrentEmulation.SnapshotTracker.Save(CurrentEmulation.MasterTimeSource.ElapsedVirtualTime, path);
-                            serializer.Serialize(VersionString, stream);
-                            serializer.Serialize(CurrentEmulation, stream);
+                            serializer.Serialize(CurrentEmulation, stream, Encoding.UTF8.GetBytes(MetadataString));
                             CurrentEmulation.BlobManager.Save(stream);
                         }
                         catch(InvalidOperationException e)
@@ -238,9 +261,14 @@ namespace Antmicro.Renode.Core
 
                 try
                 {
-                    return string.Format("{0}, version {1} ({2})",
+                    var version = entryAssembly.GetName().Version;
+
+                    // version.Revision is intentionally skipped here
+                    return string.Format("{0}, version {1}.{2}.{3} ({4})",
                         entryAssembly.GetName().Name,
-                        entryAssembly.GetName().Version,
+                        version.Major,
+                        version.Minor,
+                        version.Build,
                         ((AssemblyInformationalVersionAttribute)entryAssembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)[0]).InformationalVersion
                     );
                 }
@@ -251,12 +279,21 @@ namespace Antmicro.Renode.Core
 
             }
         }
+
+        public string MetadataString => $"{VersionString} running on {RuntimeInfo.OSIdentifier}-{RuntimeInfo.ArchitectureIdentifier} {RuntimeInfo.Version}";
         
         public SimpleFileCache CompiledFilesCache { get; } = new SimpleFileCache("compiler-cache", !Emulator.InCIMode && ConfigurationManager.Instance.Get("general", "compiler-cache-enabled", false));
 
         public event Action EmulationChanged;
 
         public static bool DisableEmulationFilesCleanup = false;
+
+        private int stopwatchCounter;
+        private Stopwatch stopwatch;
+        private readonly Serializer serializer;
+        private Emulation currentEmulation;
+        private readonly object currentEmulationLock;
+        private string profilerPathPrefix;
 
         private static bool TryFindPath(object obj, Dictionary<object, IEnumerable<object>> parents, Type finalType, out List<object> resultPath)
         {
@@ -296,21 +333,6 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        private EmulationManager()
-        {
-            var serializerMode = ConfigurationManager.Instance.Get("general", "serialization-mode", Antmicro.Migrant.Customization.Method.Generated);
-            
-            var settings = new Antmicro.Migrant.Customization.Settings(serializerMode, serializerMode,
-                Antmicro.Migrant.Customization.VersionToleranceLevel.AllowGuidChange, disableTypeStamping: true);
-            serializer = new Serializer(settings);
-            serializer.ForObject<PythonDictionary>().SetSurrogate(x => new PythonDictionarySurrogate(x));
-            serializer.ForSurrogate<PythonDictionarySurrogate>().SetObject(x => x.Restore());
-            currentEmulation = new Emulation();
-            ProgressMonitor = new ProgressMonitor();
-            stopwatch = new Stopwatch();
-            currentEmulationLock = new object();
-        }
-
         private void InvokeEmulationChanged()
         {
             var emulationChanged = EmulationChanged;
@@ -326,12 +348,14 @@ namespace Antmicro.Renode.Core
             machine.EnableProfiler(profilerPath);
         }
 
-        private int stopwatchCounter;
-        private Stopwatch stopwatch;
-        private readonly Serializer serializer;
-        private Emulation currentEmulation;
-        private readonly object currentEmulationLock;
-        private string profilerPathPrefix;
+        private RecoverableException CreateLoadException(DeserializationResult result, string metadata)
+        {
+            var errorMessage = result == DeserializationResult.MetadataCorrupted
+                ? $"The snapshot cannot be loaded as its metadata is corrupted."
+                : $"This snapshot is incompatible or the emulation's state is corrupted. Snapshot version: {metadata}. Your version: {MetadataString}";
+
+            return new RecoverableException(errorMessage); 
+        }
 
         /// <summary>
         /// Represents external world time domain.
@@ -344,4 +368,3 @@ namespace Antmicro.Renode.Core
         }
     }
 }
-

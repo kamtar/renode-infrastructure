@@ -74,6 +74,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         void UnregisterFromAddress(ulong address, ICPU context = null);
         void MoveRegistrationWithinContext(IBusPeripheral peripheral, BusRangeRegistration newRegistration, ICPU context, Func<IEnumerable<IBusRegistered<IBusPeripheral>>, IBusRegistered<IBusPeripheral>> selector = null);
+        void ChangePeripheralAccessCondition(IBusPeripheral peripheral, string newCondition, string oldCondition = null);
 
         void AddWatchpointHook(ulong address, SysbusAccessWidth width, Access access, BusHookDelegate hook);
         void RemoveWatchpointHook(ulong address, BusHookDelegate hook);
@@ -87,14 +88,14 @@ namespace Antmicro.Renode.Peripherals.Bus
         string FindSymbolAt(ulong offset, ICPU context = null);
 
         bool TryGetAllSymbolAddresses(string symbolName, out IEnumerable<ulong> symbolAddresses, ICPU context = null);
-        bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null);
+        bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null, bool functionOnly = false);
         string DecorateWithCPUNameAndPC(string str);
 
         void MapMemory(IMappedSegment segment, IBusPeripheral owner, bool relative = true, ICPUWithMappedMemory context = null);
         IBusRegistered<MappedMemory> FindMemory(ulong address, ICPU context = null);
         bool IsMemory(ulong address, ICPU context = null);
 
-        void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false);
+        void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false);
 
         void ApplySVD(string path);
 
@@ -102,6 +103,9 @@ namespace Antmicro.Renode.Peripherals.Bus
         void LoadUImage(ReadFilePath fileName, IInitableCPU cpu = null);
 
         SymbolLookup GetLookup(ICPU context = null);
+
+        IReadOnlyDictionary<string, int> GetCommonStateBits();
+        IReadOnlyDictionary<string, int> GetStateBits(string initiatorName);
 
         void EnableAllTranslations(bool enable = true);
         void EnableAllTranslations(IBusPeripheral busPeripheral, bool enable = true);

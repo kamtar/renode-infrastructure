@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -51,6 +51,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 result += $" for core {Initiator}";
             }
+            if(Condition != null)
+            {
+                result += $" with condition \"{Condition}\"";
+            }
             return result;
         }
 
@@ -76,7 +80,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public override IConditionalRegistration WithInitiatorAndStateMask(IPeripheral initiator, StateMask mask)
         {
-            return new BusRangeRegistration(Range, mask, Offset, initiator);
+            return new BusRangeRegistration(Range, mask, Offset, initiator, condition: Condition);
         }
 
         public void RegisterForEachContext(Action<BusRangeRegistration> register)

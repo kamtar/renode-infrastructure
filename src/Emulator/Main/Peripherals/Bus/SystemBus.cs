@@ -56,7 +56,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             this.Log(LogLevel.Info, "System bus created.");
         }
 
-        public void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, ICPU cpu)
+        public void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, IPeripheral cpu)
         {
             var minAddr = this.LoadFileChunks(chunks, cpu);
             AddFingerprint(path);
@@ -209,6 +209,88 @@ namespace Antmicro.Renode.Peripherals.Bus
                     cpu.RegisterAccessFlags(range.StartAddress, range.Size, isIoMemory: true);
                 }
             }
+        }
+
+        public void ChangePeripheralAccessCondition(IBusPeripheral peripheral, string newCondition, string oldCondition = null)
+        {
+            lock(peripheral)
+            {
+                var newConditionsPerInitiator = ParseNewConditions(newCondition);
+                var foundEntry = FindUniqueRegistration(peripheral, oldCondition) ?? throw new RecoverableException("No registration found for this peripheral with the specified condition.");
+
+                foundEntry.Collection.Remove(peripheral);
+                var registration = foundEntry.RegistrationPoint;
+                var methods = foundEntry.AccessMethods;
+                var range = registration.Range;
+
+                foreach(var newContext in newConditionsPerInitiator)
+                {
+                    var initiator = Machine[Core.Machine.SystemBusName + Core.Machine.PathSeparator + newContext.Key];
+                    foreach(var newMask in newContext.Value)
+                    {
+                        peripheralsCollectionByContext.WithStateCollection(initiator, newMask, collection =>
+                        {
+                            var busRegistered = new BusRegistered<IBusPeripheral>(peripheral, registration);
+                            collection.Add(range.StartAddress, range.EndAddress + 1, busRegistered, methods);
+                        });
+                    }
+                }
+            }
+        }
+
+        private Dictionary<string, List<StateMask>> ParseNewConditions(string newCondition)
+        {
+            if(string.IsNullOrEmpty(newCondition))
+            {
+                return new Dictionary<string, List<StateMask>>
+                {
+                    [""] = new List<StateMask> { StateMask.AllAccess }
+                };
+            }
+            else
+            {
+                var condition = AccessConditionParser.ParseCondition(newCondition);
+                return AccessConditionParser.EvaluateWithStateBits(condition,
+                    i => string.IsNullOrEmpty(i) ? GetCommonStateBits() : GetStateBits(i));
+            }
+        }
+
+        private FoundRegistrationInfo? FindUniqueRegistration(IBusPeripheral peripheral, string oldCondition)
+        {
+            FoundRegistrationInfo? match = null;
+
+            foreach(var contextKey in peripheralsCollectionByContext.GetAllContextKeys())
+            {
+                foreach(var stateKey in peripheralsCollectionByContext.GetAllStateKeys(contextKey))
+                {
+                    peripheralsCollectionByContext.WithStateCollection(contextKey, stateKey, collection =>
+                    {
+                        // We take only the entries with a distinct registration point ignoring the state mask as a registration might be split
+                        // into multiple points, for example `secure || privileged` will be represented as 2 registrations which differ only in
+                        // the state mask, but it's the same registration for our purposes.
+                        var busRegisteredEntries = collection.Peripherals
+                            .Where(x => x.Peripheral == peripheral && (string.IsNullOrEmpty(oldCondition) || x.RegistrationPoint.Condition == oldCondition))
+                            .DistinctBy(x => x.RegistrationPoint.WithInitiatorAndStateMask(x.RegistrationPoint.Initiator, StateMask.AllAccess));
+
+                        foreach(var entry in busRegisteredEntries)
+                        {
+                            var registration = entry.RegistrationPoint;
+                            var normalizedRegistration = registration.WithInitiatorAndStateMask(registration.Initiator, StateMask.AllAccess);
+                            var methods = collection.FindAccessMethods(registration.Range.StartAddress, out _, out _);
+                            if(match == null)
+                            {
+                                match = new FoundRegistrationInfo(registration, collection, methods);
+                            }
+                            else if(!match.Value.RegistrationPoint.WithInitiatorAndStateMask(match.Value.RegistrationPoint.Initiator, StateMask.AllAccess).Equals(normalizedRegistration))
+                            {
+                                throw new RecoverableException("This peripheral is registered with several conditions. You need to specify which one to change.");
+                            }
+                        }
+                    });
+                }
+            }
+
+            return match;
         }
 
         public void Register(ICPU cpu, CPURegistrationPoint registrationPoint)
@@ -820,11 +902,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             return name;
         }
 
-        public bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null)
+        public bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null, bool functionOnly = false)
         {
             if(!pcCache.TryGetValue(offset, out var entry))
             {
-                if(!GetLookup(context).TryGetSymbolByAddress(offset, out symbol))
+                if(!GetLookup(context).TryGetSymbolByAddress(offset, out symbol, functionOnly))
                 {
                     symbol = null;
                     name = null;
@@ -997,12 +1079,12 @@ namespace Antmicro.Renode.Peripherals.Bus
             svdDevices.Add(svdDevice);
         }
 
-        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false)
+        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false)
         {
             var intersectings = tags.Where(x => x.Key.Intersects(range)).ToArray();
             if(intersectings.Length == 0)
             {
-                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue });
+                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent });
                 if(pausing)
                 {
                     pausingTags.Add(tag);
@@ -1161,6 +1243,34 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
 
             return cpuLookup;
+        }
+
+        public IReadOnlyDictionary<string, int> GetCommonStateBits()
+        {
+            var possibleInitiators = Machine.GetPeripheralsOfType<IPeripheralWithTransactionState>();
+            if(!possibleInitiators.Any())
+            {
+                return null;
+            }
+
+            var theIntersectionOfTheirStateBitsets = possibleInitiators
+                .Select(i => i.StateBits)
+                .Aggregate((commonDict, nextDict) =>
+                    commonDict
+                        .Where(p => nextDict.TryGetValue(p.Key, out var value) && p.Value == value)
+                        .ToDictionary(p => p.Key, p => p.Value)
+                );
+            return theIntersectionOfTheirStateBitsets;
+        }
+
+        public IReadOnlyDictionary<string, int> GetStateBits(string initiatorName)
+        {
+            if(string.IsNullOrEmpty(initiatorName))
+            {
+                throw new ArgumentNullException(nameof(initiatorName));
+            }
+            var fullPath = Core.Machine.SystemBusName + Core.Machine.PathSeparator + initiatorName;
+            return Machine.TryGetByName<IPeripheralWithTransactionState>(fullPath, out var peri) ? peri?.StateBits : null;
         }
 
         public IMachine Machine { get; }
@@ -1956,7 +2066,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             return true;
         }
 
-        private string TryGetTag(ulong address, out ulong defaultValue)
+        private string TryGetTag(ulong address, out ulong defaultValue, out bool silent)
         {
             // The `return` inside is intentional; we just want to find the first tag.
             // `FirstOrDefault` isn't used cause the default `Range` is a valid `<0, 0>` range.
@@ -1965,16 +2075,18 @@ namespace Antmicro.Renode.Peripherals.Bus
             foreach(var tag in tags.Where(x => x.Key.Contains(address)).Select(x => x.Value))
             {
                 defaultValue = tag.DefaultValue;
+                silent = tag.Silent;
                 return tag.Name;
             }
             defaultValue = default(ulong);
+            silent = false;
             return null;
         }
 
-        private string EnterTag(string str, ulong address, out bool tagEntered, out ulong defaultValue)
+        private string EnterTag(string str, ulong address, out bool tagEntered, out ulong defaultValue, out bool silent)
         {
             // TODO: also pausing here in a bit hacky way
-            var tag = TryGetTag(address, out defaultValue);
+            var tag = TryGetTag(address, out defaultValue, out silent);
             if(tag == null)
             {
                 tagEntered = false;
@@ -1992,8 +2104,9 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             Interlocked.Increment(ref unexpectedReads);
             bool tagged;
+            bool silent;
             ulong defaultValue;
-            var warning = EnterTag(NonExistingRead, address, out tagged, out defaultValue);
+            var warning = EnterTag(NonExistingRead, address, out tagged, out defaultValue, out silent);
             warning = DecorateWithCPUNameAndPC(warning);
             if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.DoNotReport)
             {
@@ -2006,8 +2119,9 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(tagged)
             {
+                var logLevel = silent ? LogLevel.Debug : LogLevel.Warning;
                 //strange parsing of default value ensures we get the right width, depending on the access type
-                this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, type, defaultValue.ToString("X16").Substring(16 - (int)type * 2));
+                this.Log(logLevel, warning.TrimEnd('.') + ", returning 0x{2}.", address, type, defaultValue.ToString("X16").Substring(16 - (int)type * 2));
             }
             else
             {
@@ -2032,7 +2146,8 @@ namespace Antmicro.Renode.Peripherals.Bus
                 return;
             }
             bool tagged;
-            var warning = EnterTag(NonExistingWrite, address, out tagged, out var _);
+            bool silent;
+            var warning = EnterTag(NonExistingWrite, address, out tagged, out var _, out silent);
             warning = DecorateWithCPUNameAndPC(warning);
             if((UnhandledAccessBehaviour == UnhandledAccessBehaviour.ReportIfTagged && !tagged)
                 || (UnhandledAccessBehaviour == UnhandledAccessBehaviour.ReportIfNotTagged && tagged))
@@ -2046,7 +2161,8 @@ namespace Antmicro.Renode.Peripherals.Bus
                     return;
                 }
             }
-            this.Log(LogLevel.Warning, warning, address, value, type);
+            var logLevel = silent ? LogLevel.Debug : LogLevel.Warning;
+            this.Log(logLevel, warning, address, value, type);
         }
 
         private IDisposable SetLocalContext(IPeripheral context, ulong? initiatorState = null)
@@ -2138,14 +2254,17 @@ namespace Antmicro.Renode.Peripherals.Bus
             // Perform a mutation on the value collection for a specific initiator state and mask pair (for example to add a new peripheral)
             public void WithStateCollection(IPeripheral context, StateMask? stateMask, Action<TValue> action)
             {
-                var collection = context == null ? globalValue : cpuLocalValues[context];
-                var effectiveMask = stateMask ?? StateMask.AllAccess;
-                if(!collection.ContainsKey(effectiveMask))
+                lock(locker)
                 {
-                    collection[effectiveMask] = defaultFactory();
+                    var collection = context == null ? globalValue : cpuLocalValues[context];
+                    var effectiveMask = stateMask ?? StateMask.AllAccess;
+                    if(!collection.ContainsKey(effectiveMask))
+                    {
+                        collection[effectiveMask] = defaultFactory();
+                    }
+                    action(collection[effectiveMask]);
+                    DropCaches();
                 }
-                action(collection[effectiveMask]);
-                DropCaches();
             }
 
             public IEnumerable<TValue> GetAllDistinctValues()
@@ -2207,7 +2326,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                     collectionToSearch = thisCpuValues.Concat(collectionToSearch);
                 }
                 bool anyHit = false;
-                foreach(var pair in collectionToSearch)
+                // Additionally, search the collections from the most to least specific (by number of set bits in the mask).
+                // This is mainly used so that if an conditionally-registered peripheral overlaps an unconditional one, the
+                // conditional peripheral will be prioritized.
+                foreach(var pair in collectionToSearch.OrderByDescending(pair => BitHelper.GetSetBitsCount(pair.Key.Mask)))
                 {
                     var stateMask = pair.Key;
                     if((initiatorState.Value & stateMask.Mask) == stateMask.State)
@@ -2231,12 +2353,31 @@ namespace Antmicro.Renode.Peripherals.Bus
             private readonly Dictionary<IPeripheral, Dictionary<StateMask, TValue>> cpuLocalValues = new Dictionary<IPeripheral, Dictionary<StateMask, TValue>>();
             private readonly Dictionary<IPeripheral, Dictionary<ulong, TValue>> cpuInStateCache = new Dictionary<IPeripheral, Dictionary<ulong, TValue>>();
             private readonly Func<TValue> defaultFactory;
+            private readonly object locker = new object();
             private readonly Dictionary<StateMask, TValue> globalValue = new Dictionary<StateMask, TValue>();
             private readonly Dictionary<ulong, TValue> globalCache = new Dictionary<ulong, TValue>();
             // Please take performance into account before removing these caches (they were added because looking up a value
             // in a Dictionary<StateMask, TValue> was very slow)
             private readonly Dictionary<IPeripheral, TValue> cpuAllAccess = new Dictionary<IPeripheral, TValue>();
             private readonly TValue globalAllAccess;
+        }
+
+        private
+#if NET
+        readonly
+#endif
+        struct FoundRegistrationInfo
+        {
+            public FoundRegistrationInfo(BusRangeRegistration registrationPoint, PeripheralCollection collection, PeripheralAccessMethods accessMethods)
+            {
+                RegistrationPoint = registrationPoint;
+                Collection = collection;
+                AccessMethods = accessMethods;
+            }
+
+            public readonly BusRangeRegistration RegistrationPoint;
+            public readonly PeripheralCollection Collection;
+            public readonly PeripheralAccessMethods AccessMethods;
         }
 
         private Dictionary<IBusPeripheral, List<MappedSegmentWrapper>> mappingsForPeripheral;
@@ -2382,6 +2523,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             public string Name;
             public ulong DefaultValue;
+            public bool Silent;
         }
 
         private class ThreadLocalContext : IDisposable

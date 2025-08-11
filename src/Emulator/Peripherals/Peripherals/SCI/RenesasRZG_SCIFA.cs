@@ -15,6 +15,7 @@ using Antmicro.Renode.Time;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 namespace Antmicro.Renode.Peripherals.SCI
 {
@@ -37,6 +38,7 @@ namespace Antmicro.Renode.Peripherals.SCI
             base.Reset();
             parityBit = Parity.Even;
             receiveQueue.Clear();
+            txFifoResetCancellationTokenSrc?.Cancel();
             UpdateInterrupts();
         }
 
@@ -105,7 +107,7 @@ namespace Antmicro.Renode.Peripherals.SCI
         // IRQs are bundled into 5 signals per channel in the following order:
         // 0: ERI - Receive error
         // 1: BRI - Break detection or overrun
-        // 2: RXI - Receive FIFO data full 
+        // 2: RXI - Receive FIFO data full
         // 3: TXI - Transmit FIFO data empty
         // 4: TEI_DRI - Transmit end / Receive data ready
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
@@ -137,7 +139,6 @@ namespace Antmicro.Renode.Peripherals.SCI
         }
 
         public long Frequency { get; set; }
-
         [field: Transient]
         public event Action<byte> CharReceived;
 
@@ -227,22 +228,56 @@ namespace Antmicro.Renode.Peripherals.SCI
                             this.ErrorLog("Transmitter is not enabled, dropping byte: 0x{0:x}", (byte)val);
                             return;
                         }
-                        CharReceived?.Invoke((byte)val);
-                        // RZ/G2L Group, RZ/G2LC Group User's Manual: Hardware, states that
-                        // TDFE and TEND flags are cleared when data is written to FTDR register.
-                        // But TDFE is set again when quantity of data written FTDR is less than
-                        // specified threshold, and TEND is set when FTDR becomes empty.
-                        // Both actions take some time on real hardware, but happen immediately in Renode.
-                        // Hence we use delay to prevent interrupts from being triggered too soon.
-                        transmitFIFOEmpty.Value = false;
-                        transmitEnd.Value = false;
-                        UpdateInterrupts();
-                        machine.ScheduleAction(TimeInterval.FromMicroseconds(TransmitInterruptDelay), ___ =>
+                        // RZ/G2L Group, RZ/G2LC Group User's Manual:
+                        // 1. The hardware manual states that the TDFE and TEND flags are cleared when data is written to the FTDR register.
+                        //    However, TDFE is set again when the quantity of data written to FTDR is less than the 'TranmitFIFOTriggerCount',
+                        //    and TEND is set when FTDR becomes empty.
+                        //    These updates take some time on real hardware but happen immediately in Renode.
+                        //
+                        // 2. If additional data is written when the transmit FIFO is full, the data is ignored.
+                        //
+                        // Additionally, software like Zephyr uses the 'FifoDataCount.T' register to determine how much data
+                        // can be written to the FTDR at once. The use of an explicit queue is tricky,
+                        // as there is no simple way to ensure constant transmission timing.
+                        // Therefore, the current solution uses an implicit queue:
+                        // After each write to FTDR, a write action is scheduled to run after 'TransmitInterruptDelay' micro seconds,
+                        // and the number of scheduled data items is tracked using 'transmitFifoLevel',
+                        // which is accessible via the 'FifoDataCount.T' register.
+
+                        if(transmitFifoLevel < MaxFIFOSize)
                         {
-                            transmitFIFOEmpty.Value = true;
-                            transmitEnd.Value = true;
+                            CharReceived?.Invoke((byte)val);
+                            transmitFIFOEmpty.Value = false;
+                            transmitEnd.Value = false;
                             UpdateInterrupts();
-                        });
+                            transmitFifoLevel++;
+                            var txFifoResetCancellationToken = txFifoResetCancellationTokenSrc.Token;
+                            machine.ScheduleAction(TimeInterval.FromMicroseconds(TransmitInterruptDelay), ___ =>
+                            {
+                                if(!txFifoResetCancellationToken.IsCancellationRequested)
+                                {
+                                    transmitFifoLevel--;
+                                    if(transmitFifoLevel < 0)
+                                    {
+                                        this.ErrorLog("Transmit FIFO contains a negative amount of characters, resetting it to 0");
+                                        transmitFifoLevel = 0;
+                                    }
+                                    if(transmitFifoLevel <= TranmitFIFOTriggerCount)
+                                    {
+                                        transmitFIFOEmpty.Value = true;
+                                    }
+                                    if(transmitFifoLevel <= 0)
+                                    {
+                                        transmitEnd.Value = true;
+                                    }
+                                    UpdateInterrupts();
+                                }
+                            });
+                        }
+                        else
+                        {
+                            this.ErrorLog("Transmit FIFO is full, dropping byte: 0x{0:x}", (byte)val);
+                        }
                     },
                     name: "FTDR")
                 .WithIgnoredBits(8, 8);
@@ -265,9 +300,20 @@ namespace Antmicro.Renode.Peripherals.SCI
             Registers.FifoControl.Define(this)
                 .WithTaggedFlag("LOOP", 0)
                 .WithFlag(1, FieldMode.Read | FieldMode.WriteOneToClear, name: "RFRST", writeCallback: (_, __) => receiveQueue.Clear())
-                .WithTaggedFlag("TFRST", 2)
+                .WithFlag(2, FieldMode.Read | FieldMode.WriteOneToClear, name: "TFRST",
+                    writeCallback: (_, value) =>
+                    {
+                        if(value)
+                        {
+                            txFifoResetCancellationTokenSrc?.Cancel();
+                            txFifoResetCancellationTokenSrc = new CancellationTokenSource();
+                            transmitFifoLevel = 0;
+                            transmitFIFOEmpty.Value = true;
+                            transmitEnd.Value = true;
+                        }
+                    })
                 .WithTaggedFlag("MCE", 3)
-                .WithTag("TTRG", 4, 2)
+                .WithValueField(4, 2, out transmitFifoDataTriggerNumberSelect, name: "TTRG")
                 .WithValueField(6, 2, out receiveFifoDataTriggerNumberSelect, name: "RTRG")
                 .WithTag("RSTRG", 8, 3)
                 .WithReservedBits(11, 5)
@@ -277,8 +323,8 @@ namespace Antmicro.Renode.Peripherals.SCI
                 .WithValueField(0, 5, FieldMode.Read, name: "R",
                     valueProviderCallback: _ => (ulong)receiveQueue.Count >= MaxFIFOSize ? MaxFIFOSize : (ulong)receiveQueue.Count)
                 .WithReservedBits(5, 3)
-                // Transmission is instantaneous, so it will always be empty
-                .WithValueField(8, 5, name: "T", valueProviderCallback: _ => 0x0)
+                .WithValueField(8, 5, FieldMode.Read, name: "T",
+                    valueProviderCallback: _ => (ulong)transmitFifoLevel >= MaxFIFOSize ? MaxFIFOSize : (ulong)transmitFifoLevel)
                 .WithReservedBits(13, 3);
 
             Registers.SerialPort.Define(this)
@@ -321,9 +367,9 @@ namespace Antmicro.Renode.Peripherals.SCI
             // "When the number of entries in the reception FIFO ... rises to or above the specified trigger number for reception,
             //  the RDF flag is set to 1 and a receive FIFO data full interrupt (RXI) request is generated"
             Registers.FifoTriggerControl.Define(this, 0x1f1f)
-                .WithTag("TFTC", 0, 5)
+                .WithValueField(0, 5, out transmitFifoDataTriggerNumber, name: "TFTC")
                 .WithReservedBits(5, 2)
-                .WithTaggedFlag("TTRGS", 7)
+                .WithFlag(7, out transmitTriggerSelect, name:"TTRGS")
                 .WithValueField(8, 5, out receiveFifoDataTriggerNumber, name: "RFTC")
                 .WithReservedBits(13, 2)
                 .WithFlag(15, out receiveTriggerSelect, name: "RTRGS");
@@ -354,6 +400,38 @@ namespace Antmicro.Renode.Peripherals.SCI
                                 "{0} has invalid value {1}. Defaulting to 0x1.",
                                 nameof(receiveFifoDataTriggerNumberSelect),
                                 receiveFifoDataTriggerNumberSelect.Value
+                            );
+                            return 1;
+                    }
+                }
+            }
+        }
+
+        private int TranmitFIFOTriggerCount
+        {
+            get
+            {
+                if(transmitTriggerSelect.Value)
+                {
+                    return (int)transmitFifoDataTriggerNumber.Value;
+                }
+                else
+                {
+                    switch(transmitFifoDataTriggerNumberSelect.Value)
+                    {
+                        case 0:
+                            return 8;
+                        case 1:
+                            return 4;
+                        case 2:
+                            return 2;
+                        case 3:
+                            return 0;
+                        default:
+                            this.ErrorLog(
+                                "{0} has invalid value {1}. Defaulting to 0x1.",
+                                nameof(transmitFifoDataTriggerNumberSelect),
+                                transmitFifoDataTriggerNumberSelect.Value
                             );
                             return 1;
                     }
@@ -393,9 +471,14 @@ namespace Antmicro.Renode.Peripherals.SCI
         private IValueRegisterField receiveFifoDataTriggerNumber;
         private IFlagRegisterField receiveTriggerSelect;
         private IValueRegisterField receiveFifoDataTriggerNumberSelect;
+        private IValueRegisterField transmitFifoDataTriggerNumber;
+        private IFlagRegisterField transmitTriggerSelect;
+        private IValueRegisterField transmitFifoDataTriggerNumberSelect;
         private IFlagRegisterField asynchronousBaseClock8Times;
         private IEnumRegisterField<ModulationDutyRegisterSelect> registerSelect;
         private IEnumRegisterField<CommunicationMode> communicationMode;
+        private int transmitFifoLevel = 0;
+        private CancellationTokenSource txFifoResetCancellationTokenSrc;
 
         private readonly Queue<byte> receiveQueue = new Queue<byte>();
 
@@ -406,7 +489,7 @@ namespace Antmicro.Renode.Peripherals.SCI
         private const int ReceiveFifoFullIrqIdx = 2;
         private const int TransmitFifoEmptyIrqIdx = 3;
         private const int TransmitEndReceiveReadyIrqIdx = 4;
-        private const int TransmitInterruptDelay = 5;
+        private const int TransmitInterruptDelay = 10;
 
         private enum CommunicationMode
         {
