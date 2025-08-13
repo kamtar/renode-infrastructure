@@ -1,4 +1,4 @@
-﻿/********************************************************
+/********************************************************
 *
 * Warning!
 * This file was generated automatically.
@@ -32,9 +32,19 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+                var warning = TagOverriddenRead;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    return (byte)foundTag.DefaultValue;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    return (byte)ReportNonExistingRead(address, accessWidth);
+                    return (byte)ReportNonExistingRead(address, tag, accessWidth);
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
@@ -88,9 +98,20 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+
+                var warning = TagOverriddenWrite;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    return;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    ReportNonExistingWrite(address, value, accessWidth);
+                    ReportNonExistingWrite(address, value, tag, accessWidth);
                     return;
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
@@ -146,9 +167,19 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+                var warning = TagOverriddenRead;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    return (ushort)foundTag.DefaultValue;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    return (ushort)ReportNonExistingRead(address, accessWidth);
+                    return (ushort)ReportNonExistingRead(address, tag, accessWidth);
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
@@ -202,9 +233,20 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+
+                var warning = TagOverriddenWrite;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    return;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    ReportNonExistingWrite(address, value, accessWidth);
+                    ReportNonExistingWrite(address, value, tag, accessWidth);
                     return;
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
@@ -260,9 +302,19 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+                var warning = TagOverriddenRead;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    return (uint)foundTag.DefaultValue;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    return (uint)ReportNonExistingRead(address, accessWidth);
+                    return (uint)ReportNonExistingRead(address, tag, accessWidth);
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
@@ -316,9 +368,20 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+
+                var warning = TagOverriddenWrite;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    return;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    ReportNonExistingWrite(address, value, accessWidth);
+                    ReportNonExistingWrite(address, value, tag, accessWidth);
                     return;
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
@@ -374,9 +437,19 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+                var warning = TagOverriddenRead;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    return (ulong)foundTag.DefaultValue;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    return (ulong)ReportNonExistingRead(address, accessWidth);
+                    return (ulong)ReportNonExistingRead(address, tag, accessWidth);
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
@@ -430,9 +503,20 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             using(SetLocalContext(context, cpuState))
             {
+                TryGetTag(address, out var tag);
+
+                var warning = TagOverriddenWrite;
+                if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                {
+                    warning = EnterTag(warning, foundTag);
+                    warning = DecorateWithCPUNameAndPC(warning);
+                    this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    return;
+                }
+
                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, cpuState))
                 {
-                    ReportNonExistingWrite(address, value, accessWidth);
+                    ReportNonExistingWrite(address, value, tag, accessWidth);
                     return;
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))

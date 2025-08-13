@@ -45,7 +45,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         internal SystemBus(IMachine machine)
         {
             this.Machine = machine;
-            cpuSync = new object();
+            cpuSync = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
             binaryFingerprints = new List<BinaryFingerprint>();
             cpuById = new Dictionary<int, ICPU>();
             idByCpu = new Dictionary<ICPU, int>();
@@ -295,7 +295,8 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void Register(ICPU cpu, CPURegistrationPoint registrationPoint)
         {
-            lock(cpuSync)
+            cpuSync.EnterWriteLock();
+            try
             {
                 if(mappingsRemoved)
                 {
@@ -338,6 +339,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                 idByCpu.Add(cpu, registrationPoint.Slot.Value);
                 AddContextKeys(cpu);
             }
+            finally
+            {
+                cpuSync.ExitWriteLock();
+            }
         }
 
         public void Unregister(ICPU cpu)
@@ -345,12 +350,17 @@ namespace Antmicro.Renode.Peripherals.Bus
             using(Machine.ObtainPausedState(true))
             {
                 Machine.UnregisterFromParent(cpu);
-                lock(cpuSync)
+                cpuSync.EnterWriteLock();
+                try
                 {
                     var id = idByCpu[cpu];
                     idByCpu.Remove(cpu);
                     cpuById.Remove(id);
                     RemoveContextKeys(cpu);
+                }
+                finally
+                {
+                    cpuSync.ExitWriteLock();
                 }
             }
         }
@@ -359,24 +369,26 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             using(Machine.ObtainPausedState(true))
             {
-                lock(cpuSync)
+                cpuSync.EnterWriteLock();
+                try
                 {
                     foreach(var p in idByCpu.Keys.Cast<ICPU>())
                     {
                         p.PC = pc;
                     }
                 }
+                finally
+                {
+                    cpuSync.ExitWriteLock();
+                }
             }
         }
 
         public void LogAllPeripheralsAccess(bool enable = true)
         {
-            lock(cpuSync)
+            foreach(var p in allPeripherals.SelectMany(x => x.Peripherals))
             {
-                foreach(var p in allPeripherals.SelectMany(x => x.Peripherals))
-                {
-                    LogPeripheralAccess(p.Peripheral, enable);
-                }
+                LogPeripheralAccess(p.Peripheral, enable);
             }
         }
 
@@ -429,21 +441,31 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public IEnumerable<ICPU> GetCPUs()
         {
-            lock(cpuSync)
+            cpuSync.EnterReadLock();
+            try
             {
                 return new ReadOnlyCollection<ICPU>(idByCpu.Keys.ToList());
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
             }
         }
 
         public int GetCPUSlot(ICPU cpu)
         {
-            lock(cpuSync)
+            cpuSync.EnterReadLock();
+            try
             {
                 if(idByCpu.ContainsKey(cpu))
                 {
                     return idByCpu[cpu];
                 }
                 throw new KeyNotFoundException("Given CPU is not registered.");
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
             }
         }
 
@@ -545,7 +567,8 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private bool TryFindCurrentThreadCPUAndId(out ICPU cpu, out int cpuId)
         {
-            lock(cpuSync)
+            cpuSync.EnterReadLock();
+            try
             {
                 foreach(var entry in cpuById)
                 {
@@ -562,11 +585,16 @@ namespace Antmicro.Renode.Peripherals.Bus
                 cpuId = -1;
                 return false;
             }
+            finally
+            {
+                cpuSync.ExitReadLock();
+            }
         }
 
         public bool TryGetCurrentCPU(out ICPU cpu)
         {
-            lock(cpuSync)
+            cpuSync.EnterReadLock();
+            try
             {
                 int id;
                 if(TryGetCurrentCPUId(out id))
@@ -576,6 +604,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                 }
                 cpu = null;
                 return false;
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
             }
         }
 
@@ -609,16 +641,18 @@ namespace Antmicro.Renode.Peripherals.Bus
             cachedCpuId.Dispose();
             threadLocalContext.Dispose();
             globalLookup.Dispose();
+            cpuSync.Dispose();
             foreach(var lookup in localLookups.Values)
             {
                 lookup.Dispose();
             }
-            #if DEBUG
             foreach(var peripherals in allPeripherals)
             {
+#if DEBUG
                 peripherals.ShowStatistics();
+#endif
+                peripherals.Dispose();
             }
-            #endif
         }
 
         /// <summary>Checks what is at a given address.</summary>
@@ -950,13 +984,18 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void UnmapMemory(Range range, ICPU context = null)
         {
-            lock(cpuSync)
+            cpuSync.EnterWriteLock();
+            try
             {
                 foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
                 {
                     mappingsRemoved = true;
                     cpu.UnmapMemory(range);
                 }
+            }
+            finally
+            {
+                cpuSync.ExitWriteLock();
             }
         }
 
@@ -1079,12 +1118,21 @@ namespace Antmicro.Renode.Peripherals.Bus
             svdDevices.Add(svdDevice);
         }
 
-        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false)
+        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false, bool overridePeripheralAccesses = false)
         {
             var intersectings = tags.Where(x => x.Key.Intersects(range)).ToArray();
             if(intersectings.Length == 0)
             {
-                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent });
+                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent, OverridePeripheralAccesses = overridePeripheralAccesses });
+
+                var onMappedMemory  = GetRegisteredPeripherals()
+                    .Where(x => x.Peripheral is MappedMemory)
+                    .Any(reg => reg.RegistrationPoint.Range.Intersects(range));
+                if(overridePeripheralAccesses && onMappedMemory)
+                {
+                    this.WarningLog("Tags with OverridePeripheralAccesses property do not override mapped memory for the CPU.");
+                }
+
                 if(pausing)
                 {
                     pausingTags.Add(tag);
@@ -1118,7 +1166,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 Tag(new Range(range.EndAddress + 1, parentRangeAfterSplitSizeRight), parentName, parentDefaultValue, parentPausing);
             }
-            Tag(range, string.Format("{0}/{1}", parentName, tag), defaultValue, pausing);
+            Tag(range, string.Format("{0}/{1}", parentName, tag), defaultValue, pausing, overridePeripheralAccesses);
         }
 
         public void RemoveTag(ulong address)
@@ -1945,7 +1993,8 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private void ClearAll()
         {
-            lock(cpuSync)
+            cpuSync.EnterWriteLock();
+            try
             {
                 foreach(var group in Machine.PeripheralsGroups.ActiveGroups)
                 {
@@ -1959,6 +2008,10 @@ namespace Antmicro.Renode.Peripherals.Bus
 
                 mappingsRemoved = false;
                 InitStructures();
+            }
+            finally
+            {
+                cpuSync.ExitWriteLock();
             }
         }
 
@@ -2007,7 +2060,8 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             using(Machine.ObtainPausedState(true))
             {
-                lock(cpuSync)
+                cpuSync.EnterWriteLock();
+                try
                 {
                     var mappingsList = newMappings.ToList();
                     if(mappingsForPeripheral.ContainsKey(owner))
@@ -2026,6 +2080,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                             cpu.MapMemory(mapping);
                         }
                     }
+                }
+                finally
+                {
+                    cpuSync.ExitWriteLock();
                 }
             }
         }
@@ -2066,7 +2124,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             return true;
         }
 
-        private string TryGetTag(ulong address, out ulong defaultValue, out bool silent)
+        private bool TryGetTag(ulong address, out TagEntry? foundTag)
         {
             // The `return` inside is intentional; we just want to find the first tag.
             // `FirstOrDefault` isn't used cause the default `Range` is a valid `<0, 0>` range.
@@ -2074,39 +2132,34 @@ namespace Antmicro.Renode.Peripherals.Bus
             // `ToArray` isn't used to avoid analyzing all `tags` keys since we only use the first one.
             foreach(var tag in tags.Where(x => x.Key.Contains(address)).Select(x => x.Value))
             {
-                defaultValue = tag.DefaultValue;
-                silent = tag.Silent;
-                return tag.Name;
+                foundTag = tag;
+                return true;
             }
-            defaultValue = default(ulong);
-            silent = false;
-            return null;
+            foundTag = null;
+            return false;
         }
 
-        private string EnterTag(string str, ulong address, out bool tagEntered, out ulong defaultValue, out bool silent)
+        private string EnterTag(string str, TagEntry tag)
         {
-            // TODO: also pausing here in a bit hacky way
-            var tag = TryGetTag(address, out defaultValue, out silent);
-            if(tag == null)
-            {
-                tagEntered = false;
-                return str;
-            }
-            tagEntered = true;
-            if(pausingTags.Contains(tag))
+            // TODO: pausing here in a bit hacky way
+            if(pausingTags.Contains(tag.Name))
             {
                 Machine.Pause();
             }
-            return string.Format("(tag: '{0}') {1}", tag, str);
+            return string.Format("(tag: '{0}') {1}", tag.Name, str);
         }
 
-        private ulong ReportNonExistingRead(ulong address, SysbusAccessWidth type)
+        private ulong ReportNonExistingRead(ulong address, TagEntry? tag, SysbusAccessWidth type)
         {
             Interlocked.Increment(ref unexpectedReads);
-            bool tagged;
-            bool silent;
-            ulong defaultValue;
-            var warning = EnterTag(NonExistingRead, address, out tagged, out defaultValue, out silent);
+            var tagged = tag is TagEntry;
+            var defaultValue = tag?.DefaultValue ?? default(ulong);
+            var silent = tag?.Silent ?? false;
+            var warning = NonExistingRead;
+            if(tag is TagEntry foundTag)
+            {
+                warning = EnterTag(warning, foundTag);
+            }
             warning = DecorateWithCPUNameAndPC(warning);
             if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.DoNotReport)
             {
@@ -2138,16 +2191,21 @@ namespace Antmicro.Renode.Peripherals.Bus
             return defaultValue;
         }
 
-        private void ReportNonExistingWrite(ulong address, ulong value, SysbusAccessWidth type)
+        private void ReportNonExistingWrite(ulong address, ulong value, TagEntry? tag, SysbusAccessWidth type)
         {
             Interlocked.Increment(ref unexpectedWrites);
             if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.DoNotReport)
             {
                 return;
             }
-            bool tagged;
-            bool silent;
-            var warning = EnterTag(NonExistingWrite, address, out tagged, out var _, out silent);
+
+            var tagged = tag is TagEntry;
+            var silent = tag?.Silent ?? false;
+            var warning = NonExistingWrite;
+            if(tag is TagEntry filledTag)
+            {
+                warning = EnterTag(warning, filledTag);
+            }
             warning = DecorateWithCPUNameAndPC(warning);
             if((UnhandledAccessBehaviour == UnhandledAccessBehaviour.ReportIfTagged && !tagged)
                 || (UnhandledAccessBehaviour == UnhandledAccessBehaviour.ReportIfNotTagged && tagged))
@@ -2394,7 +2452,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         private ThreadLocal<int> cachedCpuId;
         [Transient]
         private ThreadLocalContext threadLocalContext;
-        private object cpuSync;
+        private readonly ReaderWriterLockSlim cpuSync;
         private SymbolLookup globalLookup;
         private Dictionary<ICPU, SymbolLookup> localLookups;
         private Dictionary<Range, TagEntry> tags;
@@ -2402,7 +2460,9 @@ namespace Antmicro.Renode.Peripherals.Bus
         private HashSet<string> pausingTags;
         private readonly List<BinaryFingerprint> binaryFingerprints;
         private const string NonExistingRead = "Read{1} from non existing peripheral at 0x{0:X}.";
+        private const string TagOverriddenRead = "Read{1} from overriding tag at 0x{0:X}.";
         private const string NonExistingWrite = "Write{2} to non existing peripheral at 0x{0:X}, value 0x{1:X}.";
+        private const string TagOverriddenWrite = "Write{2} to overriding tag at 0x{0:X}, value 0x{1:X}.";
         private const string IOExceptionMessage = "I/O error while loading ELF: {0}.";
         private const string CantFindCpuIdMessage = "Can't verify current CPU in the given context.";
 
@@ -2524,6 +2584,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             public string Name;
             public ulong DefaultValue;
             public bool Silent;
+            public bool OverridePeripheralAccesses;
         }
 
         private class ThreadLocalContext : IDisposable
