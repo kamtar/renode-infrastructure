@@ -7,11 +7,13 @@
  * This code uses KVM API, documentation for it may be found on
  * https://docs.kernel.org/virt/kvm/api.html
  */
-
 #include "callbacks.h"
 #include "cpu.h"
 #include "utils.h"
 #include "unwind.h"
+#ifdef TARGET_X86KVM
+#include "x86_reports.h"
+#endif
 
 #include <linux/kvm.h>
 #include <string.h>
@@ -32,9 +34,9 @@
 #define CPUID_FEATURE_INFO 0x1
 #define CPUID_FEATURE_INFO_EXTENDED 0x80000001
 
-cpu_state *cpu;
+CpuState *cpu;
 __thread struct unwind_state unwind_state;
-static void kvm_set_cpuid(cpu_state *s)
+static void kvm_set_cpuid(CpuState *s)
 {
     struct kvm_cpuid2 *kvm_cpuid;
 
@@ -51,7 +53,7 @@ static void kvm_set_cpuid(cpu_state *s)
     free(kvm_cpuid);
 }
 
-static void cpu_init(cpu_state *s)
+static void cpu_init(CpuState *s)
 {
     int ret;
     struct kvm_pit_config pit_config;
@@ -113,17 +115,27 @@ static void cpu_init(cpu_state *s)
         kvm_abortf("mmap kvm_run: %s", strerror(errno));
     }
 
-    cpu->exit_request = false;
+    cpu->exit_requested = false;
+    cpu->sregs_state = CLEAR;
+}
+
+static void kill_cpu_thread(int sig)
+{
+    if (tgkill(cpu->tgid, cpu->tid, sig) < 0) {
+        /* ESRCH means there is no such process. Such situation may occur when cpu thread already exited. */
+        if (errno != ESRCH) {
+            kvm_runtime_abortf("tgkill: %s", strerror(errno));
+        }
+    }
 }
 
 static void sigalarm_handler(int sig)
 {
     if (gettid() == cpu->tid) {
-        cpu->timer_expired = true;
+        cpu->exit_requested = true;
     } else {
         /* we are not the CPU thread, redirect signal */
-        if (tgkill(cpu->tgid, cpu->tid, SIGALRM) < 0)
-            kvm_abort("tgkill: failed to send signal");
+        kill_cpu_thread(SIGALRM);
     }
 }
 
@@ -155,7 +167,7 @@ void kvm_set_irq(int level, int interrupt_number)
     irq_level.irq = interrupt_number;
     irq_level.level = level;
     if (ioctl(cpu->vm_fd, KVM_IRQ_LINE, &irq_level) < 0) {
-        kvm_abort("KVM_IRQ_LINE");
+        kvm_runtime_abortf("KVM_IRQ_LINE");
     }
 }
 EXC_VOID_2(kvm_set_irq, int, level, int, interrupt_number)
@@ -191,38 +203,13 @@ void kvm_unmap_range(int32_t slot)
 }
 EXC_VOID_1(kvm_unmap_range, int32_t, slot)
 
-#define GET_FIELD(val, offset, width) ((uint8_t)(((val) >> (offset)) & (0xff >> (8 - (width)))))
-
-#define SECTOR_DESCRIPTOR_SETTER(name) \
-    void kvm_set_##name##_descriptor(uint64_t base, uint32_t limit, uint32_t selector, uint32_t flags) \
-    { \
-        struct kvm_sregs sregs; \
-        get_sregs(&sregs); \
-\
-        sregs.name.base = base; \
-        sregs.name.limit = limit; \
-        sregs.name.selector = selector; \
-        sregs.name.type = GET_FIELD(flags, 8, 4); \
-        sregs.name.present = GET_FIELD(flags, 15, 1); \
-        sregs.name.dpl = GET_FIELD(flags, 13, 2); \
-        sregs.name.db = GET_FIELD(flags, 22, 1); \
-        sregs.name.s = GET_FIELD(flags, 12, 1); \
-        sregs.name.l = GET_FIELD(flags, 21, 1); \
-        sregs.name.g = GET_FIELD(flags, 23, 1); \
-        sregs.name.avl = GET_FIELD(flags, 20, 1); \
-        set_sregs(&sregs); \
-    } \
-\
-    EXC_VOID_4(kvm_set_##name##_descriptor, uint64_t, base, uint32_t, limit, uint32_t, selector, uint32_t, flags)
-
-/* Segment descriptor setters
- * For more info plase refer to Intel(R) 64 and IA-32 Architectures Software Developer’s Manual Volume 3 (3.4.3) */
-SECTOR_DESCRIPTOR_SETTER(cs)
-SECTOR_DESCRIPTOR_SETTER(ds)
-SECTOR_DESCRIPTOR_SETTER(es)
-SECTOR_DESCRIPTOR_SETTER(ss)
-SECTOR_DESCRIPTOR_SETTER(fs)
-SECTOR_DESCRIPTOR_SETTER(gs)
+#ifdef TARGET_X86KVM
+void kvm_set64_bit_behaviour(uint32_t on64BitDetected)
+{
+    cpu->on64BitDetected = (Detected64BitBehaviour)on64BitDetected;
+}
+EXC_VOID_1(kvm_set64_bit_behaviour, uint32_t, on64BitDetected)
+#endif
 
 void kvm_dispose()
 {
@@ -230,7 +217,7 @@ void kvm_dispose()
 }
 EXC_VOID_0(kvm_dispose)
 
-static void kvm_exit_io(cpu_state *s, struct kvm_run *run)
+static void kvm_exit_io(CpuState *s, struct kvm_run *run)
 {
     uint8_t *ptr;
     int i;
@@ -249,7 +236,7 @@ static void kvm_exit_io(cpu_state *s, struct kvm_run *run)
                 kvm_io_port_write_double_word(run->io.port, *(uint32_t *)ptr);
                 break;
             default:
-                kvm_abortf("invalid io access width: %d bytes", run->io.size);
+                kvm_runtime_abortf("invalid io access width: %d bytes", run->io.size);
             }
         } else {
             switch(run->io.size) {
@@ -263,17 +250,24 @@ static void kvm_exit_io(cpu_state *s, struct kvm_run *run)
                 *(uint32_t *)ptr = kvm_io_port_read_double_word(run->io.port);
                 break;
             default:
-                kvm_abortf("invalid io access width: %d bytes", run->io.size);
+                kvm_runtime_abortf("invalid io access width: %d bytes", run->io.size);
             }
         }
         ptr += run->io.size;
     }
 }
 
-static void kvm_exit_mmio(cpu_state *s, struct kvm_run *run)
+static void kvm_exit_mmio(CpuState *s, struct kvm_run *run)
 {
     uint8_t *data = run->mmio.data;
     uint64_t addr = run->mmio.phys_addr;
+
+    #ifdef TARGET_X86KVM
+    if (addr > UINT32_MAX) {
+        handle_64bit_access(INVALID_ACCESS_64BIT_ADDRESS, run->mmio.len, run->mmio.is_write, addr);
+    }
+#endif
+
     if (run->mmio.is_write) {
         switch(run->mmio.len) {
         case 1:
@@ -286,10 +280,13 @@ static void kvm_exit_mmio(cpu_state *s, struct kvm_run *run)
             kvm_sysbus_write_double_word(addr, *(uint32_t *)data);
             break;
         case 8:
+#ifdef TARGET_X86KVM
+            handle_64bit_access(INVALID_ACCESS_64BIT_WIDTH, 8, true, addr);
+#endif
             kvm_sysbus_write_quad_word(addr, *(uint64_t *)data);
             break;
         default:
-            kvm_abortf("invalid mmio access width: %d bytes", run->mmio.len);
+            kvm_runtime_abortf("invalid mmio access width: %d bytes", run->mmio.len);
         }
     } else {
         switch(run->mmio.len) {
@@ -303,10 +300,13 @@ static void kvm_exit_mmio(cpu_state *s, struct kvm_run *run)
             *(uint32_t *)data = kvm_sysbus_read_double_word(addr);
             break;
         case 8:
+#ifdef TARGET_X86KVM
+            handle_64bit_access(INVALID_ACCESS_64BIT_WIDTH, 8, false, addr);
+#endif
             *(uint64_t *)data = kvm_sysbus_read_quad_word(addr);
             break;
         default:
-            kvm_abortf("invalid mmio access width: %d bytes", run->mmio.len);
+            kvm_runtime_abortf("invalid mmio access width: %d bytes", run->mmio.len);
         }
     }
 }
@@ -328,7 +328,7 @@ static void execution_timer_set(uint64_t timeout_in_us)
     }
 
     if (setitimer(ITIMER_REAL, &ival, NULL) < 0)
-        kvm_abortf("setitimer: %s", strerror(errno));
+        kvm_runtime_abortf("setitimer: %s", strerror(errno));
 }
 
 static void execution_timer_disarm()
@@ -339,7 +339,7 @@ static void execution_timer_disarm()
     ival.it_interval.tv_sec = 0;
     ival.it_interval.tv_usec = 0;
     if (setitimer(ITIMER_REAL, &ival, NULL) < 0)
-        kvm_abortf("setitimer: %s", strerror(errno));
+        kvm_runtime_abortf("setitimer: %s", strerror(errno));
 }
 
 /* Get execution time since calling kvm_execute */
@@ -356,7 +356,7 @@ static void set_next_run_as_single_step() {
     };
     ret = ioctl(cpu->vcpu_fd, KVM_SET_GUEST_DEBUG, &debug);
     if (ret < 0) {
-        kvm_abortf("KVM_SET_GUEST_DEBUG: %s", strerror(errno));
+        kvm_runtime_abortf("KVM_SET_GUEST_DEBUG: %s", strerror(errno));
         exit(1);
     }
 }
@@ -364,6 +364,11 @@ static void set_next_run_as_single_step() {
 /* Run KVM and handle it's exit reason */
 void kvm_run()
 {
+    if (cpu->sregs_state == DIRTY) {
+        set_sregs(&(cpu->sregs));
+    }
+    cpu->sregs_state = CLEAR;
+
     struct kvm_run *run = cpu->kvm_run;
     int ret;
 
@@ -375,7 +380,7 @@ void kvm_run()
              * Otherwise, signal is ignored. */
             return;
         }
-        kvm_abortf("KVM_RUN: %s", strerror(errno));
+        kvm_runtime_abortf("KVM_RUN: %s", strerror(errno));
     }
 
     /* KVM exited - check for possible reasons */
@@ -392,18 +397,18 @@ void kvm_run()
         /* this case occurs when single-stepping is enabled */
         break;
     case KVM_EXIT_FAIL_ENTRY:
-        kvm_abortf("KVM_EXIT_FAIL_ENTRY: reason=0x%" PRIx64 "\n",
+        kvm_runtime_abortf("KVM_EXIT_FAIL_ENTRY: reason=0x%" PRIx64 "\n",
                     (uint64_t)run->fail_entry.hardware_entry_failure_reason);
         break;
     case KVM_EXIT_INTERNAL_ERROR:
-        kvm_abortf("KVM_EXIT_INTERNAL_ERROR: suberror=0x%x\n",
+        kvm_runtime_abortf("KVM_EXIT_INTERNAL_ERROR: suberror=0x%x\n",
                     (uint32_t)run->internal.suberror);
         break;
     case KVM_EXIT_SHUTDOWN:
-        kvm_abort("KVM shutdown requested");
+        kvm_runtime_abortf("KVM shutdown requested");
         break;
     default:
-        kvm_abortf("KVM: unsupported exit_reason=%d\n", run->exit_reason);
+        kvm_runtime_abortf("KVM: unsupported exit_reason=%d\n", run->exit_reason);
     }
 }
 
@@ -413,18 +418,13 @@ uint64_t kvm_execute(uint64_t time_in_us)
     cpu->tgid = getpid();
     cpu->tid = gettid();
 
-    cpu->timer_expired = false;
+    cpu->exit_requested = false;
 
     execution_timer_set(time_in_us);
 
     /* timer_expired flag will be set by the SIGALRM handler */
-    while(!cpu->timer_expired) {
+    while(!cpu->exit_requested) {
         kvm_run();
-
-        if (cpu->exit_request) {
-            cpu->exit_request = false;
-            break;
-        }
     }
 
     return OK;
@@ -445,12 +445,6 @@ EXC_VALUE_0(uint64_t, kvm_execute_single_step, 0)
 void kvm_interrupt_execution()
 {
     execution_timer_disarm();
-    cpu->exit_request = true;
-    if (tgkill(cpu->tgid, cpu->tid, SIGALRM) < 0) {
-        /* ESRCH means there is no such process. Such situation may occur when cpu thread already exited. */
-        if (errno != ESRCH) {
-            kvm_abortf("tgkill: %s", strerror(errno));
-        }
-    }
+    kill_cpu_thread(SIGALRM);
 }
 EXC_VOID_0(kvm_interrupt_execution)

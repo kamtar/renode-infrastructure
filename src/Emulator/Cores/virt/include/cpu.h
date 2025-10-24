@@ -28,9 +28,24 @@ typedef enum {
     STOPPED_AT_WATCHPOINT = 4,
     EXTERNAL_MMU_FAULT = 5,
     ABORTED = UINT64_MAX
-} execution_result;
+} ExecutionResult;
 
-typedef struct cpu_state {
+typedef enum {
+    CLEAR,
+    PRESENT,
+    DIRTY
+} RegisterState;
+
+#ifdef TARGET_X86KVM
+typedef enum
+{
+    FAULT = 0,
+    WARN = 1,
+    IGNORE = 2,
+} Detected64BitBehaviour;
+#endif
+
+typedef struct CpuState {
     pid_t tid;  /* id of cpu thread */
     pid_t tgid; /* id of cpu process */
 
@@ -44,10 +59,16 @@ typedef struct cpu_state {
     /* struct containing KVM execution details */
     struct kvm_run *kvm_run;
 
-    /* flag set when time limit for execution is reached */
-    bool timer_expired;
-    /* flag set when there is exit request from C# */
-    bool exit_request;
-} cpu_state;
+    /* Flag set when there is exit request from from C# or timer */
+    bool exit_requested;
 
-extern struct cpu_state *cpu;
+    /* cached special register state */
+    struct kvm_sregs sregs;
+    RegisterState sregs_state;
+
+#ifdef TARGET_X86KVM
+    Detected64BitBehaviour on64BitDetected;
+#endif
+} CpuState;
+
+extern struct CpuState *cpu;

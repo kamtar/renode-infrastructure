@@ -6,31 +6,32 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
-using System.Linq;
-using System.Globalization;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+
+using Antmicro.Migrant;
+using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Extensions;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Peripherals.CPU;
-using Antmicro.Renode.Utilities;
-using System.Threading;
-using System.Collections.ObjectModel;
-using System.Text;
-using Machine = Antmicro.Renode.Core.Machine;
-using Antmicro.Migrant;
-using Antmicro.Migrant.Hooks;
-using ELFSharp.ELF;
-using ELFSharp.ELF.Segments;
-using ELFSharp.UImage;
-using System.IO;
-using Antmicro.Renode.Core.Extensions;
-using System.Reflection;
-using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.UserInterface;
+using Antmicro.Renode.Utilities;
 
+using ELFSharp.ELF;
+using ELFSharp.UImage;
+
+using Microsoft.CSharp.RuntimeBinder;
+
+using Machine = Antmicro.Renode.Core.Machine;
 using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.Bus
@@ -54,243 +55,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             pcCache.OnChanged += HandleChangedSymbols;
             InitStructures();
             this.Log(LogLevel.Info, "System bus created.");
-        }
-
-        public void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, IPeripheral cpu)
-        {
-            var minAddr = this.LoadFileChunks(chunks, cpu);
-            AddFingerprint(path);
-            UpdateLowestLoadedAddress(minAddr);
-            this.DebugLog(path + " File loaded.");
-        }
-
-        public void Unregister(IBusPeripheral peripheral)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                Machine.UnregisterAsAChildOf(this, peripheral);
-                UnregisterInner(peripheral);
-            }
-        }
-
-        public void Unregister(IBusRegistered<IBusPeripheral> busRegisteredPeripheral)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                Machine.UnregisterAsAChildOf(this, busRegisteredPeripheral.RegistrationPoint);
-                UnregisterInner(busRegisteredPeripheral);
-            }
-        }
-
-        public void Unregister(IPeripheral peripheral)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                Machine.UnregisterAsAChildOf(this, peripheral);
-                RemoveContextKeys(peripheral);
-            }
-        }
-
-        public void Register(IPeripheral peripheral, NullRegistrationPoint registrationPoint)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                // NullRegistrationPoint peripherals are not mapped on the bus and
-                // are not directly accessible from the emulated software.
-                Machine.RegisterAsAChildOf(this, peripheral, registrationPoint);
-            }
-        }
-
-        public void Register(IBusPeripheral peripheral, BusRangeRegistration registrationPoint)
-        {
-            var methods = PeripheralAccessMethods.CreateWithLock();
-            if(registrationPoint is BusParametrizedRegistration parametrizedRegistrationPoint)
-            {
-                parametrizedRegistrationPoint.RegisterForEachContext((contextRegistration) =>
-                {
-                    // Prepare accessor methods in the context of registration,
-                    // as it may want to fill them according to the CPU context.
-                    methods = PeripheralAccessMethods.CreateWithLock();
-                    contextRegistration.FillAccessMethods(peripheral, ref methods);
-                    FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
-                    RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator);
-                });
-            }
-            else if(registrationPoint is BusMultiRegistration multiRegistrationPoint)
-            {
-                if(peripheral is IMapped)
-                {
-                    throw new ConstructionException(string.Format("It is not allowed to register `{0}` peripheral using `{1}`", typeof(IMapped).Name, typeof(BusMultiRegistration).Name));
-                }
-                FillAccessMethodsWithTaggedMethods(peripheral, multiRegistrationPoint.ConnectionRegionName, ref methods);
-                multiRegistrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
-            }
-            else
-            {
-                FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
-                registrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
-            }
-        }
-
-        public void Register(IBusPeripheral peripheral, BusMultiRegistration registrationPoint)
-        {
-            Register(peripheral, (BusRangeRegistration)registrationPoint);
-        }
-
-        public void Register(IBusPeripheral peripheral, BusParametrizedRegistration registrationPoint)
-        {
-            Register(peripheral, (BusRangeRegistration)registrationPoint);
-        }
-
-        void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
-        {
-            Unregister(peripheral);
-        }
-
-        public void Register(IKnownSize peripheral, BusPointRegistration registrationPoint)
-        {
-            Register(peripheral, registrationPoint.ToRangeRegistration(checked((ulong)peripheral.Size)));
-        }
-
-        public void Unregister(IKnownSize peripheral)
-        {
-            Unregister((IBusPeripheral)peripheral);
-        }
-
-        public void MoveRegistrationWithinContext(IBusPeripheral peripheral, BusRangeRegistration newRegistration, ICPU context, Func<IEnumerable<IBusRegistered<IBusPeripheral>>, IBusRegistered<IBusPeripheral>> selector = null)
-        {
-            if(context == null && !TryFindCurrentThreadCPUAndId(out context, out var _))
-            {
-                throw new RecoverableException("Moving a peripheral is supported only from CPU thread if context isn't explicitly set");
-            }
-            var wasMapped = RemoveMappingsForPeripheral(peripheral);
-            var busRegisteredEntries = peripheralsCollectionByContext[context].Peripherals.Where(x => x.Peripheral == peripheral).ToList();
-            if(busRegisteredEntries.Count == 0)
-            {
-                throw new RecoverableException("Attempted to move a peripheral that isn't registered within current context");
-            }
-            IBusRegistered<IBusPeripheral> busRegistered;
-            if(selector != null)
-            {
-                busRegistered = selector(busRegisteredEntries);
-                if(busRegistered == null)
-                {
-                    throw new RecoverableException("Provided selector failed to find a suitable registration point");
-                }
-            }
-            else
-            {
-                if(busRegisteredEntries.Count > 1)
-                {
-                    throw new RecoverableException($"Unable to unambiguously determine a registration point, found multiple candidates: {String.Join(", ", busRegisteredEntries.Select(x => x.RegistrationPoint))}");
-                }
-                busRegistered = busRegisteredEntries[0];
-            }
-            if(IsAddressRangeLocked(busRegistered.RegistrationPoint.Range, context))
-            {
-                throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
-            }
-            UnregisterAccessFlags(busRegistered.RegistrationPoint, context);
-            peripheralsCollectionByContext.WithStateCollection(context, null, collection =>
-            {
-                collection.Move(busRegistered, newRegistration);
-            });
-            Machine.ExchangeRegistrationPointForPeripheral(this, peripheral, busRegistered.RegistrationPoint, newRegistration);
-            if(wasMapped)
-            {
-                AddMappingsForPeripheral(peripheral, newRegistration, context);
-            }
-
-            if(peripheral is ArrayMemory)
-            {
-                foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
-                {
-                    var range = newRegistration.Range;
-                    cpu.RegisterAccessFlags(range.StartAddress, range.Size, isIoMemory: true);
-                }
-            }
-        }
-
-        public void ChangePeripheralAccessCondition(IBusPeripheral peripheral, string newCondition, string oldCondition = null)
-        {
-            lock(peripheral)
-            {
-                var newConditionsPerInitiator = ParseNewConditions(newCondition);
-                var foundEntry = FindUniqueRegistration(peripheral, oldCondition) ?? throw new RecoverableException("No registration found for this peripheral with the specified condition.");
-
-                foundEntry.Collection.Remove(peripheral);
-                var registration = foundEntry.RegistrationPoint;
-                var methods = foundEntry.AccessMethods;
-                var range = registration.Range;
-
-                foreach(var newContext in newConditionsPerInitiator)
-                {
-                    var initiator = Machine[Core.Machine.SystemBusName + Core.Machine.PathSeparator + newContext.Key];
-                    foreach(var newMask in newContext.Value)
-                    {
-                        peripheralsCollectionByContext.WithStateCollection(initiator, newMask, collection =>
-                        {
-                            var busRegistered = new BusRegistered<IBusPeripheral>(peripheral, registration);
-                            collection.Add(range.StartAddress, range.EndAddress + 1, busRegistered, methods);
-                        });
-                    }
-                }
-            }
-        }
-
-        private Dictionary<string, List<StateMask>> ParseNewConditions(string newCondition)
-        {
-            if(string.IsNullOrEmpty(newCondition))
-            {
-                return new Dictionary<string, List<StateMask>>
-                {
-                    [""] = new List<StateMask> { StateMask.AllAccess }
-                };
-            }
-            else
-            {
-                var condition = AccessConditionParser.ParseCondition(newCondition);
-                return AccessConditionParser.EvaluateWithStateBits(condition,
-                    i => string.IsNullOrEmpty(i) ? GetCommonStateBits() : GetStateBits(i));
-            }
-        }
-
-        private FoundRegistrationInfo? FindUniqueRegistration(IBusPeripheral peripheral, string oldCondition)
-        {
-            FoundRegistrationInfo? match = null;
-
-            foreach(var contextKey in peripheralsCollectionByContext.GetAllContextKeys())
-            {
-                foreach(var stateKey in peripheralsCollectionByContext.GetAllStateKeys(contextKey))
-                {
-                    peripheralsCollectionByContext.WithStateCollection(contextKey, stateKey, collection =>
-                    {
-                        // We take only the entries with a distinct registration point ignoring the state mask as a registration might be split
-                        // into multiple points, for example `secure || privileged` will be represented as 2 registrations which differ only in
-                        // the state mask, but it's the same registration for our purposes.
-                        var busRegisteredEntries = collection.Peripherals
-                            .Where(x => x.Peripheral == peripheral && (string.IsNullOrEmpty(oldCondition) || x.RegistrationPoint.Condition == oldCondition))
-                            .DistinctBy(x => x.RegistrationPoint.WithInitiatorAndStateMask(x.RegistrationPoint.Initiator, StateMask.AllAccess));
-
-                        foreach(var entry in busRegisteredEntries)
-                        {
-                            var registration = entry.RegistrationPoint;
-                            var normalizedRegistration = registration.WithInitiatorAndStateMask(registration.Initiator, StateMask.AllAccess);
-                            var methods = collection.FindAccessMethods(registration.Range.StartAddress, out _, out _);
-                            if(match == null)
-                            {
-                                match = new FoundRegistrationInfo(registration, collection, methods);
-                            }
-                            else if(!match.Value.RegistrationPoint.WithInitiatorAndStateMask(match.Value.RegistrationPoint.Initiator, StateMask.AllAccess).Equals(normalizedRegistration))
-                            {
-                                throw new RecoverableException("This peripheral is registered with several conditions. You need to specify which one to change.");
-                            }
-                        }
-                    });
-                }
-            }
-
-            return match;
         }
 
         public void Register(ICPU cpu, CPURegistrationPoint registrationPoint)
@@ -323,20 +87,33 @@ namespace Antmicro.Renode.Peripherals.Bus
                     throw new RegistrationException("Currently there can't be CPUs with different endiannesses on the same bus.");
                 }
 
+                if(registrationPoint == null && !Machine.IsRegistered(cpu))
+                {
+                    throw new RegistrationException(
+                        "Registering a CPU without a registration point is allowed only after it has already been registered on a valid registration point in this machine.");
+                }
+
+                var cpuId = 0;
+                if(registrationPoint == null || !registrationPoint.Slot.HasValue)
+                {
+                    while(cpuById.ContainsKey(cpuId))
+                    {
+                        cpuId++;
+                    }
+                }
+                else
+                {
+                    cpuId = registrationPoint.Slot.Value;
+                }
+
                 // This must be the very last step after all conditions have been validated and we are committed to registering
                 // this CPU.
-                if(!registrationPoint.Slot.HasValue)
+                if(registrationPoint != null)
                 {
-                    var i = 0;
-                    while(cpuById.ContainsKey(i))
-                    {
-                        i++;
-                    }
-                    registrationPoint = new CPURegistrationPoint(i);
+                    Machine.RegisterAsAChildOf(this, cpu, new CPURegistrationPoint(cpuId));
                 }
-                Machine.RegisterAsAChildOf(this, cpu, registrationPoint);
-                cpuById.Add(registrationPoint.Slot.Value, cpu);
-                idByCpu.Add(cpu, registrationPoint.Slot.Value);
+                cpuById.Add(cpuId, cpu);
+                idByCpu.Add(cpu, cpuId);
                 AddContextKeys(cpu);
             }
             finally
@@ -345,496 +122,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public void Unregister(ICPU cpu)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                Machine.UnregisterFromParent(cpu);
-                cpuSync.EnterWriteLock();
-                try
-                {
-                    var id = idByCpu[cpu];
-                    idByCpu.Remove(cpu);
-                    cpuById.Remove(id);
-                    RemoveContextKeys(cpu);
-                }
-                finally
-                {
-                    cpuSync.ExitWriteLock();
-                }
-            }
-        }
-
-        public void SetPCOnAllCores(ulong pc)
-        {
-            using(Machine.ObtainPausedState(true))
-            {
-                cpuSync.EnterWriteLock();
-                try
-                {
-                    foreach(var p in idByCpu.Keys.Cast<ICPU>())
-                    {
-                        p.PC = pc;
-                    }
-                }
-                finally
-                {
-                    cpuSync.ExitWriteLock();
-                }
-            }
-        }
-
-        public void LogAllPeripheralsAccess(bool enable = true)
-        {
-            foreach(var p in allPeripherals.SelectMany(x => x.Peripherals))
-            {
-                LogPeripheralAccess(p.Peripheral, enable);
-            }
-        }
-
-        public void LogPeripheralAccess(IBusPeripheral busPeripheral, bool enable = true)
-        {
-            foreach(var peripherals in allPeripherals)
-            {
-                peripherals.VisitAccessMethods(busPeripheral, pam =>
-                {
-                    // first check whether logging is already enabled, method should be idempotent
-                    var loggingAlreadEnabled = pam.WriteByte.Target is HookWrapper;
-                    this.Log(LogLevel.Info, "Logging already enabled: {0}.", loggingAlreadEnabled);
-                    if(enable == loggingAlreadEnabled)
-                    {
-                        return pam;
-                    }
-                    if(enable)
-                    {
-                        pam.WrapMethods(typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>));
-                        return pam;
-                    }
-                    else
-                    {
-                        pam.RemoveWrappersOfType(typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>));
-                        return pam;
-                    }
-                });
-            }
-        }
-
-        public void EnableAllTranslations(bool enable = true)
-        {
-            foreach(var p in allPeripherals.SelectMany(x => x.Peripherals))
-            {
-                EnableAllTranslations(p.Peripheral, enable);
-            }
-        }
-
-        public void EnableAllTranslations(IBusPeripheral busPeripheral, bool enable = true)
-        {
-            foreach(var peripherals in allPeripherals)
-            {
-                peripherals.VisitAccessMethods(busPeripheral, pam =>
-                {
-                    pam.EnableAllTranslations(enable, Endianess);
-                    return pam;
-                });
-            }
-        }
-
-        public IEnumerable<ICPU> GetCPUs()
-        {
-            cpuSync.EnterReadLock();
-            try
-            {
-                return new ReadOnlyCollection<ICPU>(idByCpu.Keys.ToList());
-            }
-            finally
-            {
-                cpuSync.ExitReadLock();
-            }
-        }
-
-        public int GetCPUSlot(ICPU cpu)
-        {
-            cpuSync.EnterReadLock();
-            try
-            {
-                if(idByCpu.ContainsKey(cpu))
-                {
-                    return idByCpu[cpu];
-                }
-                throw new KeyNotFoundException("Given CPU is not registered.");
-            }
-            finally
-            {
-                cpuSync.ExitReadLock();
-            }
-        }
-
-        public ICPU GetCurrentCPU()
-        {
-            ICPU cpu;
-            if(!TryGetCurrentCPU(out cpu))
-            {
-                // TODO: inline
-                throw new RecoverableException(CantFindCpuIdMessage);
-            }
-            return cpu;
-        }
-
-        public int GetCurrentCPUId()
-        {
-            int id;
-            if(!TryGetCurrentCPUId(out id))
-            {
-                throw new RecoverableException(CantFindCpuIdMessage);
-            }
-            return id;
-        }
-
-        public IEnumerable<IPeripheral> GetAllContextKeys()
-        {
-            return peripheralsCollectionByContext.GetAllContextKeys();
-        }
-
-        public bool TryGetCurrentContextState<T>(out IPeripheralWithTransactionState cpu, out T cpuState)
-        {
-            cpu = null;
-            cpuState = default;
-            if(!threadLocalContext.InUse || !threadLocalContext.InitiatorState.HasValue)
-            {
-                return false;
-            }
-            cpu = threadLocalContext.Initiator as IPeripheralWithTransactionState;
-            if((cpu == null) || !cpu.TryConvertUlongToStateObj(threadLocalContext.InitiatorState.Value, out var state))
-            {
-                return false;
-            }
-            if(state is T requestedTypeSTate)
-            {
-                cpuState = requestedTypeSTate;
-                return true;
-            }
-            return false;
-        }
-
-        public bool TryConvertStateToUlongForContext(IPeripheral context, IContextState cpuStateObj, out ulong? state)
-        {
-            state = null;
-            if(!(context is IPeripheralWithTransactionState peripheralWithTransactionState)
-                || !peripheralWithTransactionState.TryConvertStateObjToUlong(cpuStateObj, out state))
-            {
-                return false;
-            }
-            return true;
-        }
-
-        private void HandleChangedSymbols()
-        {
-            OnSymbolsChanged?.Invoke(Machine);
-        }
-
-        private IEnumerable<ICPU> GetCPUsForContext(IPeripheral context)
-        {
-            return GetCPUs().Where(x => context == null || x == context);
-        }
-
-        private IEnumerable<T> GetCPUsForContext<T>(IPeripheral context)
-            where T : IPeripheral
-        {
-            return GetCPUsForContext(context).OfType<T>();
-        }
-
-        private bool TryGetCurrentCPUId(out int cpuId)
-        {
-            if(threadLocalContext.InUse && threadLocalContext.Initiator is ICPU cpu)
-            {
-                cpuId = idByCpu[cpu];
-                return true;
-            }
-            /*
-             * Because getting cpu id can possibly be a heavy operation, we cache the
-             * obtained ID in the thread local storage. Note that we assume here that the
-             * thread with such storage won't be used for another purposes than it was
-             * used originally (i.e. cpu loop).
-             */
-            if(cachedCpuId.IsValueCreated)
-            {
-                cpuId = cachedCpuId.Value;
-                return true;
-            }
-
-            return TryFindCurrentThreadCPUAndId(out var _, out cpuId);
-        }
-
-        private bool TryFindCurrentThreadCPUAndId(out ICPU cpu, out int cpuId)
-        {
-            cpuSync.EnterReadLock();
-            try
-            {
-                foreach(var entry in cpuById)
-                {
-                    cpu = entry.Value;
-                    if(!cpu.OnPossessedThread)
-                    {
-                        continue;
-                    }
-                    cpuId = entry.Key;
-                    cachedCpuId.Value = cpuId;
-                    return true;
-                }
-                cpu = default(ICPU);
-                cpuId = -1;
-                return false;
-            }
-            finally
-            {
-                cpuSync.ExitReadLock();
-            }
-        }
-
-        public bool TryGetCurrentCPU(out ICPU cpu)
-        {
-            cpuSync.EnterReadLock();
-            try
-            {
-                int id;
-                if(TryGetCurrentCPUId(out id))
-                {
-                    cpu = cpuById[id];
-                    return true;
-                }
-                cpu = null;
-                return false;
-            }
-            finally
-            {
-                cpuSync.ExitReadLock();
-            }
-        }
-
-        /// <summary>
-        /// Unregister peripheral from the specified address.
-        ///
-        /// NOTE: After calling this method, peripheral may still be
-        /// registered in the SystemBus at another address. In order
-        /// to remove peripheral completely use 'Unregister' method.
-        /// </summary>
-        /// <param name="address">Address on system bus where the peripheral is registered.</param>
-        /// <param name="context">
-        ///     CPU context in which peripherals should be scanned.
-        ///     This is useful when some peripherals are only accessible from selected CPUs.
-        ///
-        ///     If not provided, the global peripherals collection (i.e., peripherals available for all CPUs) is searched.
-        /// </param>
-        public void UnregisterFromAddress(ulong address, ICPU context = null)
-        {
-            var busRegisteredPeripheral = WhatIsAt(address, context);
-            if(busRegisteredPeripheral == null)
-            {
-                throw new RecoverableException(string.Format(
-                    "There is no peripheral registered at 0x{0:X}.", address));
-            }
-            Unregister(busRegisteredPeripheral);
-        }
-
-        public void Dispose()
-        {
-            cachedCpuId.Dispose();
-            threadLocalContext.Dispose();
-            globalLookup.Dispose();
-            cpuSync.Dispose();
-            foreach(var lookup in localLookups.Values)
-            {
-                lookup.Dispose();
-            }
-            foreach(var peripherals in allPeripherals)
-            {
-#if DEBUG
-                peripherals.ShowStatistics();
-#endif
-                peripherals.Dispose();
-            }
-        }
-
-        /// <summary>Checks what is at a given address.</summary>
-        /// <param name="address">
-        ///     A <see cref="ulong"/> with the address to check.
-        /// </param>
-        /// <param name="context">
-        ///     CPU context in which peripherals should be scanned.
-        ///     This is useful when some peripherals are only accessible from selected CPUs.
-        ///
-        ///     If not provided, the global peripherals collection (i.e., peripherals available for all CPUs) is searched.
-        /// </param>
-        /// <returns>
-        ///     A peripheral which is at the given address.
-        /// </returns>
-        public IBusRegistered<IBusPeripheral> WhatIsAt(ulong address, IPeripheral context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context).FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
-        }
-
-        public IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null)
-        {
-            var registered = WhatIsAt(address, context);
-            if(registered != null)
-            {
-                return registered.Peripheral;
-            }
-            return null;
-        }
-
-        public IBusRegistered<MappedMemory> FindMemory(ulong address, ICPU context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context)
-                .Where(x => x.Peripheral is MappedMemory)
-                .Convert<IBusPeripheral, MappedMemory>()
-                .FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
-        }
-
-        public bool IsMemory(ulong address, ICPU context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context)
-                .Any(x => x.Peripheral is IMemory && x.RegistrationPoint.Range.Contains(address));
-        }
-
-        public IEnumerable<IBusRegistered<IMapped>> GetMappedPeripherals(IPeripheral context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context)
-                .Where(x => x.Peripheral is IMapped)
-                .Convert<IBusPeripheral, IMapped>();
-        }
-
-        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegistrationsForPeripheralType<T>(IPeripheral context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context)
-                .Where(x => x.Peripheral is T);
-        }
-
-        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegisteredPeripherals(IPeripheral context = null)
-        {
-            return GetAccessiblePeripheralsForContext(context);
-        }
-
-        public void SilenceRange(Range range)
-        {
-            var silencer = new Silencer();
-            Register(silencer, new BusRangeRegistration(range));
-        }
-
-        public void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null)
-        {
-            using(SetLocalContext(context))
-            {
-                var targets = FindTargets(address, checked((ulong)count), context);
-                if(onlyMemory)
-                {
-                    ThrowIfNotAllMemory(targets);
-                }
-                foreach(var target in targets)
-                {
-                    var memory = target.What.Peripheral as MappedMemory;
-                    if(memory != null)
-                    {
-                        checked
-                        {
-                            memory.ReadBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), (int)target.SourceLength, destination, startIndex + (int)target.SourceIndex);
-                        }
-                    }
-                    else
-                    {
-                        for(var i = 0UL; i < target.SourceLength; ++i)
-                        {
-                            destination[checked((ulong)startIndex) + target.SourceIndex + i] = ReadByte(target.Offset + i, context);
-                        }
-                    }
-                }
-            }
-        }
-
-        public byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null)
-        {
-            var result = new byte[count];
-            ReadBytes(address, count, result, 0, onlyMemory, context);
-            return result;
-        }
-
-        public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
-        {
-            return ReadBytes((ulong)offset, count, context: context);
-        }
-
-        public void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null)
-        {
-            WriteBytes(bytes, address, bytes.Length, onlyMemory, context);
-        }
-
-        public void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null)
-        {
-            using(SetLocalContext(context))
-            {
-                var targets = FindTargets(address, checked((ulong)count), context);
-                if(onlyMemory)
-                {
-                    ThrowIfNotAllMemory(targets);
-                }
-                foreach(var target in targets)
-                {
-                    var multibytePeripheral = target.What.Peripheral as IMultibyteWritePeripheral;
-                    if(multibytePeripheral != null)
-                    {
-                        checked
-                        {
-                            multibytePeripheral.WriteBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), bytes, startingIndex + (int)target.SourceIndex, (int)target.SourceLength);
-                        }
-                    }
-                    else
-                    {
-                        for(var i = 0UL; i < target.SourceLength; ++i)
-                        {
-                            WriteByte(target.Offset + i, bytes[target.SourceIndex + (ulong)startingIndex + i]);
-                        }
-                    }
-                }
-            }
-        }
-
-        public void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null)
-        {
-            WriteBytes(bytes, address, 0, count, onlyMemory, context);
-        }
-
-        public void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context = null)
-        {
-            WriteBytes(array, (ulong)offset, startingIndex, count, context: context);
-        }
-
-        public void ZeroRange(Range range, IPeripheral context = null)
-        {
-            var zeroBlock = new byte[1024 * 1024];
-            var blocksNo = range.Size / (ulong)zeroBlock.Length;
-            for(var i = 0UL; i < blocksNo; i++)
-            {
-                WriteBytes(zeroBlock, range.StartAddress + i * (ulong)zeroBlock.Length, context: context);
-            }
-            WriteBytes(zeroBlock, range.StartAddress + blocksNo * (ulong)zeroBlock.Length, (int)range.Size % zeroBlock.Length, context: context);
-        }
-
-        // Specifying `textAddress` will override the address of the program text - the symbols will be applied
-        // as if the first loaded segment started at the specified address. This is equivalent to the ADDR parameter
-        // to GDB's add-symbol-file.
-        public void LoadSymbolsFrom(IELF elf, bool useVirtualAddress = false, ulong? textAddress = null, ICPU context = null)
-        {
-            GetOrCreateLookup(context).LoadELF(elf, useVirtualAddress, textAddress);
-            pcCache.Invalidate();
-        }
-
-        public void ClearSymbols(ICPU context = null)
-        {
-            RemoveLookup(context);
-            pcCache.Invalidate();
-        }
-
-        public void AddSymbol(Range address, string name, bool isThumb = false, ICPU context = null)
+        public void AddSymbol(Range address, string name, ICPU context = null)
         {
             checked
             {
@@ -978,7 +266,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             else
             {
-                AddMappings(new [] { new MappedSegmentWrapper(segment, 0, long.MaxValue, context) }, owner);
+                AddMappings(new[] { new MappedSegmentWrapper(segment, 0, long.MaxValue, context) }, owner);
             }
         }
 
@@ -1054,7 +342,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void RemoveWatchpointHook(ulong address, BusHookDelegate hook)
         {
-            foreach(var hookDictionary in new [] { hooksOnRead, hooksOnWrite })
+            foreach(var hookDictionary in new[] { hooksOnRead, hooksOnWrite })
             {
                 List<BusHookHandler> handlers;
                 if(hookDictionary.TryGetValue(address, out handlers))
@@ -1104,18 +392,159 @@ namespace Antmicro.Renode.Peripherals.Bus
                 .Select(x => x.RegistrationPoint);
         }
 
-        /// <remarks>Doesn't include peripherals registered using NullRegistrationPoints.</remarks>
-        public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral peripheral)
+        public IDisposable SetLocalContext(IPeripheral context, ulong? initiatorState = null)
         {
-            // try to detect the CPU context based on the current thread
-            TryGetCurrentCPU(out var context);
-            return GetRegistrationPoints(peripheral, context);
+            return threadLocalContext.Initialize(context, initiatorState);
         }
 
-        public void ApplySVD(string path)
+        public IReadOnlyDictionary<string, int> GetStateBits(string initiatorName)
         {
-            var svdDevice = new SVDParser(path, this);
-            svdDevices.Add(svdDevice);
+            if(string.IsNullOrEmpty(initiatorName))
+            {
+                throw new ArgumentNullException(nameof(initiatorName));
+            }
+            var fullPath = Core.Machine.SystemBusName + Core.Machine.PathSeparator + initiatorName;
+            return Machine.TryGetByName<IPeripheralWithTransactionState>(fullPath, out var peri) ? peri?.StateBits : null;
+        }
+
+        public IReadOnlyDictionary<string, int> GetCommonStateBits()
+        {
+            var possibleInitiators = Machine.GetPeripheralsOfType<IPeripheralWithTransactionState>();
+            if(!possibleInitiators.Any())
+            {
+                return null;
+            }
+
+            var theIntersectionOfTheirStateBitsets = possibleInitiators
+                .Select(i => i.StateBits)
+                .Aggregate((commonDict, nextDict) =>
+                    commonDict
+                        .Where(p => nextDict.TryGetValue(p.Key, out var value) && p.Value == value)
+                        .ToDictionary(p => p.Key, p => p.Value)
+                );
+            return theIntersectionOfTheirStateBitsets;
+        }
+
+        public SymbolLookup GetLookup(ICPU context = null)
+        {
+            if(context == null
+               || !localLookups.TryGetValue(context, out var cpuLookup))
+            {
+                return globalLookup;
+            }
+
+            return cpuLookup;
+        }
+
+        public string DecorateWithCPUNameAndPC(string str)
+        {
+            if(!TryGetCurrentCPU(out var cpu) || !Machine.TryGetLocalName(cpu, out var cpuName))
+            {
+                return str;
+            }
+
+            // you probably wonder why 26?
+            // * we assume at least 3 characters for cpu name
+            // * 64-bit PC value nees 18 characters
+            // * there are 5 more separating characters
+            var builder = new StringBuilder(str.Length + 26);
+            builder
+                .Append("[")
+                .Append(cpuName);
+
+            builder.AppendFormat(": 0x{0:X}", cpu.PC.RawValue);
+
+            builder
+                .Append("] ")
+                .Append(str);
+
+            return builder.ToString();
+        }
+
+        public void Reset()
+        {
+            LowestLoadedAddress = null;
+            globalLookup = new SymbolLookup();
+            localLookups = new Dictionary<ICPU, SymbolLookup>();
+            pcCache.Invalidate();
+            delayedInvalidation = false;
+        }
+
+        public void ClearSymbols(ICPU context = null)
+        {
+            RemoveLookup(context);
+            pcCache.Invalidate();
+        }
+
+        public void Clear()
+        {
+            ClearAll();
+        }
+
+        /// <returns>True if any part of the <c>range</c> is locked for the given CPU (globally if <c>null</c> passed as <c>context</c>).</returns>
+        public bool IsAddressRangeLocked(Range range, IPeripheral context = null)
+        {
+            // The locked range is either mapped for the CPU context, or globally (that is the reason for the OR)
+            return (lockedRangesCollectionByContext.TryGetValue(context, initiatorState: null, out var collection) && collection.ContainsOverlappingRange(range))
+                || lockedRangesCollectionByContext[null].ContainsOverlappingRange(range);
+        }
+
+        public void SetPeripheralEnabled(IPeripheral peripheral, bool enabled)
+        {
+            if(enabled)
+            {
+                lockedPeripherals.Remove(peripheral);
+            }
+            else
+            {
+                if(peripheral != null)
+                {
+                    lockedPeripherals.Add(peripheral);
+                }
+            }
+        }
+
+        public void SetAddressRangeLocked(Range range, bool locked, IPeripheral context = null)
+        {
+            lock(lockedRangesCollectionByContext)
+            {
+                // Check if `range` needs to be locked or unlocked at all.
+                if(locked ? lockedRangesCollectionByContext[context].ContainsWholeRange(range) : !IsAddressRangeLocked(range, context))
+                {
+                    return;
+                }
+
+                using(Machine.ObtainPausedState(internalPause: true))
+                {
+                    RelockRange(range, locked, context);
+
+                    lockedRangesCollectionByContext.WithStateCollection(context, stateMask: null, collection =>
+                    {
+                        if(locked)
+                        {
+                            collection.Add(range);
+                        }
+                        else
+                        {
+                            collection.Remove(range);
+                        }
+                    });
+                }
+            }
+        }
+
+        public void RemoveTag(ulong address)
+        {
+            var tagsToRemove = tags.Where(x => x.Key.Contains(address)).ToArray();
+            if(tagsToRemove.Length == 0)
+            {
+                throw new RecoverableException(string.Format("There is no tag at address 0x{0:X}.", address));
+            }
+            foreach(var tag in tagsToRemove)
+            {
+                tags.Remove(tag.Key);
+                pausingTags.Remove(tag.Value.Name);
+            }
         }
 
         public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false, bool overridePeripheralAccesses = false)
@@ -1169,70 +598,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             Tag(range, string.Format("{0}/{1}", parentName, tag), defaultValue, pausing, overridePeripheralAccesses);
         }
 
-        public void RemoveTag(ulong address)
+        public void ApplySVD(string path)
         {
-            var tagsToRemove = tags.Where(x => x.Key.Contains(address)).ToArray();
-            if(tagsToRemove.Length == 0)
-            {
-                throw new RecoverableException(string.Format("There is no tag at address 0x{0:X}.", address));
-            }
-            foreach(var tag in tagsToRemove)
-            {
-                tags.Remove(tag.Key);
-                pausingTags.Remove(tag.Value.Name);
-            }
-        }
-
-        public void SetAddressRangeLocked(Range range, bool locked, IPeripheral context = null)
-        {
-            lock(lockedRangesCollectionByContext)
-            {
-                // Check if `range` needs to be locked or unlocked at all.
-                if(locked ? lockedRangesCollectionByContext[context].ContainsWholeRange(range) : !IsAddressRangeLocked(range, context))
-                {
-                    return;
-                }
-
-                using(Machine.ObtainPausedState(internalPause: true))
-                {
-                    RelockRange(range, locked, context);
-
-                    lockedRangesCollectionByContext.WithStateCollection(context, stateMask: null, collection =>
-                    {
-                        if(locked)
-                        {
-                            collection.Add(range);
-                        }
-                        else
-                        {
-                            collection.Remove(range);
-                        }
-                    });
-                }
-            }
-        }
-
-        public void SetPeripheralEnabled(IPeripheral peripheral, bool enabled)
-        {
-            if(enabled)
-            {
-                lockedPeripherals.Remove(peripheral);
-            }
-            else
-            {
-                if(peripheral != null)
-                {
-                    lockedPeripherals.Add(peripheral);
-                }
-            }
-        }
-
-        /// <returns>True if any part of the <c>range</c> is locked for the given CPU (globally if <c>null</c> passed as <c>context</c>).</returns>
-        public bool IsAddressRangeLocked(Range range, IPeripheral context = null)
-        {
-            // The locked range is either mapped for the CPU context, or globally (that is the reason for the OR)
-            return (lockedRangesCollectionByContext.TryGetValue(context, initiatorState: null, out var collection) && collection.ContainsOverlappingRange(range))
-                || lockedRangesCollectionByContext[null].ContainsOverlappingRange(range);
+            var svdDevice = new SVDParser(path, this);
+            svdDevices.Add(svdDevice);
         }
 
         public bool IsPeripheralEnabled(IPeripheral peripheral)
@@ -1244,102 +613,652 @@ namespace Antmicro.Renode.Peripherals.Bus
             return true;
         }
 
-        public void Clear()
+        // Specifying `textAddress` will override the address of the program text - the symbols will be applied
+        // as if the first loaded segment started at the specified address. This is equivalent to the ADDR parameter
+        // to GDB's add-symbol-file.
+        public void LoadSymbolsFrom(IELF elf, bool useVirtualAddress = false, ulong? textAddress = null, ICPU context = null)
         {
-            ClearAll();
-        }
-
-        public void Reset()
-        {
-            LowestLoadedAddress = null;
-            globalLookup = new SymbolLookup();
-            localLookups = new Dictionary<ICPU, SymbolLookup>();
+            GetOrCreateLookup(context).LoadELF(elf, useVirtualAddress, textAddress);
             pcCache.Invalidate();
         }
 
-        public string DecorateWithCPUNameAndPC(string str)
+        /// <remarks>Doesn't include peripherals registered using NullRegistrationPoints.</remarks>
+        public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral peripheral)
         {
-            if(!TryGetCurrentCPU(out var cpu) || !Machine.TryGetLocalName(cpu, out var cpuName))
-            {
-                return str;
-            }
-
-            // you probably wonder why 26?
-            // * we assume at least 3 characters for cpu name
-            // * 64-bit PC value nees 18 characters
-            // * there are 5 more separating characters
-            var builder = new StringBuilder(str.Length + 26);
-            builder
-                .Append("[")
-                .Append(cpuName);
-
-            builder.AppendFormat(": 0x{0:X}", cpu.PC.RawValue);
-
-            builder
-                .Append("] ")
-                .Append(str);
-
-            return builder.ToString();
+            // try to detect the CPU context based on the current thread
+            TryGetCurrentCPU(out var context);
+            return GetRegistrationPoints(peripheral, context);
         }
 
-        public SymbolLookup GetLookup(ICPU context = null)
+        public void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context = null)
         {
-            if(context == null
-               || !localLookups.TryGetValue(context, out var cpuLookup))
-            {
-                return globalLookup;
-            }
-
-            return cpuLookup;
+            WriteBytes(array, (ulong)offset, startingIndex, count, context: context);
         }
 
-        public IReadOnlyDictionary<string, int> GetCommonStateBits()
+        public void Unregister(ICPU cpu)
         {
-            var possibleInitiators = Machine.GetPeripheralsOfType<IPeripheralWithTransactionState>();
-            if(!possibleInitiators.Any())
+            using(Machine.ObtainPausedState(true))
             {
-                return null;
-            }
-
-            var theIntersectionOfTheirStateBitsets = possibleInitiators
-                .Select(i => i.StateBits)
-                .Aggregate((commonDict, nextDict) =>
-                    commonDict
-                        .Where(p => nextDict.TryGetValue(p.Key, out var value) && p.Value == value)
-                        .ToDictionary(p => p.Key, p => p.Value)
-                );
-            return theIntersectionOfTheirStateBitsets;
-        }
-
-        public IReadOnlyDictionary<string, int> GetStateBits(string initiatorName)
-        {
-            if(string.IsNullOrEmpty(initiatorName))
-            {
-                throw new ArgumentNullException(nameof(initiatorName));
-            }
-            var fullPath = Core.Machine.SystemBusName + Core.Machine.PathSeparator + initiatorName;
-            return Machine.TryGetByName<IPeripheralWithTransactionState>(fullPath, out var peri) ? peri?.StateBits : null;
-        }
-
-        public IMachine Machine { get; }
-
-        public int UnexpectedReads
-        {
-            get
-            {
-                return Interlocked.CompareExchange(ref unexpectedReads, 0, 0);
+                Machine.UnregisterFromParent(cpu);
+                cpuSync.EnterWriteLock();
+                try
+                {
+                    var id = idByCpu[cpu];
+                    idByCpu.Remove(cpu);
+                    cpuById.Remove(id);
+                    RemoveContextKeys(cpu);
+                }
+                finally
+                {
+                    cpuSync.ExitWriteLock();
+                }
             }
         }
 
-        public int UnexpectedWrites
+        public void SetPCOnAllCores(ulong pc)
         {
-            get
+            using(Machine.ObtainPausedState(true))
             {
-                return Interlocked.CompareExchange(ref unexpectedWrites, 0, 0);
+                cpuSync.EnterWriteLock();
+                try
+                {
+                    foreach(var p in idByCpu.Keys.Cast<ICPU>())
+                    {
+                        p.PC = pc;
+                    }
+                }
+                finally
+                {
+                    cpuSync.ExitWriteLock();
+                }
             }
         }
 
-        public ulong? LowestLoadedAddress { get; private set; }
+        public void LogAllPeripheralsAccess(bool enable = true)
+        {
+            EnableAllPeripheralAccessWrappers(typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging");
+        }
+
+        public void LogPeripheralAccess(IBusPeripheral busPeripheral, bool enable = true)
+        {
+            EnablePeripheralAccessWrappers(busPeripheral, typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging");
+        }
+
+        public void EnableAllPeripheralAccessWrappers(Type readWrapper, Type writeWrapper, bool enable = true, string name = null)
+        {
+            foreach(var p in AllPeripherals.SelectMany(x => x.Peripherals))
+            {
+                EnablePeripheralAccessWrappers(p.Peripheral, readWrapper, writeWrapper, enable, name);
+            }
+        }
+
+        public void EnablePeripheralAccessWrappers(IBusPeripheral busPeripheral, Type readWrapper, Type writeWrapper, bool enable = true, string name = null)
+        {
+            foreach(var peripherals in AllPeripherals)
+            {
+                peripherals.VisitAccessMethods(busPeripheral, pam =>
+                {
+                    if(enable == pam.HasWrappersOfType(readWrapper, writeWrapper))
+                    {
+                        busPeripheral.Log(LogLevel.Info, "{0} is already {1}", name ?? $"The {readWrapper} wrapper", enable ? "enabled" : "disabled");
+                    }
+                    else if(enable)
+                    {
+                        pam.WrapMethods(readWrapper, writeWrapper);
+                    }
+                    else
+                    {
+                        pam.RemoveWrappersOfType(readWrapper, writeWrapper);
+                    }
+                    return pam;
+                });
+            }
+        }
+
+        public void EnableAllTranslations(bool enable = true)
+        {
+            foreach(var p in AllPeripherals.SelectMany(x => x.Peripherals))
+            {
+                EnableAllTranslations(p.Peripheral, enable);
+            }
+        }
+
+        public void EnableAllTranslations(IBusPeripheral busPeripheral, bool enable = true)
+        {
+            foreach(var peripherals in AllPeripherals)
+            {
+                peripherals.VisitAccessMethods(busPeripheral, pam =>
+                {
+                    pam.EnableAllTranslations(enable, Endianess);
+                    return pam;
+                });
+            }
+        }
+
+        public IEnumerable<ICPU> GetCPUs()
+        {
+            cpuSync.EnterReadLock();
+            try
+            {
+                return new ReadOnlyCollection<ICPU>(idByCpu.Keys.ToList());
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
+            }
+        }
+
+        public int GetCPUSlot(ICPU cpu)
+        {
+            cpuSync.EnterReadLock();
+            try
+            {
+                if(idByCpu.ContainsKey(cpu))
+                {
+                    return idByCpu[cpu];
+                }
+                throw new KeyNotFoundException("Given CPU is not registered.");
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
+            }
+        }
+
+        public ICPU GetCurrentCPU()
+        {
+            ICPU cpu;
+            if(!TryGetCurrentCPU(out cpu))
+            {
+                // TODO: inline
+                throw new RecoverableException(CantFindCpuIdMessage);
+            }
+            return cpu;
+        }
+
+        public int GetCurrentCPUId()
+        {
+            int id;
+            if(!TryGetCurrentCPUId(out id))
+            {
+                throw new RecoverableException(CantFindCpuIdMessage);
+            }
+            return id;
+        }
+
+        public IEnumerable<IPeripheral> GetAllContextKeys()
+        {
+            return peripheralsCollectionByContext.GetAllContextKeys();
+        }
+
+        public bool TryGetCurrentContextState<T>(out IPeripheralWithTransactionState cpu, out T cpuState)
+        {
+            cpu = null;
+            cpuState = default;
+            if(!threadLocalContext.InUse || !threadLocalContext.InitiatorState.HasValue)
+            {
+                return false;
+            }
+            cpu = threadLocalContext.Initiator as IPeripheralWithTransactionState;
+            if((cpu == null) || !cpu.TryConvertUlongToStateObj(threadLocalContext.InitiatorState.Value, out var state))
+            {
+                return false;
+            }
+            if(state is T requestedTypeSTate)
+            {
+                cpuState = requestedTypeSTate;
+                return true;
+            }
+            return false;
+        }
+
+        public bool TryGetCurrentCPU(out ICPU cpu)
+        {
+            cpuSync.EnterReadLock();
+            try
+            {
+                int id;
+                if(TryGetCurrentCPUId(out id))
+                {
+                    cpu = cpuById[id];
+                    return true;
+                }
+                cpu = null;
+                return false;
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
+            }
+        }
+
+        public bool TryConvertStateToUlongForContext(IPeripheral context, IContextState cpuStateObj, out ulong? state)
+        {
+            state = null;
+            if(!(context is IPeripheralWithTransactionState peripheralWithTransactionState)
+                || !peripheralWithTransactionState.TryConvertStateObjToUlong(cpuStateObj, out state))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        public void Dispose()
+        {
+            cachedCpuId.Dispose();
+            threadLocalContext.Dispose();
+            globalLookup.Dispose();
+            cpuSync.Dispose();
+            foreach(var lookup in localLookups.Values)
+            {
+                lookup.Dispose();
+            }
+            foreach(var peripherals in AllPeripherals)
+            {
+#if DEBUG
+                peripherals.ShowStatistics();
+#endif
+                peripherals.Dispose();
+            }
+        }
+
+        public void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null)
+        {
+            WriteBytes(bytes, address, 0, count, onlyMemory, context);
+        }
+
+        public void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null)
+        {
+            using(SetLocalContext(context))
+            {
+                var targets = FindTargets(address, checked((ulong)count), context);
+                if(onlyMemory)
+                {
+                    ThrowIfNotAllMemory(targets);
+                }
+                foreach(var target in targets)
+                {
+                    var multibytePeripheral = target.What.Peripheral as IMultibyteWritePeripheral;
+                    if(multibytePeripheral != null)
+                    {
+                        checked
+                        {
+                            var invalidationCtx = delayedInvalidation ? multibytePeripheral as IHasDelayedInvalidationContext : null;
+                            using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                            {
+                                multibytePeripheral.WriteBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), bytes, startingIndex + (int)target.SourceIndex, (int)target.SourceLength);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for(var i = 0UL; i < target.SourceLength; ++i)
+                        {
+                            WriteByte(target.Offset + i, bytes[target.SourceIndex + (ulong)startingIndex + i]);
+                        }
+                    }
+                }
+            }
+        }
+
+        public void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null)
+        {
+            WriteBytes(bytes, address, bytes.Length, onlyMemory, context);
+        }
+
+        public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
+        {
+            return ReadBytes((ulong)offset, count, context: context);
+        }
+
+        public byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null)
+        {
+            var result = new byte[count];
+            ReadBytes(address, count, result, 0, onlyMemory, context);
+            return result;
+        }
+
+        public void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null)
+        {
+            using(SetLocalContext(context))
+            {
+                var targets = FindTargets(address, checked((ulong)count), context);
+                if(onlyMemory)
+                {
+                    ThrowIfNotAllMemory(targets);
+                }
+                foreach(var target in targets)
+                {
+                    var memory = target.What.Peripheral as MappedMemory;
+                    if(memory != null)
+                    {
+                        checked
+                        {
+                            memory.ReadBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), (int)target.SourceLength, destination, startIndex + (int)target.SourceIndex);
+                        }
+                    }
+                    else
+                    {
+                        for(var i = 0UL; i < target.SourceLength; ++i)
+                        {
+                            destination[checked((ulong)startIndex) + target.SourceIndex + i] = ReadByte(target.Offset + i, context);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Unregister peripheral from the specified address.
+        ///
+        /// NOTE: After calling this method, peripheral may still be
+        /// registered in the SystemBus at another address. In order
+        /// to remove peripheral completely use 'Unregister' method.
+        /// </summary>
+        /// <param name="address">Address on system bus where the peripheral is registered.</param>
+        /// <param name="context">
+        ///     CPU context in which peripherals should be scanned.
+        ///     This is useful when some peripherals are only accessible from selected CPUs.
+        ///
+        ///     If not provided, the global peripherals collection (i.e., peripherals available for all CPUs) is searched.
+        /// </param>
+        public void UnregisterFromAddress(ulong address, ICPU context = null)
+        {
+            var busRegisteredPeripheral = WhatIsAt(address, context);
+            if(busRegisteredPeripheral == null)
+            {
+                throw new RecoverableException(string.Format(
+                    "There is no peripheral registered at 0x{0:X}.", address));
+            }
+            Unregister(busRegisteredPeripheral);
+        }
+
+        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegisteredPeripherals(IPeripheral context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context);
+        }
+
+        public void SilenceRange(Range range)
+        {
+            var silencer = new Silencer();
+            Register(silencer, new BusRangeRegistration(range));
+        }
+
+        public IEnumerable<IBusRegistered<IMapped>> GetMappedPeripherals(IPeripheral context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Where(x => x.Peripheral is IMapped)
+                .Convert<IBusPeripheral, IMapped>();
+        }
+
+        public bool IsMemory(ulong address, ICPU context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Any(x => x.Peripheral is IMemory && x.RegistrationPoint.Range.Contains(address));
+        }
+
+        public IBusRegistered<MappedMemory> FindMemory(ulong address, ICPU context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Where(x => x.Peripheral is MappedMemory)
+                .Convert<IBusPeripheral, MappedMemory>()
+                .FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
+        }
+
+        public IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null)
+        {
+            var registered = WhatIsAt(address, context);
+            if(registered != null)
+            {
+                return registered.Peripheral;
+            }
+            return null;
+        }
+
+        /// <summary>Checks what is at a given address.</summary>
+        /// <param name="address">
+        ///     A <see cref="ulong"/> with the address to check.
+        /// </param>
+        /// <param name="context">
+        ///     CPU context in which peripherals should be scanned.
+        ///     This is useful when some peripherals are only accessible from selected CPUs.
+        ///
+        ///     If not provided, the global peripherals collection (i.e., peripherals available for all CPUs) is searched.
+        /// </param>
+        /// <returns>
+        ///     A peripheral which is at the given address.
+        /// </returns>
+        public IBusRegistered<IBusPeripheral> WhatIsAt(ulong address, IPeripheral context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context).FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
+        }
+
+        public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegistrationsForPeripheralType<T>(IPeripheral context = null)
+        {
+            return GetAccessiblePeripheralsForContext(context)
+                .Where(x => x.Peripheral is T);
+        }
+
+        public void ZeroRange(Range range, IPeripheral context = null)
+        {
+            var zeroBlock = new byte[1024 * 1024];
+            var blocksNo = range.Size / (ulong)zeroBlock.Length;
+            for(var i = 0UL; i < blocksNo; i++)
+            {
+                WriteBytes(zeroBlock, range.StartAddress + i * (ulong)zeroBlock.Length, context: context);
+            }
+            WriteBytes(zeroBlock, range.StartAddress + blocksNo * (ulong)zeroBlock.Length, (int)range.Size % zeroBlock.Length, context: context);
+        }
+
+        public void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, IPeripheral cpu)
+        {
+            var minAddr = this.LoadFileChunks(chunks, cpu);
+            AddFingerprint(path);
+            UpdateLowestLoadedAddress(minAddr);
+            this.DebugLog(path + " File loaded.");
+        }
+
+        public void Unregister(IBusPeripheral peripheral)
+        {
+            using(Machine.ObtainPausedState(true))
+            {
+                Machine.UnregisterAsAChildOf(this, peripheral);
+                UnregisterInner(peripheral);
+            }
+        }
+
+        public void Unregister(IBusRegistered<IBusPeripheral> busRegisteredPeripheral)
+        {
+            using(Machine.ObtainPausedState(true))
+            {
+                Machine.UnregisterAsAChildOf(this, busRegisteredPeripheral.RegistrationPoint);
+                UnregisterInner(busRegisteredPeripheral);
+            }
+        }
+
+        public void Unregister(IPeripheral peripheral)
+        {
+            using(Machine.ObtainPausedState(true))
+            {
+                Machine.UnregisterAsAChildOf(this, peripheral);
+                RemoveContextKeys(peripheral);
+            }
+        }
+
+        public void Register(IPeripheral peripheral, NullRegistrationPoint registrationPoint)
+        {
+            using(Machine.ObtainPausedState(true))
+            {
+                // NullRegistrationPoint peripherals are not mapped on the bus and
+                // are not directly accessible from the emulated software.
+                Machine.RegisterAsAChildOf(this, peripheral, registrationPoint);
+                AddContextKeys(peripheral);
+            }
+        }
+
+        public void Register(IBusPeripheral peripheral, BusRangeRegistration registrationPoint)
+        {
+            var methods = PeripheralAccessMethods.CreateWithLock();
+            if(registrationPoint is BusParametrizedRegistration parametrizedRegistrationPoint)
+            {
+                parametrizedRegistrationPoint.RegisterForEachContext((contextRegistration) =>
+                {
+                    // Prepare accessor methods in the context of registration,
+                    // as it may want to fill them according to the CPU context.
+                    methods = PeripheralAccessMethods.CreateWithLock();
+                    contextRegistration.FillAccessMethods(peripheral, ref methods);
+                    FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
+                    RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator);
+                });
+            }
+            else if(registrationPoint is BusMultiRegistration multiRegistrationPoint)
+            {
+                if(peripheral is IMapped)
+                {
+                    throw new ConstructionException(string.Format("It is not allowed to register `{0}` peripheral using `{1}`", typeof(IMapped).Name, typeof(BusMultiRegistration).Name));
+                }
+                FillAccessMethodsWithTaggedMethods(peripheral, multiRegistrationPoint.ConnectionRegionName, ref methods);
+                multiRegistrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
+            }
+            else
+            {
+                FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
+                registrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
+            }
+        }
+
+        public void Register(IBusPeripheral peripheral, BusMultiRegistration registrationPoint)
+        {
+            Register(peripheral, (BusRangeRegistration)registrationPoint);
+        }
+
+        public void Register(IBusPeripheral peripheral, BusParametrizedRegistration registrationPoint)
+        {
+            Register(peripheral, (BusRangeRegistration)registrationPoint);
+        }
+
+        void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
+        {
+            Unregister(peripheral);
+        }
+
+        public void Register(IKnownSize peripheral, BusPointRegistration registrationPoint)
+        {
+            Register(peripheral, registrationPoint.ToRangeRegistration(checked((ulong)peripheral.Size)));
+        }
+
+        public void Unregister(IKnownSize peripheral)
+        {
+            Unregister((IBusPeripheral)peripheral);
+        }
+
+        public void MoveRegistrationWithinContext(IBusPeripheral peripheral, BusRangeRegistration newRegistration, ICPU context, Func<IEnumerable<IBusRegistered<IBusPeripheral>>, IBusRegistered<IBusPeripheral>> selector = null)
+        {
+            if(context == null && !TryFindCurrentThreadCPUAndId(out context, out var _))
+            {
+                throw new RecoverableException("Moving a peripheral is supported only from CPU thread if context isn't explicitly set");
+            }
+            var wasMapped = RemoveMappingsForPeripheral(peripheral);
+            var busRegisteredEntries = peripheralsCollectionByContext[context].Peripherals.Where(x => x.Peripheral == peripheral).ToList();
+            if(busRegisteredEntries.Count == 0)
+            {
+                throw new RecoverableException("Attempted to move a peripheral that isn't registered within current context");
+            }
+            IBusRegistered<IBusPeripheral> busRegistered;
+            if(selector != null)
+            {
+                busRegistered = selector(busRegisteredEntries);
+                if(busRegistered == null)
+                {
+                    throw new RecoverableException("Provided selector failed to find a suitable registration point");
+                }
+            }
+            else
+            {
+                if(busRegisteredEntries.Count > 1)
+                {
+                    throw new RecoverableException($"Unable to unambiguously determine a registration point, found multiple candidates: {String.Join(", ", busRegisteredEntries.Select(x => x.RegistrationPoint))}");
+                }
+                busRegistered = busRegisteredEntries[0];
+            }
+            if(IsAddressRangeLocked(busRegistered.RegistrationPoint.Range, context))
+            {
+                throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
+            }
+            UnregisterAccessFlags(busRegistered.RegistrationPoint, context);
+            peripheralsCollectionByContext.WithStateCollection(context, null, collection =>
+            {
+                collection.Move(busRegistered, newRegistration);
+            });
+            Machine.ExchangeRegistrationPointForPeripheral(this, peripheral, busRegistered.RegistrationPoint, newRegistration);
+            if(wasMapped)
+            {
+                AddMappingsForPeripheral(peripheral, newRegistration, context);
+            }
+
+            if(peripheral is ArrayMemory)
+            {
+                foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
+                {
+                    var range = newRegistration.Range;
+                    cpu.RegisterAccessFlags(range.StartAddress, range.Size, isIoMemory: true);
+                }
+            }
+        }
+
+        public void ChangePeripheralAccessCondition(IBusPeripheral peripheral, string newCondition, string oldCondition = null)
+        {
+            lock(peripheral)
+            {
+                var newConditionsPerInitiator = ParseNewConditions(newCondition);
+                var foundEntry = FindUniqueRegistration(peripheral, oldCondition) ?? throw new RecoverableException("No registration found for this peripheral with the specified condition.");
+
+                foundEntry.Collection.Remove(peripheral);
+                var registration = foundEntry.RegistrationPoint;
+                var methods = foundEntry.AccessMethods;
+                var range = registration.Range;
+
+                foreach(var newContext in newConditionsPerInitiator)
+                {
+                    var initiator = Machine[Core.Machine.SystemBusName + Core.Machine.PathSeparator + newContext.Key];
+                    foreach(var newMask in newContext.Value)
+                    {
+                        peripheralsCollectionByContext.WithStateCollection(initiator, newMask, collection =>
+                        {
+                            var busRegistered = new BusRegistered<IBusPeripheral>(peripheral, registration);
+                            collection.Add(range.StartAddress, range.EndAddress + 1, busRegistered, methods);
+                        });
+                    }
+                }
+            }
+        }
+
+        public DelayedInvalidationContext EnterDelayedInvalidationContext()
+        {
+            return new DelayedInvalidationContext(this);
+        }
+
+        public void SetDelayedInvalidation(bool value)
+        {
+            // When leaving delayed invalidation handle all queued memory blocks
+            if(delayedInvalidation != value && !value)
+            {
+                foreach(var cpu in GetCPUs())
+                {
+                    try
+                    {
+                        ((TranslationCPU)cpu).InvalidateTranslationBlocks();
+                    }
+                    catch(RuntimeBinderException)
+                    {
+                        // CPU does not implement `InvalidateTranslationBlocks`, there is not much we can do
+                    }
+                }
+            }
+            delayedInvalidation = value;
+        }
+
+        public UnhandledAccessBehaviour UnhandledAccessBehaviour { get; set; }
 
         /// <returns>
         /// The returned <c>IEnumerable</c> always enumerates all peripherals registered globally
@@ -1356,20 +1275,13 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public bool IsMultiCore
-        {
-            get
-            {
-                return cpuById.Count() > 1;
-            }
-        }
-
         public Endianess Endianess
         {
             get
             {
                 return endianess;
             }
+
             set
             {
                 if(peripheralRegistered)
@@ -1380,9 +1292,178 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public UnhandledAccessBehaviour UnhandledAccessBehaviour { get; set; }
+        public bool IsMultiCore
+        {
+            get
+            {
+                return cpuById.Count() > 1;
+            }
+        }
+
+        public ulong? LowestLoadedAddress { get; private set; }
+
+        public int UnexpectedReads
+        {
+            get
+            {
+                return Interlocked.CompareExchange(ref unexpectedReads, 0, 0);
+            }
+        }
+
+        public IMachine Machine { get; }
+
+        public int UnexpectedWrites
+        {
+            get
+            {
+                return Interlocked.CompareExchange(ref unexpectedWrites, 0, 0);
+            }
+        }
 
         public event Action<IMachine> OnSymbolsChanged;
+
+        private static void ThrowIfNotAllMemory(IEnumerable<PeripheralLookupResult> targets)
+        {
+            foreach(var target in targets)
+            {
+                var iMemory = target.What.Peripheral as IMemory;
+                var redirector = target.What.Peripheral as Redirector;
+                if(iMemory == null && redirector == null)
+                {
+                    throw new RecoverableException(String.Format("Tried to access {0} but only memory accesses were allowed.", target.What.Peripheral));
+                }
+            }
+        }
+
+        private static MappedSegmentWrapper FromRegistrationPointToSegmentWrapper(IMappedSegment segment, BusRangeRegistration registrationPoint, ICPUWithMappedMemory context)
+        {
+            if(segment.StartingOffset >= registrationPoint.Range.Size + registrationPoint.Offset)
+            {
+                return null;
+            }
+
+            var desiredSize = Math.Min(segment.Size, registrationPoint.Range.Size + registrationPoint.Offset - segment.StartingOffset);
+            return new MappedSegmentWrapper(segment, registrationPoint.Range.StartAddress - registrationPoint.Offset, desiredSize, context);
+        }
+
+        private Dictionary<string, List<StateMask>> ParseNewConditions(string newCondition)
+        {
+            if(string.IsNullOrEmpty(newCondition))
+            {
+                return new Dictionary<string, List<StateMask>>
+                {
+                    [""] = new List<StateMask> { StateMask.AllAccess }
+                };
+            }
+            else
+            {
+                var condition = AccessConditionParser.ParseCondition(newCondition);
+                return AccessConditionParser.EvaluateWithStateBits(condition,
+                    i => string.IsNullOrEmpty(i) ? GetCommonStateBits() : GetStateBits(i));
+            }
+        }
+
+        private FoundRegistrationInfo? FindUniqueRegistration(IBusPeripheral peripheral, string oldCondition)
+        {
+            FoundRegistrationInfo? match = null;
+
+            foreach(var contextKey in peripheralsCollectionByContext.GetAllContextKeys())
+            {
+                foreach(var stateKey in peripheralsCollectionByContext.GetAllStateKeys(contextKey))
+                {
+                    peripheralsCollectionByContext.WithStateCollection(contextKey, stateKey, collection =>
+                    {
+                        // We take only the entries with a distinct registration point ignoring the state mask as a registration might be split
+                        // into multiple points, for example `secure || privileged` will be represented as 2 registrations which differ only in
+                        // the state mask, but it's the same registration for our purposes.
+                        var busRegisteredEntries = collection.Peripherals
+                            .Where(x => x.Peripheral == peripheral && (string.IsNullOrEmpty(oldCondition) || x.RegistrationPoint.Condition == oldCondition))
+                            .DistinctBy(x => x.RegistrationPoint.WithInitiatorAndStateMask(x.RegistrationPoint.Initiator, StateMask.AllAccess));
+
+                        foreach(var entry in busRegisteredEntries)
+                        {
+                            var registration = entry.RegistrationPoint;
+                            var normalizedRegistration = registration.WithInitiatorAndStateMask(registration.Initiator, StateMask.AllAccess);
+                            var methods = collection.FindAccessMethods(registration.Range.StartAddress, out _, out _);
+                            if(match == null)
+                            {
+                                match = new FoundRegistrationInfo(registration, collection, methods);
+                            }
+                            else if(!match.Value.RegistrationPoint.WithInitiatorAndStateMask(match.Value.RegistrationPoint.Initiator, StateMask.AllAccess).Equals(normalizedRegistration))
+                            {
+                                throw new RecoverableException("This peripheral is registered with several conditions. You need to specify which one to change.");
+                            }
+                        }
+                    });
+                }
+            }
+
+            return match;
+        }
+
+        private void HandleChangedSymbols()
+        {
+            OnSymbolsChanged?.Invoke(Machine);
+        }
+
+        private IEnumerable<ICPU> GetCPUsForContext(IPeripheral context)
+        {
+            return GetCPUs().Where(x => context == null || x == context);
+        }
+
+        private IEnumerable<T> GetCPUsForContext<T>(IPeripheral context)
+            where T : IPeripheral
+        {
+            return GetCPUsForContext(context).OfType<T>();
+        }
+
+        private bool TryGetCurrentCPUId(out int cpuId)
+        {
+            if(threadLocalContext.InUse && threadLocalContext.Initiator is ICPU cpu)
+            {
+                cpuId = idByCpu[cpu];
+                return true;
+            }
+            /*
+             * Because getting cpu id can possibly be a heavy operation, we cache the
+             * obtained ID in the thread local storage. Note that we assume here that the
+             * thread with such storage won't be used for another purposes than it was
+             * used originally (i.e. cpu loop).
+             */
+            if(cachedCpuId.IsValueCreated)
+            {
+                cpuId = cachedCpuId.Value;
+                return true;
+            }
+
+            return TryFindCurrentThreadCPUAndId(out var _, out cpuId);
+        }
+
+        private bool TryFindCurrentThreadCPUAndId(out ICPU cpu, out int cpuId)
+        {
+            cpuSync.EnterReadLock();
+            try
+            {
+                foreach(var entry in cpuById)
+                {
+                    cpu = entry.Value;
+                    if(!cpu.OnPossessedThread)
+                    {
+                        continue;
+                    }
+                    cpuId = entry.Key;
+                    cachedCpuId.Value = cpuId;
+                    return true;
+                }
+                cpu = default(ICPU);
+                cpuId = -1;
+                return false;
+            }
+            finally
+            {
+                cpuSync.ExitReadLock();
+            }
+        }
 
         private SymbolLookup GetOrCreateLookup(ICPU context)
         {
@@ -1805,7 +1886,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private void UpdateAccessMethods()
         {
-            foreach(var peripherals in allPeripherals)
+            foreach(var peripherals in AllPeripherals)
             {
                 peripherals.VisitAccessMethods(null, pam =>
                 {
@@ -1880,6 +1961,8 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
 
             peripheralRegistered = true;
+            // Now enable this peripheral to use itself as a context
+            AddContextKeys(peripheral);
         }
 
         /// <summary>
@@ -1887,7 +1970,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         /// This is useful when adding or relocating peripherals to the locked range.
         /// <summary>
         /// <remarks>
-        /// Locking should almost always be done by calling <see cref="SetAddressRangeLocked"/> 
+        /// Locking should almost always be done by calling <see cref="SetAddressRangeLocked"/>
         /// since this method doesn't update locked ranges and so should be used with caution.
         /// </remarks>
         private void RelockRange(Range range, bool locked, IPeripheral context)
@@ -1970,19 +2053,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             return result;
         }
 
-        private static void ThrowIfNotAllMemory(IEnumerable<PeripheralLookupResult> targets)
-        {
-            foreach(var target in targets)
-            {
-                var iMemory = target.What.Peripheral as IMemory;
-                var redirector = target.What.Peripheral as Redirector;
-                if(iMemory == null && redirector == null)
-                {
-                    throw new RecoverableException(String.Format("Tried to access {0} but only memory accesses were allowed.", target.What.Peripheral));
-                }
-            }
-        }
-
         private void UpdatePageAccesses()
         {
             foreach(var address in hooksOnRead.Select(x => x.Key).Union(hooksOnWrite.Select(x => x.Key)))
@@ -2001,7 +2071,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     group.Unregister();
                 }
 
-                foreach(var p in allPeripherals.SelectMany(x => x.Peripherals).Select(x => x.Peripheral).Distinct().Union(GetCPUs().Cast<IPeripheral>()).ToList())
+                foreach(var p in AllPeripherals.SelectMany(x => x.Peripherals).Select(x => x.Peripheral).Distinct().Union(GetCPUs().Cast<IPeripheral>()).ToList())
                 {
                     Machine.UnregisterFromParent(p);
                 }
@@ -2052,7 +2122,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private List<MappedMemory> ObtainMemoryList()
         {
-            return allPeripherals.SelectMany(x => x.Peripherals).Where(x => x.Peripheral is MappedMemory).OrderBy(x => x.RegistrationPoint.Range.StartAddress).
+            return AllPeripherals.SelectMany(x => x.Peripherals).Where(x => x.Peripheral is MappedMemory).OrderBy(x => x.RegistrationPoint.Range.StartAddress).
                 Select(x => x.Peripheral).Cast<MappedMemory>().Distinct().ToList();
         }
 
@@ -2095,7 +2165,17 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 return;
             }
-            var cpuWithMappedMemory = context as ICPUWithMappedMemory;
+            if(!(context is ICPUWithMappedMemory cpuWithMappedMemory))
+            {
+                // If the context is a peripheral other than an ICPUWithMappedMemory, we can't create mappings for it.
+                // The other possibility is that the context was specified as null, then we need to create global mappings
+                // for all CPUs.
+                if(context != null)
+                {
+                    return;
+                }
+                cpuWithMappedMemory = null;
+            }
             var segments = mappedPeripheral.MappedSegments;
             var mappings = segments.Select(x => FromRegistrationPointToSegmentWrapper(x, registrationPoint, cpuWithMappedMemory)).Where(x => x != null);
             AddMappings(mappings, mappedPeripheral);
@@ -2223,11 +2303,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             this.Log(logLevel, warning, address, value, type);
         }
 
-        private IDisposable SetLocalContext(IPeripheral context, ulong? initiatorState = null)
-        {
-            return threadLocalContext.Initialize(context, initiatorState);
-        }
-
         private void AddContextKeys(IPeripheral peripheral)
         {
             peripheralsCollectionByContext.AddContextKey(peripheral);
@@ -2243,26 +2318,189 @@ namespace Antmicro.Renode.Peripherals.Bus
         [PostDeserialization]
         private void PostDeserializationInitStructures()
         {
-            threadLocalContext = new ThreadLocalContext(this);
+            threadLocalContext = new ThreadLocalContext();
         }
 
-        private static MappedSegmentWrapper FromRegistrationPointToSegmentWrapper(IMappedSegment segment, BusRangeRegistration registrationPoint, ICPUWithMappedMemory context)
-        {
-            if(segment.StartingOffset >= registrationPoint.Range.Size + registrationPoint.Offset)
-            {
-                return null;
-            }
+        private IEnumerable<PeripheralCollection> AllPeripherals => peripheralsCollectionByContext.GetAllDistinctValues();
 
-            var desiredSize = Math.Min(segment.Size, registrationPoint.Range.Size + registrationPoint.Offset - segment.StartingOffset);
-            return new MappedSegmentWrapper(segment, registrationPoint.Range.StartAddress - registrationPoint.Offset, desiredSize, context);
-        }
+        private Dictionary<Range, TagEntry> tags;
+        private Dictionary<ICPU, SymbolLookup> localLookups;
+        private SymbolLookup globalLookup;
+        [Transient]
+        private ThreadLocalContext threadLocalContext;
 
-        private IEnumerable<PeripheralCollection> allPeripherals => peripheralsCollectionByContext.GetAllDistinctValues();
+        [Constructor]
+        private ThreadLocal<int> cachedCpuId;
+
+        private int unexpectedReads;
+        private HashSet<string> pausingTags;
+        private List<SVDParser> svdDevices;
+        private bool hasCpuWithMismatchedEndianness;
+        private Endianess endianess;
+        private bool peripheralRegistered;
+        private bool mappingsRemoved;
+
+        private Dictionary<IBusPeripheral, List<MappedSegmentWrapper>> mappingsForPeripheral;
+
+        private bool delayedInvalidation;
+        private int unexpectedWrites;
 
         private ISet<IPeripheral> lockedPeripherals;
 
         private ContextKeyDictionary<PeripheralCollection, IReadOnlyPeripheralCollection> peripheralsCollectionByContext;
         private ContextKeyDictionary<MinimalRangesCollection, IReadOnlyMinimalRangesCollection> lockedRangesCollectionByContext;
+        private readonly List<BinaryFingerprint> binaryFingerprints;
+
+        private readonly LRUCache<ulong, Tuple<string, Symbol>> pcCache = new LRUCache<ulong, Tuple<string, Symbol>>(10000);
+        private readonly ReaderWriterLockSlim cpuSync;
+        private readonly Dictionary<ulong, List<BusHookHandler>> hooksOnRead;
+        private readonly Dictionary<int, ICPU> cpuById;
+        private readonly Dictionary<ICPU, int> idByCpu;
+        private readonly Dictionary<ulong, List<BusHookHandler>> hooksOnWrite;
+        private const string NonExistingRead = "Read{1} from non existing peripheral at 0x{0:X}.";
+        private const string TagOverriddenRead = "Read{1} from overriding tag at 0x{0:X}.";
+        private const string NonExistingWrite = "Write{2} to non existing peripheral at 0x{0:X}, value 0x{1:X}.";
+        private const string TagOverriddenWrite = "Write{2} to overriding tag at 0x{0:X}, value 0x{1:X}.";
+        private const string IOExceptionMessage = "I/O error while loading ELF: {0}.";
+        private const string CantFindCpuIdMessage = "Can't verify current CPU in the given context.";
+
+        public class MappedSegmentWrapper : IMappedSegment
+        {
+            public MappedSegmentWrapper(IMappedSegment wrappedSegment, ulong peripheralOffset, ulong maximumSize, ICPUWithMappedMemory context)
+            {
+                this.wrappedSegment = wrappedSegment;
+                this.peripheralOffset = peripheralOffset;
+                usedSize = Math.Min(maximumSize, wrappedSegment.Size);
+                this.context = context;
+            }
+
+            public override bool Equals(object obj)
+            {
+                var objAsMappedSegmentWrapper = obj as MappedSegmentWrapper;
+                if(objAsMappedSegmentWrapper == null)
+                {
+                    return false;
+                }
+
+                return wrappedSegment.Equals(objAsMappedSegmentWrapper.wrappedSegment)
+                    && peripheralOffset == objAsMappedSegmentWrapper.peripheralOffset
+                    && usedSize == objAsMappedSegmentWrapper.usedSize;
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    var hash = 17;
+                    hash = hash * 23 + wrappedSegment.GetHashCode();
+                    hash = hash * 23 + (int)peripheralOffset;
+                    hash = hash * 23 + (int)usedSize;
+                    return hash;
+                }
+            }
+
+            public void Touch()
+            {
+                wrappedSegment.Touch();
+            }
+
+            public override string ToString()
+            {
+                return string.Format("[MappedSegmentWrapper: StartingOffset=0x{0:X}, Size=0x{1:X}, OriginalStartingOffset=0x{2:X}, PeripheralOffset=0x{3:X}, Context={4}]",
+                    StartingOffset, Size, OriginalStartingOffset, PeripheralOffset, context);
+            }
+
+            public ICPUWithMappedMemory Context
+            {
+                get
+                {
+                    return context;
+                }
+            }
+
+            public ulong StartingOffset
+            {
+                get
+                {
+                    return peripheralOffset + wrappedSegment.StartingOffset;
+                }
+            }
+
+            public ulong Size
+            {
+                get
+                {
+                    return usedSize;
+                }
+            }
+
+            public IntPtr Pointer
+            {
+                get
+                {
+                    return wrappedSegment.Pointer;
+                }
+            }
+
+            public ulong OriginalStartingOffset
+            {
+                get
+                {
+                    return wrappedSegment.StartingOffset;
+                }
+            }
+
+            public ulong PeripheralOffset
+            {
+                get
+                {
+                    return peripheralOffset;
+                }
+            }
+
+            private readonly IMappedSegment wrappedSegment;
+            private readonly ulong peripheralOffset;
+            private readonly ulong usedSize;
+            private readonly ICPUWithMappedMemory context;
+        }
+
+        private class ThreadLocalContext : IDisposable
+        {
+            public ThreadLocalContext()
+            {
+                context = new ThreadLocal<Tuple<IPeripheral, ulong?>>(() => null, true);
+                emptyDisposable.Disable();
+            }
+
+            public IDisposable Initialize(IPeripheral cpu, ulong? initiatorState)
+            {
+                if(cpu == null)
+                {
+                    return emptyDisposable;
+                }
+                var previousContext = context.Value;
+                context.Value = Tuple.Create(cpu, initiatorState);
+                return DisposableWrapper.New(() =>
+                {
+                    context.Value = previousContext;
+                });
+            }
+
+            public void Dispose()
+            {
+                context.Dispose();
+            }
+
+            public bool InUse => context.Value != null;
+
+            public IPeripheral Initiator => context.Value.Item1;
+
+            public ulong? InitiatorState => context.Value.Item2;
+
+            private readonly ThreadLocal<Tuple<IPeripheral, ulong?>> context;
+
+            private static readonly DisposableWrapper emptyDisposable = new DisposableWrapper();
+        }
 
         // It doesn't implement IDictionary because serialization doesn't work correctly for dictionaries without two generic parameters.
         private class ContextKeyDictionary<TValue, TReadOnlyValue> where TValue : TReadOnlyValue, ICoalescable<TValue> where TReadOnlyValue : class
@@ -2273,7 +2511,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 globalAllAccess = globalValue[StateMask.AllAccess] = defaultFactory();
             }
 
-            // Adding the context key might happen on peripheral registration, or on first use.
+            // Adding the context key happens on peripheral registration.
             public void AddContextKey(IPeripheral key)
             {
                 if(key == null)
@@ -2438,139 +2676,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             public readonly PeripheralAccessMethods AccessMethods;
         }
 
-        private Dictionary<IBusPeripheral, List<MappedSegmentWrapper>> mappingsForPeripheral;
-        private bool mappingsRemoved;
-        private bool peripheralRegistered;
-        private Endianess endianess;
-        private bool hasCpuWithMismatchedEndianness;
-        private readonly Dictionary<ICPU, int> idByCpu;
-        private readonly Dictionary<int, ICPU> cpuById;
-        private readonly Dictionary<ulong, List<BusHookHandler>> hooksOnRead;
-        private readonly Dictionary<ulong, List<BusHookHandler>> hooksOnWrite;
-
-        [Constructor]
-        private ThreadLocal<int> cachedCpuId;
-        [Transient]
-        private ThreadLocalContext threadLocalContext;
-        private readonly ReaderWriterLockSlim cpuSync;
-        private SymbolLookup globalLookup;
-        private Dictionary<ICPU, SymbolLookup> localLookups;
-        private Dictionary<Range, TagEntry> tags;
-        private List<SVDParser> svdDevices;
-        private HashSet<string> pausingTags;
-        private readonly List<BinaryFingerprint> binaryFingerprints;
-        private const string NonExistingRead = "Read{1} from non existing peripheral at 0x{0:X}.";
-        private const string TagOverriddenRead = "Read{1} from overriding tag at 0x{0:X}.";
-        private const string NonExistingWrite = "Write{2} to non existing peripheral at 0x{0:X}, value 0x{1:X}.";
-        private const string TagOverriddenWrite = "Write{2} to overriding tag at 0x{0:X}, value 0x{1:X}.";
-        private const string IOExceptionMessage = "I/O error while loading ELF: {0}.";
-        private const string CantFindCpuIdMessage = "Can't verify current CPU in the given context.";
-
-        private int unexpectedReads;
-        private int unexpectedWrites;
-
-        private LRUCache<ulong, Tuple<string, Symbol>> pcCache = new LRUCache<ulong, Tuple<string, Symbol>>(10000);
-
-        public class MappedSegmentWrapper : IMappedSegment
-        {
-            public MappedSegmentWrapper(IMappedSegment wrappedSegment, ulong peripheralOffset, ulong maximumSize, ICPUWithMappedMemory context)
-            {
-                this.wrappedSegment = wrappedSegment;
-                this.peripheralOffset = peripheralOffset;
-                usedSize = Math.Min(maximumSize, wrappedSegment.Size);
-                this.context = context;
-            }
-
-            public void Touch()
-            {
-                wrappedSegment.Touch();
-            }
-
-            public override string ToString()
-            {
-                return string.Format("[MappedSegmentWrapper: StartingOffset=0x{0:X}, Size=0x{1:X}, OriginalStartingOffset=0x{2:X}, PeripheralOffset=0x{3:X}, Context={4}]",
-                    StartingOffset, Size, OriginalStartingOffset, PeripheralOffset, context);
-            }
-
-            public ICPUWithMappedMemory Context
-            {
-                get
-                {
-                    return context;
-                }
-            }
-
-            public ulong StartingOffset
-            {
-                get
-                {
-                    return peripheralOffset + wrappedSegment.StartingOffset;
-                }
-            }
-
-            public ulong Size
-            {
-                get
-                {
-                    return usedSize;
-                }
-            }
-
-            public IntPtr Pointer
-            {
-                get
-                {
-                    return wrappedSegment.Pointer;
-                }
-            }
-
-            public ulong OriginalStartingOffset
-            {
-                get
-                {
-                    return wrappedSegment.StartingOffset;
-                }
-            }
-
-            public ulong PeripheralOffset
-            {
-                get
-                {
-                    return peripheralOffset;
-                }
-            }
-
-            public override bool Equals(object obj)
-            {
-                var objAsMappedSegmentWrapper = obj as MappedSegmentWrapper;
-                if(objAsMappedSegmentWrapper == null)
-                {
-                    return false;
-                }
-
-                return wrappedSegment.Equals(objAsMappedSegmentWrapper.wrappedSegment)
-                    && peripheralOffset == objAsMappedSegmentWrapper.peripheralOffset
-                    && usedSize == objAsMappedSegmentWrapper.usedSize;
-            }
-
-            public override int GetHashCode()
-            {
-                unchecked
-                {
-                    var hash = 17;
-                    hash = hash * 23 + wrappedSegment.GetHashCode();
-                    hash = hash * 23 + (int)peripheralOffset;
-                    hash = hash * 23 + (int)usedSize;
-                    return hash;
-                }
-            }
-
-            private readonly IMappedSegment wrappedSegment;
-            private readonly ulong peripheralOffset;
-            private readonly ulong usedSize;
-            private readonly ICPUWithMappedMemory context;
-        }
-
         private struct PeripheralLookupResult
         {
             public IBusRegistered<IBusPeripheral> What;
@@ -2586,42 +2691,5 @@ namespace Antmicro.Renode.Peripherals.Bus
             public bool Silent;
             public bool OverridePeripheralAccesses;
         }
-
-        private class ThreadLocalContext : IDisposable
-        {
-            public ThreadLocalContext(IBusController parent)
-            {
-                context = new ThreadLocal<Tuple<IPeripheral, ulong?>>(() => null, true);
-                emptyDisposable.Disable();
-            }
-
-            public IDisposable Initialize(IPeripheral cpu, ulong? initiatorState)
-            {
-                if(cpu == null)
-                {
-                    return emptyDisposable;
-                }
-                var previousContext = context.Value;
-                context.Value = Tuple.Create(cpu, initiatorState);
-                return DisposableWrapper.New(() =>
-                {
-                    context.Value = previousContext;
-                });
-            }
-
-            public void Dispose()
-            {
-                context.Dispose();
-            }
-
-            public bool InUse => context.Value != null;
-            public IPeripheral Initiator => context.Value.Item1;
-            public ulong? InitiatorState => context.Value.Item2;
-
-            private readonly ThreadLocal<Tuple<IPeripheral, ulong?>> context;
-
-            private static readonly DisposableWrapper emptyDisposable = new DisposableWrapper();
-        }
     }
 }
-

@@ -7,11 +7,13 @@
 
 using System;
 using System.Collections.Generic;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
-using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.Utilities;
+
 using ELFSharp.ELF;
 
 using Range = Antmicro.Renode.Core.Range;
@@ -20,14 +22,24 @@ namespace Antmicro.Renode.Peripherals.Bus
 {
     public abstract class BusControllerProxy : IBusController
     {
+        public BusControllerProxy(IBusController parentController)
+        {
+            ParentController = parentController;
+        }
+
         public void Reset()
         {
             ParentController.Reset();
         }
 
-        public BusControllerProxy(IBusController parentController)
+        public DelayedInvalidationContext EnterDelayedInvalidationContext()
         {
-            ParentController = parentController;
+            return ParentController.EnterDelayedInvalidationContext();
+        }
+
+        public void SetDelayedInvalidation(bool value)
+        {
+            ParentController.SetDelayedInvalidation(value);
         }
 
         public virtual byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState = null)
@@ -37,6 +49,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                 return ParentController.ReadByte(address, context, cpuState);
             }
             return (byte)0;
+        }
+
+        public IDisposable SetLocalContext(IPeripheral context, ulong? initiatorState = null)
+        {
+            return ParentController.SetLocalContext(context, initiatorState);
         }
 
         public virtual byte ReadByteWithState(ulong address, IPeripheral context, IContextState stateObj)

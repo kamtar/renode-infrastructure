@@ -8,11 +8,11 @@
 */
 
 using System;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus.Wrappers;
-using Antmicro.Renode.Peripherals.CPU;
 
 using Range = Antmicro.Renode.Core.Range;
 
@@ -99,7 +99,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             using(SetLocalContext(context, cpuState))
             {
                 TryGetTag(address, out var tag);
-
                 var warning = TagOverriddenWrite;
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
@@ -131,7 +130,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                     {
                         accessMethods.SetAbsoluteAddress(address);
                     }
-                    accessMethods.WriteByte(checked((long)(address - startAddress)), value);
+                    var invalidationCtx = delayedInvalidation ? context as IHasDelayedInvalidationContext : null;
+                    using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                    {
+                        accessMethods.WriteByte(checked((long)(address - startAddress)), value);
+                    }
                 }
                 finally
                 {
@@ -234,7 +237,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             using(SetLocalContext(context, cpuState))
             {
                 TryGetTag(address, out var tag);
-
                 var warning = TagOverriddenWrite;
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
@@ -266,7 +268,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                     {
                         accessMethods.SetAbsoluteAddress(address);
                     }
-                    accessMethods.WriteWord(checked((long)(address - startAddress)), value);
+                    var invalidationCtx = delayedInvalidation ? context as IHasDelayedInvalidationContext : null;
+                    using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                    {
+                        accessMethods.WriteWord(checked((long)(address - startAddress)), value);
+                    }
                 }
                 finally
                 {
@@ -369,7 +375,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             using(SetLocalContext(context, cpuState))
             {
                 TryGetTag(address, out var tag);
-
                 var warning = TagOverriddenWrite;
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
@@ -401,7 +406,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                     {
                         accessMethods.SetAbsoluteAddress(address);
                     }
-                    accessMethods.WriteDoubleWord(checked((long)(address - startAddress)), value);
+                    var invalidationCtx = delayedInvalidation ? context as IHasDelayedInvalidationContext : null;
+                    using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                    {
+                        accessMethods.WriteDoubleWord(checked((long)(address - startAddress)), value);
+                    }
                 }
                 finally
                 {
@@ -504,7 +513,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             using(SetLocalContext(context, cpuState))
             {
                 TryGetTag(address, out var tag);
-
                 var warning = TagOverriddenWrite;
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
@@ -536,7 +544,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                     {
                         accessMethods.SetAbsoluteAddress(address);
                     }
-                    accessMethods.WriteQuadWord(checked((long)(address - startAddress)), value);
+                    var invalidationCtx = delayedInvalidation ? context as IHasDelayedInvalidationContext : null;
+                    using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                    {
+                        accessMethods.WriteQuadWord(checked((long)(address - startAddress)), value);
+                    }
                 }
                 finally
                 {
@@ -574,7 +586,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             var type = typeof(T);
             if(type == typeof(byte))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -593,7 +605,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(ushort))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -612,7 +624,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(uint))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -631,7 +643,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(ulong))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -664,7 +676,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             var type = typeof(T);
             if(type == typeof(byte))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -683,7 +695,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(ushort))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -702,7 +714,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(uint))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {
@@ -721,7 +733,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(type == typeof(ulong))
             {
-                foreach(var peripherals in allPeripherals)
+                foreach(var peripherals in AllPeripherals)
                 {
                     peripherals.VisitAccessMethods(peripheral, pam =>
                     {

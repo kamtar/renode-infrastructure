@@ -36,15 +36,37 @@ file (GLOB SOURCES
     "../renode/virt/*.c"
 )
 
-add_library (virt SHARED ${SOURCES})
+add_library (virt-x86 SHARED ${SOURCES})
 
-target_link_libraries (virt
+target_link_libraries (virt-x86
     -fPIC
     -shared
 )
 
-set_target_properties(virt PROPERTIES
+target_compile_definitions(virt-x86 PRIVATE
+    TARGET_X86KVM
+)
+
+set_target_properties(virt-x86 PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "kvm-i386"
+    OUTPUT_NAME "kvm-x86"
+    SUFFIX ".so"
+)
+
+
+add_library (virt-x86_64 SHARED ${SOURCES})
+
+target_link_libraries (virt-x86_64
+    -fPIC
+    -shared
+)
+
+target_compile_definitions(virt-x86_64 PRIVATE
+    TARGET_X86_64KVM
+)
+
+set_target_properties(virt-x86_64 PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "kvm-x86_64"
     SUFFIX ".so"
 )

@@ -4,9 +4,9 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Timers;
+
 using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
@@ -45,6 +45,28 @@ namespace Antmicro.Renode.Peripherals.CPU
             PCWritten();
             return value;
         }
+
+        public enum MstatusFieldOffsets : byte
+        {
+            SD = 31,
+            SDT = 24,
+            SPELP = 23,
+            TSR = 22,
+            TW = 21,
+            TVM = 20,
+            MXR = 19,
+            SUM = 18,
+            MPRV = 17,
+            XS = 15,
+            FS = 13,
+            MPP = 11,
+            VS = 9,
+            SPP = 8,
+            MPIE = 7,
+            UBE = 6,
+            SPIE = 5,
+            MIE = 3,
+            SIE = 1,
+        }
     }
 }
-

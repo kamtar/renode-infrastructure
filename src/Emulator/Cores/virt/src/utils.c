@@ -6,6 +6,7 @@
 
 #include "cpu.h"
 #include "callbacks.h"
+#include "utils.h"
 
 #include <string.h>
 #include <stdarg.h>
@@ -14,13 +15,40 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 
-void kvm_abortf(char *fmt, ...)
+#define VSNPRINTF_BUFFER_SIZE 1024
+
+
+void kvm_abortf(const char *fmt, ...)
 {
-    char result[1024];
+    char result[VSNPRINTF_BUFFER_SIZE];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(result, 1024, fmt, ap);
+    vsnprintf(result, VSNPRINTF_BUFFER_SIZE, fmt, ap);
     kvm_abort(result);
+    va_end(ap);
+}
+
+void kvm_runtime_abortf(const char *fmt, ...)
+{
+    struct kvm_regs regs;
+    get_regs(&regs);
+    uint64_t pc = regs.rip;
+
+    char result[VSNPRINTF_BUFFER_SIZE];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(result, VSNPRINTF_BUFFER_SIZE, fmt, ap);
+    kvm_runtime_abort(result, pc);
+    va_end(ap);
+}
+
+void kvm_logf(LogLevel level, const char *fmt, ...)
+{
+    char result[VSNPRINTF_BUFFER_SIZE];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(result, VSNPRINTF_BUFFER_SIZE, fmt, ap);
+    kvm_log(level, result);
     va_end(ap);
 }
 
