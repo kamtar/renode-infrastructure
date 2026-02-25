@@ -239,6 +239,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.TryGetCurrentContextState(out context, out stateObj);
         }
 
+        public bool TryGetTransactionInitiator(out IPeripheral initiator)
+        {
+            return ParentController.TryGetTransactionInitiator(out initiator);
+        }
+
         public virtual ICPU GetCurrentCPU()
         {
             return ParentController.GetCurrentCPU();
@@ -394,19 +399,19 @@ namespace Antmicro.Renode.Peripherals.Bus
             ParentController.ChangePeripheralAccessCondition(peripheral, newCondition, oldCondition);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusMultiRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>)ParentController).Unregister(peripheral);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusRangeRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)ParentController).Unregister(peripheral);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusParametrizedRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusParametrizedRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusParametrizedRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusParametrizedRegistration>)ParentController).Unregister(peripheral);
         }
 
         public void Unregister(IPeripheral peripheral)
@@ -449,9 +454,9 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.FindMemory(address, context);
         }
 
-        public virtual bool IsMemory(ulong address, ICPU context = null)
+        public virtual bool IsMemory(ulong address, ICPU context = null, ulong? initiatorState = null)
         {
-            return ParentController.IsMemory(address, context);
+            return ParentController.IsMemory(address, context, initiatorState);
         }
 
         public virtual void LoadFileChunks(string path, IEnumerable<FileChunk> chunks, IPeripheral cpu)

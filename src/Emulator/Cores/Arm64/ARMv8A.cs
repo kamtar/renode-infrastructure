@@ -19,7 +19,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public partial class ARMv8A : BaseARMv8, IARMTwoSecurityStatesCPU, IPeripheralRegister<ARM_GenericTimer, NullRegistrationPoint>
+    public partial class ARMv8A : BaseARMv8, IARMTwoSecurityStatesCPU, IRegisterablePeripheral<ARM_GenericTimer, NullRegistrationPoint>
     {
         public ARMv8A(IMachine machine, string cpuType, ARM_GenericInterruptController genericInterruptController, uint cpuId = 0, Endianess endianness = Endianess.LittleEndian)
                 : base(cpuId, cpuType, machine, endianness)
@@ -162,7 +162,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         public event Action<ExceptionLevel, SecurityState> ExecutionModeChanged;
 
         [Export]
-        protected void OnTcmMappingUpdate(int index, ulong newAddress)
+        protected void OnTcmMappingUpdate(int index, ulong newAddress, uint el01Enabled, uint el2Enabled)
         {
             throw new CpuAbortException($"TCM regions are not supported on {nameof(ARMv8A)}");
         }

@@ -7,12 +7,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Helpers;
+using Antmicro.Renode.Time;
+
 #pragma warning disable IDE0005
 using Antmicro.Renode.Utilities;
 #pragma warning restore IDE0005
@@ -24,12 +27,15 @@ namespace Antmicro.Renode.Peripherals.UART
     {
         public Cadence_UART(IMachine machine, bool clearInterruptStatusOnRead = false, ulong clockFrequency = 50000000, int fifoCapacity = 64) : base(machine)
         {
+            this.machine = machine;
             this.fifoCapacity = fifoCapacity;
-            this.clearInterruptStatusOnRead = clearInterruptStatusOnRead;
+            ClearInterruptStatusOnRead = clearInterruptStatusOnRead;
             this.clockFrequency = clockFrequency;
+            txWasEnabled = false;
+            cancellationToken = new CancellationTokenSource();
 
             registers = new DoubleWordRegisterCollection(this, BuildRegisterMap());
-            txQueue = new Queue<byte>(fifoCapacity);
+            txQueue = new Queue<byte>();
 
             txFifoOverflow = new CadenceInterruptFlag(() => false);
             txFifoNearlyFull = new CadenceInterruptFlag(() => txQueue.Count + 1 == fifoCapacity);
@@ -61,7 +67,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 return;
             }
 
-            if(Count < fifoCapacity)
+            if(Count < fifoCapacity || !EnableRxOverflow)
             {
                 base.WriteChar(value);
                 UpdateBufferState();
@@ -80,30 +86,37 @@ namespace Antmicro.Renode.Peripherals.UART
         // NOTE: Shadow original implementation of the TransmitCharacter to add additional logic
         public new void TransmitCharacter(byte character)
         {
-            if(!TxEnabled)
+            var characterEnqueued = false;
+            int queueCount;
+            lock(txQueueLock)
             {
                 if(txQueue.Count < this.fifoCapacity)
                 {
                     txQueue.Enqueue(character);
+                    characterEnqueued = true;
                 }
-                else
-                {
-                    txFifoOverflow.SetSticky(true);
-                }
-
-                UpdateSticky();
-                UpdateInterrupts();
-                return;
+                queueCount = txQueue.Count;
             }
 
-            base.TransmitCharacter(character);
+            if(characterEnqueued)
+            {
+                ScheduleTransmission(queueCount);
+            }
+            else
+            {
+                txFifoOverflow.SetSticky(true);
+            }
+            UpdateSticky();
+            UpdateInterrupts();
         }
 
         public override void Reset()
         {
             base.Reset();
             registers.Reset();
+            CancelScheduledTransmission();
             txQueue.Clear();
+            txWasEnabled = false;
 
             foreach(var flag in GetInterruptFlags())
             {
@@ -118,6 +131,33 @@ namespace Antmicro.Renode.Peripherals.UART
         public override Parity ParityBit => ConvertInternalParity(parityField.Value);
 
         public override uint BaudRate => (uint)(clockFrequency / (clockSource.Value ? 8U : 1U) / baudGenerator.Value / (baudDivider.Value + 1));
+
+        public bool ClearInterruptStatusOnRead { get; set; }
+
+        public ulong CharacterTransmitDelayMicroseconds
+        {
+            get => characterTransmitDelay;
+            set
+            {
+                if(characterTransmitDelay == value)
+                {
+                    return;
+                }
+
+                characterTransmitDelay = value;
+                lock(txQueueLock)
+                {
+                    CancelScheduledTransmission();
+                    // If delay was changed we need to call `ScheduleTransmission` to either:
+                    // * Flush the TX buffer if `characterTransmitDelay == 0`
+                    // * Schedule data currently in the fifo to be transmitted if `characterTransmitDelay > 0`
+                    for(var i = 0; i < txQueue.Count; i++)
+                    {
+                        ScheduleTransmission(i);
+                    }
+                }
+            }
+        }
 
         public long Size => 0x80;
 
@@ -141,6 +181,8 @@ namespace Antmicro.Renode.Peripherals.UART
         public GPIO TxFifoNearlyFullIRQ { get; } = new GPIO();
 
         public GPIO TxFifoOverflowIRQ { get; } = new GPIO();
+
+        public bool EnableRxOverflow { get; set; }
 
         public event Action<BufferState> BufferStateChanged;
 
@@ -186,17 +228,74 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
-        private void TryTransmitTxQueue()
+        private void SetTxState()
         {
-            if(!TxEnabled || txQueue.Count == 0)
+            if(TxEnabled == txWasEnabled)
+            {
+                // State hasn't changed
+                return;
+            }
+
+            txWasEnabled = TxEnabled;
+            if(TxEnabled)
+            {
+                lock(txQueueLock)
+                {
+                    for(var i = 0; i < txQueue.Count; i++)
+                    {
+                        // Schedule transmission for all bytes currently in the queue
+                        ScheduleTransmission(i);
+                    }
+                }
+            }
+            else
+            {
+                CancelScheduledTransmission();
+            }
+        }
+
+        private void ScheduleTransmission(int n = 0)
+        {
+            if(!TxEnabled)
             {
                 return;
             }
 
-            while(txQueue.TryDequeue(out var character))
+            CancellationToken token;
+            lock(txQueueLock)
             {
-                // NOTE: Use base class method to omit additional logic for queues
+                token = cancellationToken.Token;
+            }
+
+            Action<TimeInterval> transmitCharacter = _ =>
+            {
+                if(token.IsCancellationRequested || !TxEnabled)
+                {
+                    return;
+                }
+
+                byte character;
+                lock(txQueueLock)
+                {
+                    if(!txQueue.TryDequeue(out character))
+                    {
+                        return;
+                    }
+                }
+
                 base.TransmitCharacter(character);
+                UpdateSticky();
+                UpdateInterrupts();
+            };
+
+            if(CharacterTransmitDelayMicroseconds == 0)
+            {
+                transmitCharacter(TimeInterval.Empty);
+            }
+            else
+            {
+                var delay = TimeInterval.FromMicroseconds((ulong)(n + 1) * CharacterTransmitDelayMicroseconds);
+                machine.ScheduleAction(delay, transmitCharacter);
             }
         }
 
@@ -223,6 +322,17 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void UpdateBufferState()
         {
+            if(!EnableRxOverflow)
+            {
+                var shouldUpdate = BufferState != BufferState.Empty;
+                BufferState = BufferState.Empty;
+                if(shouldUpdate)
+                {
+                    BufferStateChanged?.Invoke(BufferState);
+                }
+                return;
+            }
+
             if((!rxFifoFull.Status && BufferState == BufferState.Full) ||
                (!rxFifoEmpty.Status && BufferState == BufferState.Empty) ||
                ((rxFifoFull.Status || rxFifoEmpty.Status) && BufferState == BufferState.Ready))
@@ -246,7 +356,6 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private Dictionary<long, DoubleWordRegister> BuildRegisterMap()
         {
-            var interruptStatusFieldMode = FieldMode.Read | (clearInterruptStatusOnRead ? 0 : FieldMode.Write);
             return new Dictionary<long, DoubleWordRegister>
             {
                 {(long)Registers.Control, new DoubleWordRegister(this, 0x00000128)
@@ -259,14 +368,24 @@ namespace Antmicro.Renode.Peripherals.UART
                             (_, val) => rxTimeoutError.SetSticky(val)
                     )
                     .WithFlag(5, out txDisabledReg, name: "txDisabled",
-                        changeCallback: (_, __) => TryTransmitTxQueue())
+                        changeCallback: (_, __) => SetTxState())
                     .WithFlag(4, out txEnabledReg, name: "txEnabled",
-                        changeCallback: (_, __) => TryTransmitTxQueue())
+                        changeCallback: (_, __) => SetTxState())
                     .WithFlag(3, out rxDisabledReg, name: "rxDisabled")
                     .WithFlag(2, out rxEnabledReg, name: "rxEnabled")
                     .WithFlag(1, valueProviderCallback: _ => false, name: "txReset",
                         writeCallback:
-                            (_, val) => { if(val) txQueue.Clear(); })
+                            (_, val) =>
+                            {
+                                if(val)
+                                {
+                                    lock(txQueueLock)
+                                    {
+                                        CancelScheduledTransmission();
+                                        txQueue.Clear();
+                                    }
+                                }
+                            })
                     .WithFlag(0, valueProviderCallback: _ => false, name: "rxReset",
                         writeCallback:
                             (_, val) => { if(val) this.ClearBuffer(); }
@@ -423,66 +542,66 @@ namespace Antmicro.Renode.Peripherals.UART
                     .WithTaggedFlag("rxBreakDetectInterruptStatus", 13)
                     .WithFlag(12,
                         valueProviderCallback: (_) => txFifoOverflow.StickyStatus,
-                        readCallback: (_, __) => txFifoOverflow.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => txFifoOverflow.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => txFifoOverflow.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => txFifoOverflow.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "txFifoOverflowInterruptStatus")
                     .WithFlag(11,
                         valueProviderCallback: (_) => txFifoNearlyFull.StickyStatus,
-                        readCallback: (_, __) => txFifoNearlyFull.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => txFifoNearlyFull.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => txFifoNearlyFull.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => txFifoNearlyFull.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "txFifoNearlyFullInterruptStatus")
                     .WithFlag(10,
                         valueProviderCallback: (_) => txFifoTrigger.StickyStatus,
-                        readCallback: (_, __) => txFifoTrigger.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => txFifoTrigger.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => txFifoTrigger.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => txFifoTrigger.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "txFifoTriggerInterruptStatus")
                     .WithTaggedFlag("deltaModemStatusInterruptStatus", 9)
-                    .WithFlag(8, interruptStatusFieldMode,
+                    .WithFlag(8,
                         valueProviderCallback: (_) => rxTimeoutError.StickyStatus,
-                        readCallback: (_, __) => rxTimeoutError.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => rxTimeoutError.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => rxTimeoutError.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => rxTimeoutError.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "rxTimeoutErrorInterruptStatus"
                     )
                     .WithTaggedFlag("rxParityErrorInterruptStatus", 7)
                     .WithTaggedFlag("rxFramingErrorInterruptStatus", 6)
-                    .WithFlag(5, interruptStatusFieldMode,
+                    .WithFlag(5,
                         valueProviderCallback: (_) => rxFifoOverflow.StickyStatus,
-                        readCallback: (_, __) => rxFifoOverflow.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => rxFifoOverflow.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => rxFifoOverflow.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => rxFifoOverflow.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "rxFifoOverflowInterruptStatus"
                     )
                     .WithFlag(4,
                         valueProviderCallback: (_) => txFifoFull.StickyStatus,
-                        readCallback: (_, __) => txFifoFull.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => txFifoFull.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => txFifoFull.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => txFifoFull.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "txFifoFullInterruptStatus")
-                    .WithFlag(3, interruptStatusFieldMode,
+                    .WithFlag(3,
                         valueProviderCallback: (_) => txFifoEmpty.StickyStatus,
-                        readCallback: (_, __) => txFifoEmpty.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => txFifoEmpty.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => txFifoEmpty.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => txFifoEmpty.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "txFifoEmptyInterruptStatus"
                     )
-                    .WithFlag(2, interruptStatusFieldMode,
+                    .WithFlag(2,
                         valueProviderCallback: (_) => rxFifoFull.StickyStatus,
-                        readCallback: (_, __) => rxFifoFull.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => rxFifoFull.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => rxFifoFull.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => rxFifoFull.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "rxFifoFullInterruptStatus"
                     )
-                    .WithFlag(1, interruptStatusFieldMode,
+                    .WithFlag(1,
                         valueProviderCallback: (_) => rxFifoEmpty.StickyStatus,
-                        readCallback: (_, __) => rxFifoEmpty.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => rxFifoEmpty.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => rxFifoEmpty.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => rxFifoEmpty.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "rxFifoEmptyInterruptMStatus"
                     )
-                    .WithFlag(0, interruptStatusFieldMode,
+                    .WithFlag(0,
                         valueProviderCallback: (_) => rxFifoTrigger.StickyStatus,
-                        readCallback: (_, __) => rxFifoTrigger.ClearSticky(clearInterruptStatusOnRead),
-                        writeCallback: (_, val) => rxFifoTrigger.ClearSticky(val && !clearInterruptStatusOnRead),
+                        readCallback: (_, __) => rxFifoTrigger.ClearSticky(ClearInterruptStatusOnRead),
+                        writeCallback: (_, val) => rxFifoTrigger.ClearSticky(val && !ClearInterruptStatusOnRead),
                         name: "rxFifoTriggerInterruptStatus"
                     )
                     .WithReadCallback((_, __) =>
                     {
-                        if(clearInterruptStatusOnRead)
+                        if(ClearInterruptStatusOnRead)
                         {
                             UpdateSticky();
                             UpdateInterrupts();
@@ -490,7 +609,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     })
                     .WithWriteCallback((_, __) =>
                     {
-                        if(!clearInterruptStatusOnRead)
+                        if(!ClearInterruptStatusOnRead)
                         {
                             UpdateSticky();
                             UpdateInterrupts();
@@ -520,12 +639,16 @@ namespace Antmicro.Renode.Peripherals.UART
                 },
                 {(long)Registers.ChannelStatus, new DoubleWordRegister(this)
                     .WithReservedBits(15, 17)
-                    .WithFlag(14, FieldMode.Read, valueProviderCallback: _ => false, name: "txFifoTriggerStatus")
+                    .WithFlag(14, FieldMode.Read,
+                        valueProviderCallback: _ => txFifoTrigger.Status,
+                        name: "txFifoTriggerStatus")
                     .WithTaggedFlag("rxFlowDelayTriggerStatus", 12)
                     .WithTaggedFlag("txStateMachineActiveStatus", 11)
                     .WithTaggedFlag("rxStateMachineActiveStatus", 10)
                     .WithReservedBits(5, 4)
-                    .WithFlag(4, FieldMode.Read, valueProviderCallback: _ => false, name: "txFifoFullStatus")
+                    .WithFlag(4, FieldMode.Read,
+                        valueProviderCallback: _ => txFifoFull.Status,
+                        name: "txFifoFullStatus")
                     .WithFlag(3, FieldMode.Read,
                         valueProviderCallback: _ => txFifoEmpty.Status,
                         name: "txFifoEmptyStatus")
@@ -614,6 +737,15 @@ namespace Antmicro.Renode.Peripherals.UART
             yield return txFifoEmpty;
         }
 
+        private void CancelScheduledTransmission()
+        {
+            lock(txQueueLock)
+            {
+                cancellationToken.Cancel();
+                cancellationToken = new CancellationTokenSource();
+            }
+        }
+
         private bool TxEnabled => txEnabledReg.Value && !txDisabledReg.Value;
 
         private bool RxEnabled => rxEnabledReg.Value && !rxDisabledReg.Value;
@@ -629,10 +761,14 @@ namespace Antmicro.Renode.Peripherals.UART
         private IValueRegisterField rxTriggerLevel;
         private IValueRegisterField txTriggerLevel;
         private IValueRegisterField baudDivider;
+        private CancellationTokenSource cancellationToken;
+        private bool txWasEnabled;
+        private ulong characterTransmitDelay;
 
         private readonly int fifoCapacity;
 
         private readonly Queue<byte> txQueue;
+        private readonly object txQueueLock = new object();
         private readonly CadenceInterruptFlag txFifoOverflow;
         private readonly CadenceInterruptFlag txFifoNearlyFull;
         private readonly CadenceInterruptFlag txFifoFull;
@@ -645,8 +781,8 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly CadenceInterruptFlag txFifoEmpty;
 
         private readonly DoubleWordRegisterCollection registers;
-        private readonly bool clearInterruptStatusOnRead;
         private readonly ulong clockFrequency;
+        private readonly IMachine machine;
 
         private enum InternalStop
         {

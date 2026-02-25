@@ -69,11 +69,16 @@
     <PackageReference Include="GdkSharp" Version="3.24.24.95" />
     <PackageReference Include="GLibSharp" Version="3.24.24.95" />
   </ItemGroup>
+  <ItemGroup Condition=" $(CurrentPlatform) != Windows ">
+    <PackageReference Include="GirCore.Gst-1.0" Version="0.7.0" />
+    <PackageReference Include="GirCore.GstApp-1.0" Version="0.7.0" />
+  </ItemGroup>
   <Import Project="$(MSBuildProjectDirectory)/BuildAdditionalProjects-UI.csproj.targets" Condition="Exists('$(MSBuildProjectDirectory)/BuildAdditionalProjects-UI.csproj.targets')" />
   <ItemGroup>
     <Compile Remove="Plugins/**/*"/>
     <Compile Remove="Emulator/Main/Tests/**/*"/>
     <Compile Remove="Emulator/Main/Utilities/AdHocCompiler.cs"/>
+    <Compile Remove="Emulator/Main/Exceptions/UnreachableException.cs"/>
     <Compile Remove="Emulator/Peripherals/Test/**/*"/>
     <Compile Remove="Emulator/Extensions/MonitorTests/**/*" />
     <Compile Remove="Emulator/Extensions/TAPHelper/DynamicModuleSpawner.cs" />
@@ -85,7 +90,7 @@
     <Compile Remove="**/obj/**/*AssemblyAttributes.cs"/>
   </ItemGroup>
   <ItemGroup Condition="$(CurrentPlatform) != 'Linux' Or $(Architecture) != 'i386'">
-    <Compile Remove="Emulator/Cores/X86KVM/*" />
+    <Compile Remove="Emulator/Cores/KVM/**" />
   </ItemGroup>
 
   <Target Name="PrepareEmbeddedResources" BeforeTargets="ResolveReferences" >

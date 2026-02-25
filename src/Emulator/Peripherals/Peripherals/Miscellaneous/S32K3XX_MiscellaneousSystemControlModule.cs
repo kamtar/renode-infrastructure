@@ -1,21 +1,42 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System.Collections.Generic;
+using System.Linq;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.IRQControllers;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class S32K3XX_MiscellaneousSystemControlModule : BasicDoubleWordPeripheral, IWordPeripheral, IKnownSize,
-        IProvidesRegisterCollection<WordRegisterCollection>
+        IProvidesRegisterCollection<WordRegisterCollection>, IGPIOReceiver
     {
-        public S32K3XX_MiscellaneousSystemControlModule(IMachine machine) : base(machine)
+        public S32K3XX_MiscellaneousSystemControlModule(IMachine machine, List<NVIC> nvics) : base(machine)
         {
+            if(nvics.Count != ProcessorCount || nvics.Any(n => n == null))
+            {
+                throw new ConstructionException($"{nameof(S32K3XX_MiscellaneousSystemControlModule)} requires {ProcessorCount} non-null NVICs to be provided, but got: {nvics.Count}");
+            }
+
+            this.nvics = nvics;
             wordRegisterCollection = new WordRegisterCollection(this);
+            interrupts = new Interrupt[InterruptRouterSharedRegisterCount, ProcessorCount];
+            for(var irq = 0; irq < interrupts.GetLength(0); irq++)
+            {
+                for(var cpu = 0; cpu < interrupts.GetLength(1); cpu++)
+                {
+                    interrupts[irq, cpu] = new Interrupt(this, irq, cpu);
+                }
+            }
+
             DefineRegisters();
         }
 
@@ -33,6 +54,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             base.Reset();
             wordRegisterCollection.Reset();
+            foreach(var irq in interrupts)
+            {
+                irq.Reset();
+            }
+        }
+
+        public void OnGPIO(int number, bool value)
+        {
+            if(number < 0 || number >= InterruptRouterSharedRegisterCount)
+            {
+                this.ErrorLog("IRQ #{0} is out of range of [0, {1}), ignoring", number, InterruptRouterRegisterCount);
+                return;
+            }
+
+            for(var cpu = 0; cpu < ProcessorCount; cpu++)
+            {
+                interrupts[number, cpu].Value = value;
+            }
         }
 
         public long Size => 0x4000;
@@ -54,7 +93,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     var numberSize = index == 0 ? 3 : 2;
                     reg.WithReservedBits(numberSize, 32 - numberSize)
-                        .WithTag("ProcessorNumber", 0, numberSize);
+                        .WithValueField(0, numberSize,
+                            valueProviderCallback: _ => machine.GetSystemBus(this).GetCurrentCPU().MultiprocessingId,
+                            name: "ProcessorNumber");
                 }
             );
             Registers.ProcessorXRevision.DefineMany(asDoubleWordCollection, ProcessorConfigurationCount, stepInBytes: processorConfigurationSize, setup: (reg, index) => reg
@@ -92,15 +133,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     var cpuIndex = index / 4;
                     reg.WithReservedBits(4, 28)
-                        .WithTaggedFlag($"CP3ToCP{cpuIndex}", 3)
-                        .WithTaggedFlag($"CP2ToCP{cpuIndex}", 2)
-                        .WithTaggedFlag($"CP1ToCP{cpuIndex}", 1)
-                        .WithTaggedFlag($"CP0ToCP{cpuIndex}", 0);
+                        .WithFlags(0, 4,
+                            writeCallback: (irqNumber, _, value) => { if(value) interrupts[irqNumber, cpuIndex].Value = false; },
+                            valueProviderCallback: (irqNumber, _) => interrupts[irqNumber, cpuIndex].Value,
+                            name: "CPn_INT")
+                        ;
                 }
             );
-            Registers.InterruptRouterCP0InterruptGeneration0.DefineMany(asDoubleWordCollection, InterruptRouterRegisterCount, stepInBytes: interruptRegisterStep, setup: (reg, index) => reg
-                .WithReservedBits(1, 31)
-                .WithTaggedFlag($"InterruptEnable", 0)
+            Registers.InterruptRouterCP0InterruptGeneration0.DefineMany(asDoubleWordCollection, InterruptRouterRegisterCount, stepInBytes: interruptRegisterStep, setup: (reg, index) =>
+                {
+                    var targetCpu = index / 4;
+                    var irqNumber = index % 4;
+                    reg.WithReservedBits(1, 31)
+                        .WithFlag(0,
+                            FieldMode.Write,
+                            writeCallback: (_, value) => interrupts[irqNumber, targetCpu].Value = value,
+                            name: "Int_En");
+                }
             );
 
             Registers.InterruptRouterConfiguration.Define(asDoubleWordCollection)
@@ -195,17 +244,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithReservedBits(0, 2);
 
             IProvidesRegisterCollection<WordRegisterCollection> asWordCollection = this;
-            Registers.InterruptRouterSharedPeripheralRoutingControl0.DefineMany(asWordCollection, InterruptRouterSharedRegisterCount, (reg, index) => reg
-                .WithTaggedFlag("Lock", 15)
-                .WithReservedBits(4, 9)
-                .WithTaggedFlag("EnableCortex-M7_3InterruptSteering", 3)
-                .WithTaggedFlag("EnableCortex-M7_2InterruptSteering", 2)
-                .WithTaggedFlag("EnableCortex-M7_1InterruptSteering", 1)
-                .WithTaggedFlag("EnableCortex-M7_0InterruptSteering", 0)
-            );
+            Registers.InterruptRouterSharedPeripheralRoutingControl0.DefineMany(asWordCollection, InterruptRouterSharedRegisterCount, resetValue: 0xF, setup: (reg, irq) =>
+            {
+                IFlagRegisterField irqLock = null;
+                reg
+                    .WithFlag(15, out irqLock, name: "Lock",
+                        writeCallback: (oldValue, newValue) =>
+                        {
+                            if(irqLock.Value && !newValue)
+                            {
+                                irqLock.Value = oldValue;
+                            }
+                        })
+                    .WithReservedBits(4, 9)
+                    .For((r, cpu) => r.WithFlag(cpu, out interrupts[irq, cpu].Enabled, name: $"EnableCortex-M7_{cpu}InterruptSteering",
+                        writeCallback: (oldValue, _) =>
+                        {
+                            if(irqLock.Value)
+                            {
+                                interrupts[irq, cpu].Enabled.Value = oldValue;
+                            }
+                            else
+                            {
+                                // Update the interrupt signal state if interrupt enable changed
+                                interrupts[irq, cpu].Update();
+                            }
+                        }), 0, 4);
+            });
         }
 
         private readonly WordRegisterCollection wordRegisterCollection;
+        private readonly List<NVIC> nvics;
+        private readonly Interrupt[,] interrupts;
 
         private const uint ProcessorCount = 4;
         private const uint ProcessorConfigurationCount = ProcessorCount + 1;
@@ -287,6 +357,45 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             EnableInterconnectErrorDetection1 = 0x604, // ENEDC1
             InterruptRouterSharedPeripheralRoutingControl0 = 0x880, // IRSPRC0
             InterruptRouterSharedPeripheralRoutingControl239 = 0xA5E // IRSPRC239
+        }
+
+        private struct Interrupt
+        {
+            public Interrupt(S32K3XX_MiscellaneousSystemControlModule parent, int irqNumber, int cpuNumber)
+            {
+                this.parent = parent;
+                this.cpuNumber = cpuNumber;
+                this.irqNumber = irqNumber;
+                rawValue = false;
+                Enabled = null;
+            }
+
+            public void Reset() => Value = false;
+
+            public void Update() => Value = rawValue;
+
+            public bool Value
+            {
+                get => rawValue && Enabled.Value;
+                set
+                {
+                    var maskedValue = value && Enabled.Value;
+                    if(Value != maskedValue)
+                    {
+                        parent.DebugLog("Setting IRQ #{0} on CPU{1} to: {2}", irqNumber, cpuNumber, maskedValue);
+                        parent.nvics[cpuNumber].OnGPIO(irqNumber, maskedValue);
+                    }
+                    rawValue = value;
+                }
+            }
+
+            public IFlagRegisterField Enabled;
+
+            private bool rawValue;
+
+            private readonly S32K3XX_MiscellaneousSystemControlModule parent;
+            private readonly int irqNumber;
+            private readonly int cpuNumber;
         }
     }
 }

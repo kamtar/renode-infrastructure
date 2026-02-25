@@ -16,6 +16,7 @@ using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
+using Antmicro.Renode.Utilities.GDB;
 
 namespace Antmicro.Renode.Core
 {
@@ -71,8 +72,6 @@ namespace Antmicro.Renode.Core
 
         void HandleTimeProgress(TimeInterval diff);
 
-        void InitAtomicMemoryState();
-
         bool IsRegistered(IPeripheral peripheral);
 
         IManagedThread ObtainManagedThread(Action action, uint frequency, string name = "managed thread", IEmulationElement owner = null, Func<bool> stopCondition = null);
@@ -111,6 +110,8 @@ namespace Antmicro.Renode.Core
 
         void StartGdbServer(int port, bool autostartEmulation, ICluster<ICpuSupportingGdb> cpu);
 
+        void StartGdbServer(SocketServerProvider terminal, IEnumerable<string> cpuNames = null);
+
         void StopGdbServer(int? port = null);
 
         bool AttachConnectionAcceptedListenerToGdbStub(int port, Action<System.IO.Stream> listener);
@@ -145,7 +146,13 @@ namespace Antmicro.Renode.Core
 
         IntPtr AtomicMemoryStatePointer { get; }
 
+        IntPtr StoreTablePointer { get; }
+
+        int StoreTableBits { get; }
+
         IClockSource ClockSource { get; }
+
+        IReadOnlyDictionary<int, GdbStub> GdbStubs { get; }
 
         bool HasRecorder { get; }
 

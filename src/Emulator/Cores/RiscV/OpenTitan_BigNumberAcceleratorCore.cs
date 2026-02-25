@@ -23,8 +23,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public class OpenTitan_BigNumberAcceleratorCore : RiscV32, IOpenTitan_BigNumberAcceleratorCore
     {
-        public OpenTitan_BigNumberAcceleratorCore(OpenTitan_BigNumberAccelerator parent, OpenTitan_ScrambledMemory instructionsMemory, OpenTitan_ScrambledMemory dataMemory)
-            : base(timeProvider: null, cpuType: "rv32im_zicsr", machine: null, hartId: 0, privilegedArchitecture: PrivilegedArchitecture.Priv1_10, endianness: Endianess.LittleEndian)
+        public OpenTitan_BigNumberAcceleratorCore(OpenTitan_BigNumberAccelerator parent, OpenTitan_ScrambledMemory instructionsMemory, OpenTitan_ScrambledMemory dataMemory, IMachine machine)
+            : base(timeProvider: null, cpuType: "rv32im_zicsr", machine: machine, hartId: 0, privilegedArchitecture: PrivilegedArchitecture.Priv1_10, endianness: Endianess.LittleEndian, useMachineAtomicState: false)
         {
             this.parent = parent;
             this.instructionsMemory = instructionsMemory;
@@ -39,11 +39,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
 
             this.EnableExternalWindowMmu(true);
-            var insnFetchWindow = (uint)this.AcquireExternalMmuWindow((int)ExternalMmuBase.Privilege.Execute); //Insn fetch only
+            var insnFetchWindow = (uint)this.AcquireExternalMmuWindow(ExternalMmuBase.Privilege.Execute); //Insn fetch only
             this.SetMmuWindowStart(insnFetchWindow, 0x0);
             this.SetMmuWindowEnd(insnFetchWindow, (ulong)instructionsMemory.Size);
             this.SetMmuWindowAddend(insnFetchWindow, 0);
-            this.SetMmuWindowPrivileges(insnFetchWindow, (int)ExternalMmuBase.Privilege.Execute);
+            this.SetMmuWindowPrivileges(insnFetchWindow, ExternalMmuBase.Privilege.Execute);
             this.AddHookAtInterruptBegin(HandleException);
 
             foreach(var segment in dataMemory.MappedSegments)
@@ -52,11 +52,11 @@ namespace Antmicro.Renode.Peripherals.CPU
                 this.MapMemory(wrappedSegment);
             }
 
-            var dataWindow = (uint)this.AcquireExternalMmuWindow((int)ExternalMmuBase.Privilege.ReadAndWrite); // Data read and write
+            var dataWindow = (uint)this.AcquireExternalMmuWindow(ExternalMmuBase.Privilege.ReadAndWrite); // Data read and write
             this.SetMmuWindowStart(dataWindow, 0x0);
             this.SetMmuWindowEnd(dataWindow, (ulong)dataMemory.Size);
             this.SetMmuWindowAddend(dataWindow, VirtualDataOffset);
-            this.SetMmuWindowPrivileges(dataWindow, (int)ExternalMmuBase.Privilege.ReadAndWrite);
+            this.SetMmuWindowPrivileges(dataWindow, ExternalMmuBase.Privilege.ReadAndWrite);
 
             // Add the X1 register handling
             this.EnablePostGprAccessHooks(1);

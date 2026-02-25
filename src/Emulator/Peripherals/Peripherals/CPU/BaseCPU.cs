@@ -168,6 +168,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             return Clustered.GetEnumerator();
         }
 
+        public virtual uint CheckExternalPermissions(ulong address)
+        {
+            return 1;
+        }
+
         public abstract ExecutionResult ExecuteInstructions(ulong numberOfInstructionsToExecute, out ulong numberOfExecutedInstructions);
 
         public bool DebuggerConnected { get; set; }
@@ -309,6 +314,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public string Model { get; }
+
+        public ulong ElapsedCycles { get; private set; }
 
         public IEnumerable<BaseCPU> Clustered { get; }
 
@@ -497,7 +504,9 @@ namespace Antmicro.Renode.Peripherals.CPU
                 instructionsExecutedThisRound += instructions;
                 // CPU is `executedResiduum` instructions ahead of the reported time and this value is smaller than the smallest positive possible amount to report,
                 // so we report sum of currently executed/skipped instructions and residuum from previously reported progress.
-                var intervalToReport = TimeInterval.FromCPUCycles(instructions + executedResiduum, PerformanceInMips, out executedResiduum);
+                var cycles = instructions + executedResiduum;
+                var intervalToReport = TimeInterval.FromCPUCycles(cycles, PerformanceInMips, out executedResiduum);
+                ElapsedCycles += cycles;
                 TimeHandle.ReportProgress(intervalToReport);
             }
         }

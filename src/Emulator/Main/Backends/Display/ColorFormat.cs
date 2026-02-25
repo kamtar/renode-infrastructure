@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2018 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -40,7 +40,8 @@ namespace Antmicro.Renode.Backends.Display
         BGRX8888,
         RGBX8888,
         XRGB8888,
-        XBGR8888
+        XBGR8888,
+        NV12, // First planar format
     }
 
     public enum ColorType
@@ -63,17 +64,18 @@ namespace Antmicro.Renode.Backends.Display
             {
                 // here we check if pixel format enum value has proper value
                 // i.e. calculated from the position in enum (not set explicitly)
-                var value = (int)values.GetValue(i);
+                var fmt = (PixelFormat)values.GetValue(i);
+                var value = (int)fmt;
                 if(value != i)
                 {
-                    throw new ArgumentException(string.Format("Unexpected pixel format value: {0}", (PixelFormat)value));
+                    throw new ArgumentException(string.Format("Unexpected pixel format value: {0}", fmt));
                 }
-                depths[value] = GetColorsLengths((PixelFormat)value).Sum(x => x.Value) / 8;
+                depths[value] = fmt.IsPlanar() ? 8 : GetColorsLengths(fmt).Sum(x => x.Value);
             }
         }
 
         /// <summary>
-        /// Returns a number of bytes needed to encode the color.
+        /// Returns the number of bits needed to encode the color.
         /// </summary>
         /// <param name="format">Color format.</param>
         public static int GetColorDepth(this PixelFormat format)
@@ -84,6 +86,22 @@ namespace Antmicro.Renode.Backends.Display
             }
 
             return depths[(int)format];
+        }
+
+        /// <summary>
+        /// Returns the number of bytes needed to encode the given number of pixels.
+        /// </summary>
+        public static ulong GetByteCount(this PixelFormat format, ulong pixels)
+        {
+            return (ulong)format.GetColorDepth() * pixels / 8;
+        }
+
+        /// <summary>
+        /// Returns the number of pixels that fit in the given number of bytes.
+        /// </summary>
+        public static ulong GetPixelCount(this PixelFormat format, ulong bytes)
+        {
+            return bytes * 8 / (ulong)format.GetColorDepth();
         }
 
         /// <summary>
@@ -114,5 +132,14 @@ namespace Antmicro.Renode.Backends.Display
         }
 
         private static readonly int[] depths;
+
+        /// <summary>
+        /// Checks whether or not the specified format is planar.
+        /// </summary>
+        /// <param name="format">Color format</param>
+        public static bool IsPlanar(this PixelFormat format)
+        {
+            return format >= PixelFormat.NV12;
+        }
     }
 }

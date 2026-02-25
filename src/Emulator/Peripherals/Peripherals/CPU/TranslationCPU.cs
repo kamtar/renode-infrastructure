@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -25,6 +25,7 @@ using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU.Assembler;
 using Antmicro.Renode.Peripherals.CPU.Disassembler;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Utilities.Binding;
 
@@ -53,7 +54,7 @@ namespace Antmicro.Renode.Peripherals.CPU
     /// <see cref="TranslationCPU"/> implements <see cref="ICluster{T}"/> interface
     /// to seamlessly handle either cluster or CPU as a parameter to different methods.
     /// </summary>
-    public abstract partial class TranslationCPU : BaseCPU, ICluster<TranslationCPU>, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU
+    public abstract partial class TranslationCPU : BaseCPU, ICluster<TranslationCPU>, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU, IHasPreservableState
     {
         public void AddHookAtInterruptBegin(Action<ulong> hook)
         {
@@ -148,9 +149,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             if(!value)
             {
+                logFunctionNamesCurrentState = null;
                 SetInternalHookAtBlockBegin(null);
                 return;
             }
+            logFunctionNamesCurrentState = new LogFunctionNamesState(spaceSeparatedPrefixes, removeDuplicates, useFunctionSymbolsOnly);
 
             var prefixesAsArray = spaceSeparatedPrefixes.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             // using string builder here is due to performance reasons: test shows that string.Format is much slower
@@ -226,9 +229,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             memoryAccessHook = hook;
         }
 
-        public void AddHookOnMmuFault(Action<ulong, AccessType, int> hook)
+        public void AddHookOnMmuFault(ExternalMmuFaultHook hook)
         {
             mmuFaultHook += hook;
+        }
+
+        public void RemoveHookOnMmuFault(ExternalMmuFaultHook hook)
+        {
+            mmuFaultHook -= hook;
         }
 
         public void AddHookAtInterruptEnd(Action<ulong> hook)
@@ -289,41 +297,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             SetRegister(register, value);
         }
 
-        public void AddHook(ulong addr, Action<ICpuSupportingGdb, ulong> hook)
-        {
-            lock(hooks)
-            {
-                if(!hooks.ContainsKey(addr))
-                {
-                    hooks[addr] = new HookDescriptor(this, addr);
-                }
+        public void AddHook(ulong addr, CpuAddressHook hook) => hooks.AddHook(addr, hook);
 
-                hooks[addr].AddCallback(hook);
-                this.DebugLog("Added hook @ 0x{0:X}", addr);
-            }
-        }
-
-        public void RemoveHook(ulong addr, Action<ICpuSupportingGdb, ulong> hook)
-        {
-            lock(hooks)
-            {
-                HookDescriptor descriptor;
-                if(!hooks.TryGetValue(addr, out descriptor) || !descriptor.RemoveCallback(hook))
-                {
-                    this.Log(LogLevel.Warning, "Tried to remove not existing hook from address 0x{0:x}", addr);
-                    return;
-                }
-                if(descriptor.IsEmpty)
-                {
-                    hooks.Remove(addr);
-                }
-                if(!hooks.Any(x => !x.Value.IsActive))
-                {
-                    isAnyInactiveHook = false;
-                }
-                UpdateBlockBeginHookPresent();
-            }
-        }
+        public void RemoveHook(ulong addr, CpuAddressHook hook) => hooks.RemoveHook(addr, hook);
 
         public void OrderTranslationBlocksInvalidation(IntPtr start, IntPtr end, bool delayInvalidation = false)
         {
@@ -364,10 +340,36 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        public void LoadPreservedState(object state)
+        {
+            if(!(state is TranslationCPUState cpuState))
+            {
+                throw new RecoverableException("Unexpected state received while loading preserved state");
+            }
+            isInterruptLoggingEnabled = cpuState.IsInterruptLoggingEnabled;
+            if(cpuState.LogFunctionNamesState.HasValue)
+            {
+                var logFunctionNamesState = cpuState.LogFunctionNamesState.Value;
+                LogFunctionNames(true, logFunctionNamesState.SpaceSeparatedPrefixes, logFunctionNamesState.RemoveDuplicates, logFunctionNamesState.UseFunctionSymbolsOnly);
+            }
+        }
+
+        public object ExtractPreservedState()
+        {
+            return new TranslationCPUState(logFunctionNamesCurrentState, isInterruptLoggingEnabled);
+        }
+
         public override void Dispose()
         {
+            // Prevent trying to release unmanaged resources if we have already disposed them
+            if(disposed)
+            {
+                return;
+            }
+            disposed = true;
             base.Dispose();
             profiler?.Dispose();
+            localAtomicState?.Dispose();
         }
 
         public void SetHookAtBlockEnd(Action<ulong, uint> hook)
@@ -446,39 +448,39 @@ namespace Antmicro.Renode.Peripherals.CPU
             return (uint)result.Length;
         }
 
-        public uint GetMmuWindowPrivileges(uint index)
+        public uint GetMmuWindowPrivileges(ulong id)
         {
-            return AssertMmuEnabledAndWindowInRange(index) ? TlibGetWindowPrivileges(index) : 0;
+            return AssertMmuEnabled() ? TlibGetWindowPrivileges(id) : 0;
         }
 
-        public ulong GetMmuWindowEnd(uint index)
+        public ulong GetMmuWindowEnd(ulong id)
         {
-            return AssertMmuEnabledAndWindowInRange(index) ? TlibGetMmuWindowEnd(index) : 0;
+            return AssertMmuEnabled() ? TlibGetMmuWindowEnd(id) : 0;
         }
 
-        public ulong GetMmuWindowStart(uint index)
+        public ulong GetMmuWindowStart(ulong id)
         {
-            return AssertMmuEnabledAndWindowInRange(index) ? TlibGetMmuWindowStart(index) : 0;
+            return AssertMmuEnabled() ? TlibGetMmuWindowStart(id) : 0;
         }
 
-        public ulong GetMmuWindowAddend(uint index)
+        public ulong GetMmuWindowAddend(ulong id)
         {
-            return AssertMmuEnabledAndWindowInRange(index) ? TlibGetMmuWindowAddend(index) : 0;
+            return AssertMmuEnabled() ? TlibGetMmuWindowAddend(id) : 0;
         }
 
-        public void SetMmuWindowPrivileges(uint index, uint permissions)
+        public void SetMmuWindowPrivileges(ulong id, ExternalMmuBase.Privilege permissions)
         {
-            if(AssertMmuEnabledAndWindowInRange(index))
+            if(AssertMmuEnabled())
             {
-                TlibSetWindowPrivileges(index, permissions);
+                TlibSetWindowPrivileges(id, (uint)permissions);
             }
         }
 
-        public void SetMmuWindowEnd(uint index, ulong endAddress)
+        public void SetMmuWindowEnd(ulong id, ulong endAddress)
         {
-            if(AssertMmuEnabledAndWindowInRange(index) && AssertMmuWindowAddressInRange(endAddress, inclusiveRange: true))
+            if(AssertMmuEnabled() && AssertMmuWindowAddressInRange(endAddress, inclusiveRange: true))
             {
-                bool useInclusiveEndRange= false;
+                bool useInclusiveEndRange = false;
                 // Overflow on 64bits currently not possible due to type constraints
                 if(this.bitness == CpuBitness.Bits32)
                 {
@@ -491,43 +493,73 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
 
                 this.DebugLog("Setting range end to {0} addr 0x{1:x}", useInclusiveEndRange ? "inclusive" : "exclusive", endAddress);
-                TlibSetMmuWindowEnd(index, endAddress, useInclusiveEndRange ? 1u : 0u);
+                TlibSetMmuWindowEnd(id, endAddress, useInclusiveEndRange ? 1u : 0u);
             }
         }
 
-        public void SetMmuWindowStart(uint index, ulong startAddress)
+        public void SetMmuWindowStart(ulong id, ulong startAddress)
         {
-            if(AssertMmuEnabledAndWindowInRange(index) && AssertMmuWindowAddressInRange(startAddress))
+            if(AssertMmuEnabled() && AssertMmuWindowAddressInRange(startAddress))
             {
-                TlibSetMmuWindowStart(index, startAddress);
+                TlibSetMmuWindowStart(id, startAddress);
             }
         }
 
-        public void SetMmuWindowAddend(uint index, ulong addend)
+        public void SetMmuWindowAddend(ulong id, ulong addend)
         {
-            if(AssertMmuEnabledAndWindowInRange(index))
+            if(AssertMmuEnabled())
             {
-                TlibSetMmuWindowAddend(index, addend);
+                TlibSetMmuWindowAddend(id, addend);
             }
         }
 
-        public void ResetMmuWindow(uint index)
+        public void ResetMmuWindow(ulong id)
         {
-            if(AssertMmuEnabledAndWindowInRange(index))
+            if(AssertMmuEnabled())
             {
-                TlibResetMmuWindow(index);
+                TlibResetMmuWindow(id);
             }
         }
 
-        public int AcquireExternalMmuWindow(uint type)
+        public void ResetMmuWindowsCoveringAddress(ulong address)
         {
-            return AssertMmuEnabled() ? TlibAcquireMmuWindow(type) : -1;
+            if(AssertMmuEnabled())
+            {
+                TlibResetMmuWindowsCoveringAddress(address);
+            }
+        }
+
+        public void ResetAllMmuWindows()
+        {
+            if(AssertMmuEnabled())
+            {
+                TlibResetAllMmuWindows();
+            }
+        }
+
+        public ulong AcquireExternalMmuWindow(ExternalMmuBase.Privilege type)
+        {
+            if(AssertMmuEnabled())
+            {
+                return TlibAcquireMmuWindow((uint)type);
+            }
+            return 0; // unreachable (assert throws in this case)
         }
 
         public void EnableExternalWindowMmu(bool value)
         {
-            TlibEnableExternalWindowMmu(value ? 1u : 0u);
-            externalMmuEnabled = value;
+            EnableExternalWindowMmu(value ? ExternalMmuPosition.Replace : ExternalMmuPosition.None);
+        }
+
+        public void EnableExternalWindowMmu(ExternalMmuPosition position)
+        {
+            TlibEnableExternalWindowMmu((uint)position);
+            externalMmuPosition = position;
+        }
+
+        public void FlushTlb()
+        {
+            TlibFlushTlb(OnPossessedThread);
         }
 
         public void RaiseException(uint exceptionId)
@@ -620,19 +652,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             });
         }
 
-        public void RemoveAllHooks()
-        {
-            lock(hooks)
-            {
-                foreach(var hook in hooks)
-                {
-                    TlibRemoveBreakpoint(hook.Key);
-                }
-                hooks.Clear();
-                isAnyInactiveHook = false;
-                UpdateBlockBeginHookPresent();
-            }
-        }
+        public void RemoveAllHooks() => hooks.RemoveAllHooks();
 
         public void RequestReturn()
         {
@@ -652,16 +672,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             ReportProgress(numberOfExecutedInstructions);
         }
 
-        public void ActivateNewHooks()
-        {
-            lock(hooks)
-            {
-                foreach(var newHook in hooks.Where(x => x.Value.IsNew))
-                {
-                    newHook.Value.Activate();
-                }
-            }
-        }
+        public void ActivateNewHooks() => hooks.ActivateNewHooks();
 
         public string DisassembleBlock(ulong addr = ulong.MaxValue, uint blockSize = 40, uint flags = 0)
         {
@@ -752,25 +763,25 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public void RemoveHooksAt(ulong addr)
+        public void InitStoreTable(bool afterDeserialization = false)
         {
-            lock(hooks)
-            {
-                if(hooks.Remove(addr))
-                {
-                    TlibRemoveBreakpoint(addr);
-                }
-                if(!hooks.Any(x => !x.Value.IsActive))
-                {
-                    isAnyInactiveHook = false;
-                }
-                UpdateBlockBeginHookPresent();
-            }
+            TlibStoreTableInit(StoreTablePointer, (byte)StoreTableBits, afterDeserialization ? 1 : 0);
         }
+
+        public void RemoveHooksAt(ulong addr) => hooks.RemoveHooksAt(addr);
+
+        public void RemoveHooks(CpuAddressHook hook) => hooks.RemoveHooks(hook);
 
         public new IEnumerator<TranslationCPU> GetEnumerator()
         {
             return Clustered.GetEnumerator();
+        }
+
+        // This method is overriden only to add [Export] attribute
+        [Export]
+        public override uint CheckExternalPermissions(ulong address)
+        {
+            return 1;
         }
 
         public abstract void SetRegister(int register, RegisterValue value);
@@ -778,6 +789,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         public abstract RegisterValue GetRegister(int register);
 
         public abstract IEnumerable<CPURegister> GetRegisters();
+
+        public string PreservableName => $"TranslationCPU:{this.GetName()}";
 
         public LLVMDisassembler Disassembler => disassembler;
 
@@ -893,7 +906,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         // This value should only be read in CPU hooks (during execution of translated code).
         public uint CurrentBlockDisassemblyFlags => TlibGetCurrentTbDisasFlags();
 
-        public uint ExternalMmuWindowsCount => externalMmuWindowsCount;
+        public uint ExternalMmuWindowsCount => TlibGetMmuWindowsCount();
 
         public bool ThreadSentinelEnabled { get; set; }
 
@@ -1004,23 +1017,31 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public abstract string GDBArchitecture { get; }
 
+        public readonly bool UseMachineAtomicState;
+
         protected TranslationCPU(string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32)
         : this(0, cpuType, machine, endianness, bitness)
         {
         }
 
-        protected TranslationCPU(uint id, string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32)
+        protected TranslationCPU(uint id, string cpuType, IMachine machine, Endianess endianness, CpuBitness bitness = CpuBitness.Bits32, bool useMachineAtomicState = true)
             : base(id, cpuType, machine, endianness, bitness)
         {
+            if(!useMachineAtomicState)
+            {
+                // Create unique instance of atomic state for cpu that should not use the shared state.
+                localAtomicState = new AtomicState(this, AtomicState.MinimalStoreTableBits);
+            }
+
             atomicId = -1;
             pauseGuard = new CpuThreadPauseGuard(this);
             decodedIrqs = new Dictionary<Interrupt, HashSet<int>>();
-            hooks = new Dictionary<ulong, HookDescriptor>();
+            hooks = new HookDescriptor(this);
             currentMappings = new List<SegmentMapping>();
+            this.UseMachineAtomicState = useMachineAtomicState;
             InitializeRegisters();
             Init();
             InitDisas();
-            externalMmuWindowsCount = TlibGetMmuWindowsCount();
             Clustered = new TranslationCPU[] { this };
         }
 
@@ -1339,7 +1360,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             if(result == ExecutionResult.StoppedAtBreakpoint)
             {
                 this.Trace();
-                ExecuteHooks(PC);
+                hooks.Execute(PC);
                 // it is necessary to deactivate hooks installed on this PC before
                 // calling `tlib_execute` again to avoid a loop;
                 // we need to do this because creating a breakpoint has caused special
@@ -1401,6 +1422,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         protected Action<int> TlibRequestTranslationBlockInterrupt;
+
+        [Import]
+        protected readonly Action<ulong, ulong, uint> TlibEnableExternalPermissionHandlerForRange;
+
+        [Import]
+        protected readonly Action TlibCleanWfiProcState;
 #pragma warning restore 649
 
         /*
@@ -1418,21 +1445,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void UpdateBlockBeginHookPresent()
         {
-            TlibSetBlockBeginHookPresent((blockBeginInternalHook != null || blockBeginUserHook != null || IsSingleStepMode || isAnyInactiveHook) ? 1u : 0u);
+            TlibSetBlockBeginHookPresent((blockBeginInternalHook != null || blockBeginUserHook != null || IsSingleStepMode || hooks.IsAnyInactive) ? 1u : 0u);
         }
 
-        private void ReactivateHooks()
-        {
-            lock(hooks)
-            {
-                foreach(var inactive in hooks.Where(x => !x.Value.IsActive))
-                {
-                    inactive.Value.Activate();
-                }
-                isAnyInactiveHook = false;
-                UpdateBlockBeginHookPresent();
-            }
-        }
+        private void ReactivateHooks() => hooks.Reactivate();
 
         [Export]
         private uint IsInDebugMode()
@@ -1502,21 +1518,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             return MultiprocessingId;
         }
 
-        private void ExecuteHooks(ulong address)
-        {
-            lock(hooks)
-            {
-                HookDescriptor hookDescriptor;
-                if(!hooks.TryGetValue(address, out hookDescriptor))
-                {
-                    return;
-                }
-
-                this.DebugLog("Executing hooks registered at address 0x{0:X8}", address);
-                hookDescriptor.ExecuteCallbacks();
-            }
-        }
-
         private void TlibSetIrqWrapped(int number, bool state)
         {
             var decodedInterrupt = DecodeInterrupt(number);
@@ -1541,20 +1542,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        private void DeactivateHooks(ulong address)
-        {
-            lock(hooks)
-            {
-                HookDescriptor hookDescriptor;
-                if(!hooks.TryGetValue(address, out hookDescriptor))
-                {
-                    return;
-                }
-                hookDescriptor.Deactivate();
-                isAnyInactiveHook = true;
-                UpdateBlockBeginHookPresent();
-            }
-        }
+        private void DeactivateHooks(ulong address) => hooks.DeactivateHooks(address);
 
         [Export]
         private IntPtr Allocate(IntPtr size)
@@ -1646,19 +1634,20 @@ namespace Antmicro.Renode.Peripherals.CPU
                 Marshal.Copy(cpuState, 0, statePtr, cpuState.Length);
                 AfterLoad(statePtr);
             }
-            if(machine != null)
+            if(externalMmuState != null)
             {
-                atomicId = TlibAtomicMemoryStateInit(machine.AtomicMemoryStatePointer, atomicId);
-                if(atomicId == -1)
-                {
-                    throw new ConstructionException("Failed to initialize atomic state, see the log for details");
-                }
+                var externalMmuStatePtr = TlibExportExternalMmuState();
+                Marshal.Copy(externalMmuState, 0, externalMmuStatePtr, externalMmuState.Length);
             }
+
+            atomicId = TlibAtomicMemoryStateInit(AtomicMemoryStatePointer, atomicId);
+            if(atomicId == -1)
+            {
+                throw new ConstructionException("Failed to initialize atomic state, see the log for details");
+            }
+
             HandleRamSetup();
-            foreach(var hook in hooks)
-            {
-                TlibAddBreakpoint(hook.Key);
-            }
+            ActivateNewHooks();
             CyclesPerInstruction = 1;
         }
 
@@ -1745,6 +1734,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
+        private ulong GetTotalElapsedCycles()
+        {
+            return this.ElapsedCycles;
+        }
+
+        [Export]
         private uint IsMemoryDisabled(ulong start, ulong size)
         {
             return disabledMemory.ContainsOverlappingRange(start.By(size)) ? 1u : 0u;
@@ -1788,15 +1783,18 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
-        private void MmuFaultExternalHandler(ulong address, int accessType, int windowIndex)
+        private int MmuFaultExternalHandler(ulong address, int accessType, ulong rawWindowId, int firstTry)
         {
             this.Log(LogLevel.Noisy, "External MMU fault at 0x{0:X} when trying to access as {1}", address, (AccessType)accessType);
 
-            if(windowIndex == -1)
+            var isFirstTry = firstTry == 1;
+            var windowId = rawWindowId == ulong.MaxValue ? null : (ulong?)rawWindowId;
+            if(windowId == null && !isFirstTry)
             {
                 this.Log(LogLevel.Error, "MMU fault - the address 0x{0:X} is not specified in any of the existing ranges", address);
             }
-            mmuFaultHook?.Invoke(address, (AccessType)accessType, windowIndex);
+            var result = mmuFaultHook?.Invoke(address, (AccessType)accessType, windowId, isFirstTry) ?? ExternalMmuResult.Fault;
+            return (int)result;
         }
 
         [Export]
@@ -1868,18 +1866,29 @@ namespace Antmicro.Renode.Peripherals.CPU
             BeforeSave(statePtr);
             cpuState = new byte[TlibGetStateSize()];
             Marshal.Copy(statePtr, cpuState, 0, cpuState.Length);
+            var externalMmuStatePtr = TlibExportExternalMmuState();
+            if(externalMmuStatePtr != IntPtr.Zero)
+            {
+                externalMmuState = new byte[TlibGetExternalMmuStateSize()];
+                Marshal.Copy(externalMmuStatePtr, externalMmuState, 0, externalMmuState.Length);
+            }
         }
 
         [PostSerialization]
         private void FreeState()
         {
             cpuState = null;
+            externalMmuState = null;
         }
 
         [LatePostDeserialization]
         private void RestoreState()
         {
             Init();
+            if(StoreTablePointer != IntPtr.Zero)
+            {
+                InitStoreTable(afterDeserialization: true);
+            }
             // TODO: state of the reset events
             FreeState();
             if(memoryAccessHook != null)
@@ -1922,21 +1931,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private bool AssertMmuEnabled()
         {
-            if(!externalMmuEnabled)
+            if(externalMmuPosition == ExternalMmuPosition.None)
             {
                 throw new RecoverableException("External MMU not enabled");
             }
-            return externalMmuEnabled;
-        }
-
-        private bool AssertMmuEnabledAndWindowInRange(uint index)
-        {
-            var windowInRange = index < externalMmuWindowsCount;
-            if(!windowInRange)
-            {
-                throw new RecoverableException($"Window index to high, maximum number: {externalMmuWindowsCount - 1}, got {index}");
-            }
-            return AssertMmuEnabled() && windowInRange;
+            return true;
         }
 
         /* Currently, due to the used types, 64 bit targets will always pass this check.
@@ -1997,7 +1996,22 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.Log(LogLevel.Info, "End of the interrupt: {0}", GetExceptionDescription(exceptionIndex));
         }
 
-        private bool externalMmuEnabled;
+        private IntPtr AtomicMemoryStatePointer =>
+            UseMachineAtomicState
+                ? machine.AtomicMemoryStatePointer
+                : localAtomicState.AtomicMemoryStatePointer;
+
+        private IntPtr StoreTablePointer =>
+            UseMachineAtomicState
+                ? machine.StoreTablePointer
+                : localAtomicState.StoreTablePointer;
+
+        private int StoreTableBits =>
+            UseMachineAtomicState
+                ? machine.StoreTableBits
+                : localAtomicState.StoreTableBits;
+
+        private ExternalMmuPosition externalMmuPosition;
 
         /// <summary>
         /// <see cref="atomicId" /> acts as a binder between the CPU and atomic state.
@@ -2005,6 +2019,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// </summary>
         private int atomicId;
         private byte[] cpuState;
+        private byte[] externalMmuState;
 
         [Transient]
         private TranslationBlockFetchCallback onTranslationBlockFetch;
@@ -2026,7 +2041,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private Action<ulong, uint> blockBeginUserHook;
         private Action<ulong> interruptBeginHook;
         private Action<ulong> interruptEndHook;
-        private Action<ulong, AccessType, int> mmuFaultHook;
+        private ExternalMmuFaultHook mmuFaultHook;
         private MemoryAccessHook memoryAccessHook;
         private Action<bool> wfiStateChangeHook;
 
@@ -2034,10 +2049,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Transient]
         private NativeBinder binder;
-#pragma warning restore 649
 
         private bool logTranslatedBlocks;
         private bool isInterruptLoggingEnabled;
+        private LogFunctionNamesState? logFunctionNamesCurrentState;
         private Action<ulong, uint> blockFinishedHook;
 
         [Transient]
@@ -2049,9 +2064,13 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Transient]
         private LLVMDisassembler disassembler;
 
+        [Transient]
+        private bool disposed;
+
         private string logFile;
-        private bool isAnyInactiveHook;
-        private readonly Dictionary<ulong, HookDescriptor> hooks;
+        private readonly HookDescriptorBase hooks;
+
+        private readonly AtomicState localAtomicState;
 
         private readonly Dictionary<Interrupt, HashSet<int>> decodedIrqs;
 
@@ -2061,13 +2080,19 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint> TlibSetBlockBeginHookPresent;
 
         [Import]
-        private readonly Action<uint, ulong> TlibSetMmuWindowStart;
+        private readonly Action<ulong, ulong> TlibSetMmuWindowStart;
 
         [Import]
-        private readonly Action<uint> TlibResetMmuWindow;
+        private readonly Action<ulong> TlibResetMmuWindow;
 
         [Import]
-        private readonly Func<uint, int> TlibAcquireMmuWindow;
+        private readonly Action<ulong> TlibResetMmuWindowsCoveringAddress;
+
+        [Import]
+        private readonly Action TlibResetAllMmuWindows;
+
+        [Import]
+        private readonly Func<uint, ulong> TlibAcquireMmuWindow;
 
         [Import]
         private readonly Action<uint> TlibEnableExternalWindowMmu;
@@ -2088,9 +2113,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<ulong> TlibSetPageIoAccessed;
 
         [Import]
-        private readonly Action TlibCleanWfiProcState;
-
-        [Import]
         private readonly Action<int> TlibOnMemoryAccessEventEnabled;
 
         [Import]
@@ -2109,13 +2131,13 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<uint> TlibGetCurrentTbDisasFlags;
 
         [Import]
-        private readonly Action<uint, ulong, uint> TlibSetMmuWindowEnd;
+        private readonly Action<ulong, ulong, uint> TlibSetMmuWindowEnd;
 
         [Import]
-        private readonly Action<uint, ulong> TlibSetMmuWindowAddend;
+        private readonly Action<ulong, ulong> TlibSetMmuWindowAddend;
 
         [Import]
-        private readonly Action<uint, uint> TlibSetWindowPrivileges;
+        private readonly Action<ulong, uint> TlibSetWindowPrivileges;
 
         [Import]
         private readonly Action<IntPtr> TlibAfterLoad;
@@ -2130,25 +2152,28 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<int> TlibSetBroadcastDirty;
 
         [Import]
-        private readonly Func<uint, uint> TlibGetWindowPrivileges;
+        private readonly Func<ulong, uint> TlibGetWindowPrivileges;
 
         [Import]
-        private readonly Func<uint, ulong> TlibGetMmuWindowEnd;
+        private readonly Func<ulong, ulong> TlibGetMmuWindowEnd;
 
         [Import]
-        private readonly Func<uint, ulong> TlibGetMmuWindowStart;
+        private readonly Func<ulong, ulong> TlibGetMmuWindowStart;
 
         [Import]
         private readonly Action<IntPtr> TlibBeforeSave;
 
         [Import]
-        private readonly Func<uint, ulong> TlibGetMmuWindowAddend;
+        private readonly Func<ulong, ulong> TlibGetMmuWindowAddend;
 
         [Import]
         private readonly Action<uint> TlibSetMillicyclesPerInstruction;
 
         [Import]
         private readonly Func<int> TlibGetStateSize;
+
+        [Import]
+        private readonly Func<int> TlibGetExternalMmuStateSize;
 
         [Import]
         private readonly Action TlibReset;
@@ -2184,6 +2209,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<IntPtr, int, int> TlibAtomicMemoryStateInit;
 
         [Import]
+        private readonly Func<IntPtr, byte, int, int> TlibStoreTableInit;
+
+        [Import]
         private readonly Action<uint> TlibSetSyncPcEveryInstructionDisabled;
 
         [Import]
@@ -2199,6 +2227,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<ulong> TlibFlushPage;
 
         [Import]
+        private readonly Action<bool> TlibFlushTlb;
+
+        [Import]
         private readonly Func<uint> TlibGetPageSize;
 
         [Import]
@@ -2212,6 +2243,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Func<IntPtr> TlibExportState;
+
+        [Import]
+        private readonly Func<IntPtr> TlibExportExternalMmuState;
 
         [Import]
         private readonly Action TlibInvalidateTranslationCache;
@@ -2254,12 +2288,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Action<ulong, ulong, ulong> TlibEnableReadCache;
+#pragma warning restore 649
 
         private readonly ConcurrentQueue<Action> actionsToExecuteOnCpuThread = new ConcurrentQueue<Action>();
 
         // TODO
         private readonly object lck = new object();
-        private readonly uint externalMmuWindowsCount;
         private readonly MinimalRangesCollection mappedMemory = new MinimalRangesCollection();
         private readonly CpuThreadPauseGuard pauseGuard;
 
@@ -2421,6 +2455,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             TargetExternal3 = 1 << 9,
         }
 
+        private class HookDescriptor : HookDescriptorBase
+        {
+            public HookDescriptor(ICpuSupportingGdb cpu) : base(cpu)
+            {
+            }
+
+            protected override void HookStateChangedCallback() => (cpu as TranslationCPU).UpdateBlockBeginHookPresent();
+
+            protected override void AddBreakpoint(ulong address) => (cpu as TranslationCPU).TlibAddBreakpoint(address);
+
+            protected override void RemoveBreakpoint(ulong address) => (cpu as TranslationCPU).TlibRemoveBreakpoint(address);
+        }
+
         private class SimpleMemoryManager
         {
             public SimpleMemoryManager(TranslationCPU parent)
@@ -2507,87 +2554,41 @@ namespace Antmicro.Renode.Peripherals.CPU
             private readonly TranslationCPU parent;
         }
 
-        private class HookDescriptor
-        {
-            public HookDescriptor(TranslationCPU cpu, ulong address)
-            {
-                this.cpu = cpu;
-                this.address = address;
-                callbacks = new HashSet<Action<ICpuSupportingGdb, ulong>>();
-                IsNew = true;
-            }
-
-            public void ExecuteCallbacks()
-            {
-                // As hooks can be removed inside the callback, .ToList()
-                // is required to avoid _Collection was modified_ exception.
-                foreach(var callback in callbacks.ToList())
-                {
-                    callback(cpu, address);
-                }
-            }
-
-            public void AddCallback(Action<ICpuSupportingGdb, ulong> action)
-            {
-                callbacks.Add(action);
-            }
-
-            public bool RemoveCallback(Action<ICpuSupportingGdb, ulong> action)
-            {
-                var result = callbacks.Remove(action);
-                if(result && IsEmpty)
-                {
-                    Deactivate();
-                }
-                return result;
-            }
-
-            /// <summary>
-            /// Activates the hook by installing it in tlib.
-            /// </summary>
-            public void Activate()
-            {
-                if(IsActive)
-                {
-                    return;
-                }
-
-                cpu.TlibAddBreakpoint(address);
-                IsActive = true;
-                IsNew = false;
-            }
-
-            /// <summary>
-            /// Deactivates the hook by removing it from tlib.
-            /// </summary>
-            public void Deactivate()
-            {
-                if(!IsActive)
-                {
-                    return;
-                }
-
-                cpu.TlibRemoveBreakpoint(address);
-                IsActive = false;
-            }
-
-            public bool IsEmpty { get { return !callbacks.Any(); } }
-
-            public bool IsActive { get; private set; }
-
-            public bool IsNew { get; private set; }
-
-            private readonly ulong address;
-            private readonly TranslationCPU cpu;
-            private readonly HashSet<Action<ICpuSupportingGdb, ulong>> callbacks;
-        }
-
         [StructLayout(LayoutKind.Sequential, Pack = 1)]
         private struct HostMemoryBlock
         {
             public ulong Start;
             public ulong Size;
             public IntPtr HostPointer;
+        }
+
+        private struct TranslationCPUState
+        {
+            public TranslationCPUState(LogFunctionNamesState? logFunctionNamesState, bool isInterruptLoggingEnabled)
+            {
+                LogFunctionNamesState = logFunctionNamesState;
+                IsInterruptLoggingEnabled = isInterruptLoggingEnabled;
+            }
+
+            public LogFunctionNamesState? LogFunctionNamesState { get; private set; }
+
+            public bool IsInterruptLoggingEnabled { get; private set; }
+        }
+
+        private struct LogFunctionNamesState
+        {
+            public LogFunctionNamesState(string spaceSeparatedPrefixes, bool removeDuplicates, bool useFunctionSymbolsOnly)
+            {
+                this.SpaceSeparatedPrefixes = spaceSeparatedPrefixes;
+                this.RemoveDuplicates = removeDuplicates;
+                this.UseFunctionSymbolsOnly = useFunctionSymbolsOnly;
+            }
+
+            public string SpaceSeparatedPrefixes { get; private set; }
+
+            public bool RemoveDuplicates { get; private set; }
+
+            public bool UseFunctionSymbolsOnly { get; private set; }
         }
 
         private delegate void TranslationBlockFetchCallback(ulong pc);

@@ -455,6 +455,7 @@ namespace Antmicro.Renode.Peripherals.CAN
                     }
 
                     rv.TxBufferCancellationFinished.CancellationFinishedFlags[idx].Value = true;
+                    rv.InterruptRegister.InterruptFlags[(int)Interrupt.TransmissionCancellationFinished].Value = true;
                 }, name: "CRx")
                 .WithWriteCallback((oldVal, newVal) =>
                 {
@@ -463,10 +464,10 @@ namespace Antmicro.Renode.Peripherals.CAN
                 });
 
             registerMap[(long)Register.TxBufferTransmissionOccurred] = new DoubleWordRegister(this)
-                .WithFlags(0, 32, out rv.TxBufferTransmissionOccurred.TransmissionOccurredFlags, name: "TOx");
+                .WithFlags(0, 32, out rv.TxBufferTransmissionOccurred.TransmissionOccurredFlags, FieldMode.Read, name: "TOx");
 
             registerMap[(long)Register.TxBufferCancellationFinished] = new DoubleWordRegister(this)
-                .WithFlags(0, 32, out rv.TxBufferCancellationFinished.CancellationFinishedFlags, name: "CFx");
+                .WithFlags(0, 32, out rv.TxBufferCancellationFinished.CancellationFinishedFlags, FieldMode.Read, name: "CFx");
 
             registerMap[(long)Register.TxBufferTransmissionInterruptEnable] = new DoubleWordRegister(this)
                 .WithFlags(0, 32, out rv.TxBufferTransmissionInterruptEnable.TransmissionInterruptEnableFlags, name: "TIEx");
@@ -753,6 +754,7 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
 
             rv.TxBufferTransmissionOccurred.TransmissionOccurredFlags[i].Value = true;
+            rv.InterruptRegister.InterruptFlags[(int)Interrupt.TransmissionCompleted].Value = true;
         }
 
         private void HandleTxEvent(TxBufferElementHeader txHeader)
@@ -1306,22 +1308,6 @@ namespace Antmicro.Renode.Peripherals.CAN
         {
             var flag0 = false;
             var flag1 = false;
-
-            for(int i = 0; i < rv.TxBufferTransmissionInterruptEnable.TransmissionInterruptEnableFlags.Length; i++)
-            {
-                if(rv.TxBufferTransmissionInterruptEnable.TransmissionInterruptEnableFlags[i].Value && rv.TxBufferTransmissionOccurred.TransmissionOccurredFlags[i].Value)
-                {
-                    rv.InterruptRegister.InterruptFlags[(int)Interrupt.TransmissionCompleted].Value = true;
-                }
-            }
-
-            for(int i = 0; i < rv.TxBufferCancellationFinishedInterruptEnable.CancellationFinishedInterruptEnableFlags.Length; i++)
-            {
-                if(rv.TxBufferCancellationFinishedInterruptEnable.CancellationFinishedInterruptEnableFlags[i].Value && rv.TxBufferCancellationFinished.CancellationFinishedFlags[i].Value)
-                {
-                    rv.InterruptRegister.InterruptFlags[(int)Interrupt.TransmissionCancellationFinished].Value = true;
-                }
-            }
 
             for(int i = 0; i < rv.InterruptRegister.InterruptFlags.Length; i++)
             {

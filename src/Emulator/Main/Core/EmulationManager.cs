@@ -1,5 +1,6 @@
 //
 // Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -30,6 +31,8 @@ namespace Antmicro.Renode.Core
         static EmulationManager()
         {
             ExternalWorld = new ExternalWorldTimeDomain();
+            PreservableManager = new PreservableManager();
+
             RebuildInstance();
         }
 
@@ -37,9 +40,12 @@ namespace Antmicro.Renode.Core
         public static void RebuildInstance()
         {
             Instance = new EmulationManager();
+            PreservableManager.RegisterEvents();
         }
 
         public static ITimeDomain ExternalWorld { get; private set; }
+
+        public static PreservableManager PreservableManager { get; private set; }
 
         public static EmulationManager Instance { get; private set; }
 
@@ -100,13 +106,38 @@ namespace Antmicro.Renode.Core
             CompiledFilesCache.Enabled = value;
         }
 
-        public void Load(ReadFilePath path)
+        public void Load(ReadFilePath path, bool preserveState = false)
         {
-            using(var fstream = new FileStream(path, FileMode.Open, FileAccess.Read))
-            using(var stream = path.ToString().EndsWith(".gz", StringComparison.InvariantCulture)
-                                ? (Stream)new GZipStream(fstream, CompressionMode.Decompress)
-                                : (Stream)fstream)
+            FileStream fstream = null;
+            MemoryStream ms = null;
+            Stream stream = null;
+
+            try
             {
+                Dictionary<string, object> preservedStates = null;
+                if(preserveState)
+                {
+                    preservedStates = PreservableManager.ExtractPreservableStates();
+                }
+
+                fstream = new FileStream(path, FileMode.Open, FileAccess.Read);
+
+                if(path.ToString().EndsWith(".gz", StringComparison.InvariantCulture))
+                {
+                    // Migrant deserializer uses the .Position, which is not supported
+                    // by GZipStream. Decompress and copy the data to a MemoryStream.
+                    var gz = new GZipStream(fstream, CompressionMode.Decompress);
+                    ms = new MemoryStream();
+                    gz.CopyTo(ms);
+                    gz.Dispose();
+                    ms.Position = 0;
+                    stream = ms;
+                }
+                else
+                {
+                    stream = fstream;
+                }
+
                 EmulationEpoch++;
                 var deserializationResult = serializer.TryDeserialize<Emulation>(stream, out var emulation, out var metadata);
                 string metadataStringFromFile = null;
@@ -136,6 +167,19 @@ namespace Antmicro.Renode.Core
                 {
                     Logger.Log(LogLevel.Warning, "Version of deserialized emulation ({0}) does not match current one ({1}). Things may go awry!", metadataStringFromFile, MetadataString);
                 }
+
+                if(preserveState)
+                {
+                    if(!PreservableManager.LoadPreservedStates(preservedStates))
+                    {
+                        throw new RecoverableException("Unexpected state while loading preserved states. Things may go wrong!");
+                    }
+                }
+            }
+            finally
+            {
+                ms?.Dispose();
+                fstream?.Dispose();
             }
         }
 
@@ -216,6 +260,24 @@ namespace Antmicro.Renode.Core
             {
                 File.Delete(path);
                 throw;
+            }
+        }
+
+        public void LoadLatestSnapshot(bool autoStart = false)
+        {
+            var currentTimeStamp = CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
+            LoadLatestSnapshot(currentTimeStamp - TimeInterval.FromTicks(1), autoStart);
+        }
+
+        public void LoadLatestSnapshot(TimeInterval beforeOrAtTimestamp, bool autoStart = false)
+        {
+            var snapshotPath = CurrentEmulation.SnapshotTracker.GetLastSnapshotBeforeOrAtTimeStamp(beforeOrAtTimestamp);
+
+            Load(snapshotPath, preserveState: true);
+
+            if(autoStart)
+            {
+                CurrentEmulation.StartAll();
             }
         }
 

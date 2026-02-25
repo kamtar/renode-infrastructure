@@ -1,10 +1,11 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Text;
 using System.Threading;
 
 using Antmicro.Migrant;
@@ -38,6 +39,11 @@ namespace Antmicro.Renode.Analyzers
         {
         }
 
+        public override void Clear()
+        {
+            server.Send(Encoding.ASCII.GetBytes("\x1b[2J\x1b[H"));
+        }
+
         public void Dispose()
         {
             server.Dispose();
@@ -57,7 +63,7 @@ namespace Antmicro.Renode.Analyzers
             IMachine machine = UART.GetMachine();
             uartNumber = Interlocked.Increment(ref UartCount);
             server = new WebSocketSingleConnectionServer($"/telnet/{uartNumber}", true);
-            server.DataReceived += WriteToUart;
+            server.DataBlockReceived += WriteToUart;
             ioSource.ByteWritten += WriteToClient;
             server.Start();
         }
@@ -67,9 +73,12 @@ namespace Antmicro.Renode.Analyzers
             server.SendByte(b);
         }
 
-        private void WriteToUart(WebSocketConnection sender, int c)
+        private void WriteToUart(WebSocketConnection sender, byte[] bytes)
         {
-            ioSource.InvokeByteRead(c);
+            foreach(var b in bytes)
+            {
+                ioSource.InvokeByteRead(b);
+            }
         }
 
         private int uartNumber;

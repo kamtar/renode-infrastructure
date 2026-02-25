@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -26,8 +26,8 @@ namespace Antmicro.Renode.Peripherals.Video
                 throw new RecoverableException("Frame buffer is empty.");
             }
 
-            var converter = PixelManipulationTools.GetConverter(Format, Endianess, RawImageData.PixelFormat, ELFSharp.ELF.Endianess.BigEndian);
-            var outBuffer = new byte[Width * Height * RawImageData.PixelFormat.GetColorDepth()];
+            var converter = PixelManipulationTools.GetConverter(Format, Endianess, RawImageData.PixelFormat, ELFSharp.ELF.Endianess.BigEndian, Width, Height);
+            var outBuffer = new byte[RawImageData.PixelFormat.GetByteCount((ulong)(Width * Height))];
             converter.Convert(buffer, ref outBuffer);
 
             return new RawImageData(outBuffer, Width, Height);
@@ -140,7 +140,7 @@ namespace Antmicro.Renode.Peripherals.Video
 
                 if(flag && Width > 0 && Height > 0)
                 {
-                    buffer = new byte[Width * Height * Format.GetColorDepth()];
+                    buffer = new byte[Format.GetByteCount((ulong)(Width * Height))];
 
                     var cc = configurationChanged;
                     if(cc != null)

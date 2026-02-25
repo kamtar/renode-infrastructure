@@ -111,13 +111,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 return false;
             }
-            var cortexMStateObj = new ContextState
-            {
-                Privileged = (state & 1u) == 1u,
-                CpuSecure = (state & 2u) == 2u,
-                AttributionSecure = (state & 4u) == 4u
-            };
-            stateObj = cortexMStateObj;
+            stateObj = (ContextState)state.Value;
             return true;
         }
 
@@ -181,10 +175,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 return false;
             }
-            state = 0u;
-            state |= (cortexMStateObj.Privileged ? 1u : 0) & 1u;
-            state |= (cortexMStateObj.CpuSecure ? 2u : 0) & 2u;
-            state |= (cortexMStateObj.AttributionSecure ? 4u : 0) & 4u;
+            state = cortexMStateObj;
             return true;
         }
 
@@ -220,6 +211,25 @@ namespace Antmicro.Renode.Peripherals.CPU
                 mSystemFeature.Registers.Add(new GDBRegisterDescriptor(30, 32, "faultmask", "uint32", "general"));
                 mSystemFeature.Registers.Add(new GDBRegisterDescriptor(31, 32, "control", "uint32", "general"));
                 features.Add(mSystemFeature);
+
+                bool hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
+                if(hasMProfileVectorExtensions)
+                {
+                    var mveProfileFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-profile-mve");
+                    var vprFields = new List<GDBTypeBitField>{
+                        // ARMv8.1-M and MVE: Unprivileged and privileged Access.
+                        new GDBTypeBitField("P0", 0, 15, "uint16"),
+                        // ARMv8.1-M: Privileged Access only.
+                        new GDBTypeBitField("MASK01", 16, 19, "uint8"),
+                        // ARMv8.1-M: Privileged Access only.
+                        new GDBTypeBitField("MASK23", 20, 23, "uint8")
+                    };
+                    var vprRegType = GDBCustomType.Flags("vpr_reg", 4, vprFields);
+                    mveProfileFeature.Types.Add(vprRegType);
+                    // MVE vector predication status and control register (VPR)
+                    mveProfileFeature.Registers.Add(new GDBRegisterDescriptor(117, 32, "vpr", "vpr_reg", "vector"));
+                    features.Add(mveProfileFeature);
+                }
 
                 // +++++ Important
                 // tlibs implement VFP using DOUBLE PRECISION FP (64 bit) registers.
@@ -524,7 +534,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             set
             {
                 vtorInitialized = true;
-                if(!machine.SystemBus.IsMemory(value, this))
+                if(!machine.SystemBus.IsMemory(value, this, secureState))
                 {
                     this.Log(LogLevel.Warning, "Tried to set VTOR address at 0x{0:X} which does not lay in memory. Aborted.", value);
                     return;
@@ -553,7 +563,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     throw new RecoverableException("You need to enable TrustZone to use VTOR_NS");
                 }
                 vtorInitialized = true;
-                if(machine.SystemBus.FindMemory(value, this) == null)
+                if(!machine.SystemBus.IsMemory(value, this))
                 {
                     this.Log(LogLevel.Warning, "Tried to set VTOR_NS address at 0x{0:X} which does not lay in memory. Aborted.", value);
                     return;
@@ -937,9 +947,9 @@ namespace Antmicro.Renode.Peripherals.CPU
                 // stack pointer and program counter are being sent according
                 // to VTOR (vector table offset register)
                 var sysbus = machine.SystemBus;
-                var pc = sysbus.ReadDoubleWord(VectorTableOffset + 4, this);
-                var sp = sysbus.ReadDoubleWord(VectorTableOffset, this);
-                if(!sysbus.IsMemory(pc, this) || (pc == 0 && sp == 0))
+                var pc = sysbus.ReadDoubleWordWithState(VectorTableOffset + 4, this, secureState);
+                var sp = sysbus.ReadDoubleWordWithState(VectorTableOffset, this, secureState);
+                if(!sysbus.IsMemory(pc, this, secureState) || (pc == 0 && sp == 0))
                 {
                     this.Log(LogLevel.Error, "PC does not lay in memory or PC and SP are equal to zero. CPU was halted.");
                     IsHalted = true;
@@ -1174,6 +1184,25 @@ namespace Antmicro.Renode.Peripherals.CPU
             public bool Privileged;
             public bool CpuSecure;
             public bool AttributionSecure;
+
+            public static implicit operator ulong(ContextState stateObj)
+            {
+                var state = 0u;
+                state |= (stateObj.Privileged ? 1u : 0) & 1u;
+                state |= (stateObj.CpuSecure ? 2u : 0) & 2u;
+                state |= (stateObj.AttributionSecure ? 4u : 0) & 4u;
+                return state;
+            }
+
+            public static implicit operator ContextState(ulong state)
+            {
+                return new ContextState
+                {
+                    Privileged = (state & 1u) == 1u,
+                    CpuSecure = (state & 2u) == 2u,
+                    AttributionSecure = (state & 4u) == 4u,
+                };
+            }
         }
 
         public struct IDAURegion
@@ -1256,6 +1285,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             public int AccessType;
             public int AccessWidth;
         }
+
+        private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
 
         private static readonly IReadOnlyDictionary<string, int> stateBits = new Dictionary<string, int>
         {

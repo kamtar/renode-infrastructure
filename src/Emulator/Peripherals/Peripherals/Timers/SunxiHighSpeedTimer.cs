@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -18,7 +18,7 @@ namespace Antmicro.Renode.Peripherals.Timers
 {
     public sealed class SunxiHighSpeedTimer : IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
     {
-        public SunxiHighSpeedTimer(IMachine machine, long frequency)
+        public SunxiHighSpeedTimer(IMachine machine, ulong frequency)
         {
             irqEnableRegister = new DoubleWordRegister(this);
             irqStatusRegister = new DoubleWordRegister(this);
@@ -170,7 +170,7 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private sealed class SunxiHighSpeedTimerUnit : LimitTimer
         {
-            public SunxiHighSpeedTimerUnit(IMachine machine, long frequency) : base(machine.ClockSource, frequency, direction: Direction.Descending, enabled: false)
+            public SunxiHighSpeedTimerUnit(IMachine machine, ulong frequency) : base(machine.ClockSource, frequency, direction: Direction.Descending, enabled: false)
             {
                 controlRegister = new DoubleWordRegister(this);
                 controlRegister.DefineFlagField(7, changeCallback: OnModeChange, name: "MODE");
@@ -255,13 +255,6 @@ namespace Antmicro.Renode.Peripherals.Timers
                 }
             }
 
-            // THIS IS A WORKAROUND FOR A BUG IN MONO
-            // https://bugzilla.xamarin.com/show_bug.cgi?id=39444
-            protected override void OnLimitReached()
-            {
-                base.OnLimitReached();
-            }
-
             private void OnModeChange(bool oldValue, bool newValue)
             {
                 Mode = newValue ? WorkMode.OneShot : WorkMode.Periodic;
@@ -271,7 +264,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 if(newValue < 4)
                 {
-                    Divider = 1 << (int)newValue;
+                    Divider = 1UL << (int)newValue;
                 }
                 else
                 {

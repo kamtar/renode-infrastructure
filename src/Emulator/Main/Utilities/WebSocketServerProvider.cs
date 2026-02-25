@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -91,7 +92,7 @@ namespace Antmicro.Renode.Utilities
             }
         }
 
-        public void NewConnectionEventHandler(WebSocket webSocket, List<string> extraSegments)
+        public void NewConnectionEventHandler(HttpListenerContext listenerContext, WebSocket webSocket, List<string> extraSegments)
         {
             if(!allowMultipleConnections && connections.Count != 0)
             {
@@ -99,24 +100,18 @@ namespace Antmicro.Renode.Utilities
                 currentConnection.Dispose();
             }
 
-            var newConnection = new WebSocketConnection(webSocket, connectionsSharedData);
+            var newConnection = new WebSocketConnection(listenerContext, webSocket, connectionsSharedData);
             connections.Add(newConnection);
             NewConnection?.Invoke(newConnection, extraSegments);
         }
 
         public int ConnectionsCount => connections.Count;
 
-        public bool IsAnythingReceiving => connectionsSharedData.DataReceived != null && connectionsSharedData.DataBlockReceived != null;
+        public bool IsAnythingReceiving => connectionsSharedData.DataBlockReceived != null;
 
         public IReadOnlyList<WebSocketConnection> Connections => connections;
 
         public event Action<WebSocketConnection, List<string>> NewConnection;
-
-        public event Action<WebSocketConnection, int> DataReceived
-        {
-            add => connectionsSharedData.DataReceived += value;
-            remove => connectionsSharedData.DataReceived -= value;
-        }
 
         public event Action<WebSocketConnection, byte[]> DataBlockReceived
         {
@@ -201,7 +196,6 @@ namespace Antmicro.Renode.Utilities
 
     public class WebSocketConnectionSharedData
     {
-        public Action<WebSocketConnection, int> DataReceived;
         public Action<WebSocketConnection, byte[]> DataBlockReceived;
         public Action<WebSocketConnection> Disconnected;
         public string Endpoint;
@@ -209,10 +203,12 @@ namespace Antmicro.Renode.Utilities
 
     public class WebSocketConnection : IDisposable
     {
-        public WebSocketConnection(WebSocket socket, WebSocketConnectionSharedData sharedData)
+        public WebSocketConnection(HttpListenerContext listenerContext, WebSocket socket, WebSocketConnectionSharedData sharedData)
         {
+            this.listenerContext = listenerContext;
             this.webSocket = socket;
             this.sharedData = sharedData;
+            this.DataBlockReceived += (data) => sharedData.DataBlockReceived?.Invoke(this, data);
             BufferSize = 4096;
             cancellationToken = new CancellationTokenSource();
             cancellationToken.Token.Register(() => this.sharedData.Disconnected?.Invoke(this));
@@ -229,6 +225,7 @@ namespace Antmicro.Renode.Utilities
                 if(webSocket.State == WebSocketState.Open)
                 {
                     webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", cancellationToken.Token).GetAwaiter().GetResult();
+                    CloseSocket();
                 }
             }
             catch(Exception)
@@ -258,6 +255,8 @@ namespace Antmicro.Renode.Utilities
         }
 
         public int BufferSize { get; private set; }
+
+        public event Action<byte[]> DataBlockReceived;
 
         private async Task AsyncReader()
         {
@@ -306,22 +305,15 @@ namespace Antmicro.Renode.Utilities
                 }
 
                 var fixedBuffer = buffer.Take(totalBytes).ToArray();
-                sharedData.DataBlockReceived?.Invoke(this, fixedBuffer);
-
-                var dataReceived = sharedData.DataReceived;
-                if(dataReceived != null)
-                {
-                    foreach(var b in fixedBuffer)
-                    {
-                        dataReceived(this, (int)b);
-                    }
-                }
+                DataBlockReceived.Invoke(fixedBuffer);
             }
 
             if(!cancellationToken.IsCancellationRequested)
             {
                 cancellationToken.Cancel();
             }
+
+            CloseSocket();
 
             Logger.Log(LogLevel.Debug, $"WebSocket: End of reader task for endpoint {sharedData.Endpoint}");
         }
@@ -359,8 +351,17 @@ namespace Antmicro.Renode.Utilities
             Logger.Log(LogLevel.Debug, $"WebSocket: End of writer task for endpoint {sharedData.Endpoint}");
         }
 
+        private void CloseSocket()
+        {
+            // HACK - calling .CloseAsync() on websocket closes only websocket (Application layer) and leaves
+            // socket (Transport layer) in half open state. To fix that we need to .Close() the httpListenerContext
+            // and completly close the connection
+            listenerContext.Response.Close();
+        }
+
         private readonly CancellationTokenSource cancellationToken;
         private readonly WebSocket webSocket;
+        private readonly HttpListenerContext listenerContext;
         private readonly Task readerTask;
         private readonly Task writerTask;
 

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -20,13 +20,12 @@ namespace Antmicro.Renode.Peripherals.Timers
 {
     // This class does not implement advanced-control timers interrupts
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class STM32_Timer : LimitTimer, IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput, IPeripheralRegister<IGPIOReceiver, NumberRegistrationPoint<int>>, IPeripheralRegister<IGPIOReceiver, NullRegistrationPoint>
+    public class STM32_Timer : LimitTimer, IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput, IRegisterablePeripheral<IGPIOReceiver, NumberRegistrationPoint<int>>, IRegisterablePeripheral<IGPIOReceiver, NullRegistrationPoint>, IGPIOReceiver
     {
-        public STM32_Timer(IMachine machine, long frequency, uint initialLimit) : base(machine.ClockSource, frequency, limit: initialLimit, direction: Direction.Ascending, enabled: false, autoUpdate: false)
+        public STM32_Timer(IMachine machine, ulong frequency, uint initialLimit) : base(machine.ClockSource, frequency, limit: initialLimit, direction: Direction.Ascending, enabled: false, eventEnabled: true, autoUpdate: false)
         {
             this.machine = machine;
             sysbus = machine.GetSystemBus(this);
-            IRQ = new GPIO();
             connections = Enumerable.Range(0, NumberOfCCChannels).ToDictionary(i => i, _ => (IGPIO)new GPIO());
             this.initialLimit = initialLimit;
             // If initialLimit is 0, throw an error - this is an invalid state for us, since we would not be able to infer the counter's width
@@ -48,6 +47,12 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                     return;
                 }
+
+                if(Mode == WorkMode.OneShot)
+                {
+                    enableRequested = false;
+                }
+
                 Limit = autoReloadValue;
 
                 for(var i = 0; i < NumberOfCCChannels; ++i)
@@ -340,7 +345,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     })
                 },
                 {(long)Registers.Prescaler, new DoubleWordRegister(this)
-                    .WithValueField(0, 16, writeCallback: (_, val) => Divider = (int)val + 1, valueProviderCallback: _ => (uint)Divider - 1, name: "Prescaler value (PSC)")
+                    .WithValueField(0, 16, writeCallback: (_, val) => Divider = val + 1, valueProviderCallback: _ => (uint)Divider - 1, name: "Prescaler value (PSC)")
                     .WithReservedBits(16, 16)
                     .WithWriteCallback((_, __) =>
                     {
@@ -400,8 +405,6 @@ namespace Antmicro.Renode.Peripherals.Timers
 
             registers = new DoubleWordRegisterCollection(this, registersMap);
             Reset();
-
-            EventEnabled = true;
         }
 
         public void Register(IGPIOReceiver peripheral, NumberRegistrationPoint<int> registrationPoint)
@@ -429,6 +432,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             registers.Write(offset, value);
         }
 
+        public void OnGPIO(int number, bool value)
+        {
+            if(value && (number == ResetPin))
+            {
+                Reset();
+            }
+        }
+
         public override void Reset()
         {
             base.Reset();
@@ -449,7 +460,18 @@ namespace Antmicro.Renode.Peripherals.Timers
             UpdateInterrupts();
         }
 
-        public GPIO IRQ { get; private set; }
+        [DefaultInterrupt]
+        public GPIO IRQ { get; } = new GPIO();
+
+        public GPIO BreakInterrupt { get; } = new GPIO();
+
+        public GPIO UpdateInterrupt { get; } = new GPIO();
+
+        public GPIO TriggerInterrupt { get; } = new GPIO();
+
+        public GPIO CommutationInterrupt { get; } = new GPIO();
+
+        public GPIO CaptureCompareInterrupt { get; } = new GPIO();
 
         public IReadOnlyDictionary<int, IGPIO> Connections => connections;
 
@@ -531,14 +553,20 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private void UpdateInterrupts()
         {
-            var value = false;
-            value |= updateInterruptFlag & updateInterruptEnable.Value;
+            var ccIrq = false;
             for(var i = 0; i < NumberOfCCChannels; ++i)
             {
-                value |= ccInterruptFlag[i] & ccInterruptEnable[i];
+                ccIrq |= ccInterruptFlag[i] & ccInterruptEnable[i];
             }
 
-            IRQ.Set(value);
+            var updateIrq = updateInterruptFlag & updateInterruptEnable.Value;
+
+            IRQ.Set(ccIrq || updateIrq);
+            BreakInterrupt.Set(false);
+            UpdateInterrupt.Set(updateIrq);
+            TriggerInterrupt.Set(false);
+            CommutationInterrupt.Set(false);
+            CaptureCompareInterrupt.Set(ccIrq);
         }
 
         private uint autoReloadValue;
@@ -565,6 +593,10 @@ namespace Antmicro.Renode.Peripherals.Timers
         private readonly Dictionary<int, IGPIO> connections;
 
         private const int NumberOfCCChannels = 4;
+
+        // Does not resemble an actual pin, just serves the purpose
+        // of passing a Reset() request
+        private const int ResetPin = 0xFF;
 
         private enum CenterAlignedMode
         {

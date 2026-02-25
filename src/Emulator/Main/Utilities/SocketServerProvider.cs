@@ -88,11 +88,20 @@ namespace Antmicro.Renode.Utilities
             Send(bytes.ToArray());
         }
 
+        public void ClearConnectionEvents()
+        {
+            ConnectionAccepted = null;
+            ConnectionClosed = null;
+            DataReceived = null;
+        }
+
         public int BufferSize { get; set; } = 1;
 
         public bool IsAnythingReceiving => DataReceived != null && DataBlockReceived != null;
 
         public int? Port => (server?.LocalEndPoint as IPEndPoint)?.Port;
+
+        public bool IsStarted => server?.IsBound ?? false;
 
         public event Action ConnectionClosed;
 

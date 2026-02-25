@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -18,7 +18,7 @@ using AntShell.Terminal;
 
 namespace Antmicro.Renode.UI
 {
-    public class ConsoleWindowBackendAnalyzer : IAnalyzableBackendAnalyzer<UARTBackend>, IDisposable
+    public class ConsoleWindowBackendAnalyzer : IAnalyzableBackendAnalyzer<UARTBackend>, IDisposable, IDisconnectableState
     {
         // Default constructor is required for the showAnalyzer command.
         public ConsoleWindowBackendAnalyzer() : this(false)
@@ -29,10 +29,12 @@ namespace Antmicro.Renode.UI
         {
             IO = new IOProvider();
             this.isMonitorWindow = isMonitorWindow;
+            EmulationManager.PreservableManager.RegisterPreservable(this, livesThroughEmulationChange: true);
         }
 
         public void Dispose()
         {
+            EmulationManager.PreservableManager.UnregisterPreservable(this);
             if(provider is IDisposable disposableProvider)
             {
                 disposableProvider.Dispose();
@@ -45,6 +47,10 @@ namespace Antmicro.Renode.UI
             if(EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementName(backend.UART, out var uartName))
             {
                 Name = uartName;
+            }
+            if(IO.IsBackendSet)
+            {
+                ((UARTBackend)Backend).BindAnalyzer(IO);
             }
         }
 
@@ -94,6 +100,19 @@ namespace Antmicro.Renode.UI
             }
             p.Close();
             provider = null;
+        }
+
+        public void Clear()
+        {
+            provider.Clear();
+        }
+
+        public void DisconnectState()
+        {
+            if(Backend != null && IO != null)
+            {
+                (Backend as UARTBackend).UnbindAnalyzer(IO);
+            }
         }
 
         public string Name { get; private set; }

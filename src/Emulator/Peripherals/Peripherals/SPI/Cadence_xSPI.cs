@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -19,7 +19,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    public class Cadence_xSPI : SimpleContainer<ISPIPeripheral>, IDoubleWordPeripheral, IKnownSize
+    public partial class Cadence_xSPI : SimpleContainer<ISPIPeripheral>, IDoubleWordPeripheral, IKnownSize
     {
         public Cadence_xSPI(IMachine machine) : base(machine)
         {
@@ -128,9 +128,14 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 commandIgnored.SetSticky(true);
             }
-            else if(previousCommand != null && previousCommand.ChipSelect != currentCommand.ChipSelect && !previousCommand.TransmissionFinished)
+            else if(previousCommand != null && !previousCommand.TransmissionFinished && previousCommand.ChipSelect != currentCommand.ChipSelect)
             {
                 this.Log(LogLevel.Error, "Triggering command with chip select different than previous one, when the previous transaction isn't finished.");
+                previousCommand.FinishTransmission();
+            }
+            else if(previousCommand != null && !previousCommand.TransmissionFinished && previousCommand.Mode != currentCommand.Mode)
+            {
+                this.Log(LogLevel.Error, "Finishing transmission due to mode change: {0} -> {1}", previousCommand.Mode, currentCommand.Mode);
                 previousCommand.FinishTransmission();
             }
 
@@ -229,8 +234,14 @@ namespace Antmicro.Renode.Peripherals.SPI
                         writeCallback: (_, val) => commandPayload[5] = (uint)val
                     )
                 },
+                {(long)Registers.CommandStatusPointer, new DoubleWordRegister(this)
+                    .WithReservedBits(3,29)
+                    .WithTag("threadSelect", 0, 3)
+                },
                 {(long)Registers.CommandStatus, new DoubleWordRegister(this)
-                    .WithReservedBits(16, 16)
+                    .WithValueField(16,16, name: "dataFromDev",
+                        valueProviderCallback: _ => (currentCommand as DataSequenceCommand)?.ShortOutput ?? 0
+                    )
                     .WithFlag(15, FieldMode.Read, name: "commandCompleted",
                         valueProviderCallback: _ => currentCommand?.Completed ?? false
                     )
@@ -353,12 +364,169 @@ namespace Antmicro.Renode.Peripherals.SPI
                         valueProviderCallback: _ => (currentCommand as IDMACommand)?.DMADataCount ?? 0
                     )
                 },
+                {(long)Registers.SequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithValueField(0, 4, out pageSizeRead,  name: "PSIZ_RD")
+                    .WithValueField(4, 4, out pageSizeProgram, name: "PSIZ_PGM")
+                    .WithTaggedFlag("CRC_EN", 8)
+                    .WithTaggedFlag("CRC_VAR", 9)
+                    .WithTaggedFlag("CRC_OE", 10)
+                    .WithReservedBits(11, 1)
+                    .WithTag("CHUNK_SIZ", 12, 3)
+                    .WithReservedBits(15, 1)
+                    .WithTaggedFlag("UAL_CHUNK_EN", 16)
+                    .WithTaggedFlag("UAL_CHUNK_CHK", 17)
+                    .WithTaggedFlag("TCMS_EN", 18)
+                    .WithFlag(20, out dataSwap888, name: "DAT_SWAP")
+                    .WithValueField(21, 1, FieldMode.Read, valueProviderCallback: (_) => 0,  name: "DAT_PER_ADDR") // 0 for xspi profile 1
+                    .WithReservedBits(22, 1)
+                    .WithValueField(23, 2, FieldMode.Read, valueProviderCallback: (_) => 0,  name: "TYP") // 0 for xspi profile 1
+                    .WithReservedBits(25,7)
+                },
+                {(long)Registers.ResetSequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithValueField(0, 8, out resetCmd0, name: "CMD0_VALUE")
+                    .WithValueField(8, 8, out resetCmd1, name: "CMD1_VALUE")
+                    .WithFlag(16, out resetCmd0Enabled, name: "CMD0_EN")
+                    .WithReservedBits(17, 1)
+                    .WithTag("DAT_IOS", 18,2)
+                    .WithReservedBits(20, 1)
+                    .WithTaggedFlag("DAT_EDGE", 21)
+                    .WithFlag(22, out resetCmd1ConfirmationEnabled, name: "DAT_EN")
+                    .WithReservedBits(23, 1)
+                    .WithTag("CMD_IOS", 24,2)
+                    .WithReservedBits(26, 2)
+                    .WithTaggedFlag("CMD_EDGE", 28)
+                    .WithReservedBits(29, 3)
+                },
+                {(long)Registers.ResetSequenceConfiguration1, new DoubleWordRegister(this)
+                    .WithTaggedFlag("P1_CMD0_EXT_EN", 0)
+                    .WithTaggedFlag("P1_CMD1_EXT_EN", 1)
+                    .WithReservedBits(2, 6)
+                    .WithTag("P1_CMD0_EXT_VALUE", 8, 8)
+                    .WithTag("P1_CMD1_EXT_VALUE", 16, 8)
+                    .WithValueField(24, 8, out resetCmd1Confirmation, name: "P1_DAT_VALUE")
+                },
+                {(long)Registers.EraseSequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithValueField(0, 8, out eraseCmd, name: "CMD_VALUE")
+                    .WithTag("CMD_IOS", 8, 2)
+                    .WithReservedBits(10, 1)
+                    .WithTaggedFlag("CMD_EDGE", 11)
+                    .WithValueField(12,3, out eraseAddrCount, name:"ADDR_CNT")
+                    .WithTaggedFlag("CMD_EXT_EN", 15)
+                    .WithTag("CMD_EXT_VALUE", 16, 8)
+                    .WithTag("ADDR_IOS", 24, 2)
+                    .WithReservedBits(26, 2)
+                    .WithTaggedFlag("ADDR_EDGE", 28)
+                    .WithReservedBits(29, 3)
+                    },
+                {(long)Registers.EraseSequenceConfiguration1, new DoubleWordRegister(this)
+                    .WithValueField(0, 5, out sectorSize, name: "P1_SECT_SIZ_VALUE")
+                    .WithReservedBits(5, 27)
+                },
+                {(long)Registers.EraseSequenceConfiguration2, new DoubleWordRegister(this)
+                    .WithValueField(0,8, out eraseAllCmd, name:"ERSA_P1_CMD_VALUE")
+                    .WithValueField(8, 2, out eraseAllCmdIOS, name: "ERSA_P1_CMD_IOS")
+                    .WithReservedBits(10, 1)
+                    .WithFlag(11, out eraseAllCmdEdge, name: "ERSA_P1_CMD_EDGE")
+                    .WithReservedBits(12, 3)
+                    .WithFlag(15, name: "ERSA_P1_CMD_EXT_EN")
+                    .WithValueField( 16, 8, name: "ERSA_P1_CMD_EXT_VALUE")
+                    .WithReservedBits(24, 8)
+                },
+                {(long)Registers.ProgramSequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithValueField(0, 8, out programCmd, name: "P1_CMD_VALUE")
+                    .WithValueField(8, 2, out programCmdIOS, name: "P1_CMD_IOS")
+                    .WithReservedBits(10, 1)
+                    .WithFlag(11, out programCmdEdge,  name: "P1_CMD_EDGE")
+                    .WithValueField(12, 3, out programAddressCount,  name: "P1_ADDR_CNT")
+                    .WithReservedBits(15, 1)
+                    .WithValueField(16, 2, out programAddressIOS, name: "P1_ADDR_IOS")
+                    .WithReservedBits(18, 1)
+                    .WithFlag(19,  out programAddressEdge, name: "P1_ADDR_EDGE")
+                    .WithValueField(20, 2, out programDataIOS, name: "P1_DAT_IOS")
+                    .WithReservedBits(22, 1)
+                    .WithFlag(23, out programDataEdge, name: "P1_DAT_EDGE")
+                    .WithValueField(24, 6, out programDummyCount, name: "P1_DMY_CNT")
+                    .WithReservedBits(30, 2)
+                    },
+                {(long)Registers.ProgramSequenceConfiguration1, new DoubleWordRegister(this)
+                    .WithTaggedFlag("P1_CMD_EXT_EN", 0)
+                    .WithTag("P1_CMD_EXT_VALUE", 8, 8)
+                    .WithReservedBits(16, 16)
+                },
+                {(long)Registers.ReadSequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithValueField(0, 8, out readCmd, name: "P1_CMD_VALUE")
+                    .WithValueField(8,2, out readCmdIOS, name:"P1_CMD_IOS")
+                    .WithReservedBits(10, 1)
+                    .WithFlag(11, out readCmdEdge, name: "P1_CMD_EDGE")
+                    .WithValueField(12, 3, out readAddressCount, name: "P1_ADDR_CNT")
+                    .WithReservedBits(15, 1)
+                    .WithValueField(16,2, out readAddressIOS, name: "P1_ADDR_IOS")
+                    .WithReservedBits(18, 1)
+                    .WithFlag(19, out readAddressEdge, name: "P1_ADDR_EDGE")
+                    .WithValueField(20,2, out readDataIOS, name:"P1_DAT_IOS")
+                    .WithReservedBits(22, 1)
+                    .WithFlag(23, out readDataEdge, name: "P1_DAT_EDGE")
+                    .WithValueField(24, 6, out readDummyCount, name: "P1_DMY_CNT")
+                    .WithReservedBits(30, 2)
+                },
+                {(long)Registers.ReadSequenceConfiguration1, new DoubleWordRegister(this)
+                    .WithTaggedFlag("P1_CMD_EXT_EN", 0)
+                    .WithReservedBits(1, 3)
+                    .WithTaggedFlag("P1_CACHE_RANDOM_READ_EN", 4)
+                    .WithReservedBits(5,3)
+                    .WithTag("P1_CMD_EXT_VALUE", 8, 8)
+                    .WithReservedBits(16,8)
+                    .WithTag("P1_MB_DMY_CNT", 24, 6)
+                    .WithReservedBits(30,1)
+                    .WithTaggedFlag("P1_MB_EN", 31)
+                },
+                {(long)Registers.WriteEnableSequenceConfiguration, new DoubleWordRegister(this)
+                    .WithValueField(0, 8, out weCmd,name: "P1_CMD_VALUE")
+                    .WithTag("P1_CMD_IOS", 8, 2)
+                    .WithReservedBits(10,1)
+                    .WithTaggedFlag("P1_CMD_EDGE", 11)
+                    .WithReservedBits(12,3)
+                    .WithTaggedFlag("P1_CMD_EXT_EN", 15)
+                    .WithTag("P1_CMD_EXT_VALUE", 16, 8)
+                    .WithFlag(24, out weCmdEnabled ,name: "P1_EN")
+                    .WithReservedBits(25,7)
+                },
+                {(long)Registers.StatusSequenceConfiguration0, new DoubleWordRegister(this)
+                    .WithTag("P1_CMD_IOS", 0, 2)
+                    .WithReservedBits(2,2)
+                    .WithTaggedFlag("P1_CMD_EDGE", 4)
+                    .WithTaggedFlag("P1_CMD_EXT_EN", 5)
+                    .WithReservedBits(6,2)
+                    .WithTag("P1_ADDR_CNT", 8, 2)
+                    .WithTag("P1_ADDR_IOS", 10, 2)
+                    .WithTaggedFlag("P1_ADDR_EDGE", 12)
+                    .WithReservedBits(13,7)
+                    .WithTag("P1_DAT_IOS", 20, 2)
+                    .WithTaggedFlag("P1_DAT_EDGE", 22)
+                    .WithReservedBits(23,9)
+                },
                 {(long)Registers.DMAStatus, new DoubleWordRegister(this)
                     .WithReservedBits(9, 23)
                     .WithEnumField<DoubleWordRegister, TransmissionDirection>(8, 1, FieldMode.Read, name: "DMADirection",
                         valueProviderCallback: _ => (currentCommand as IDMACommand)?.DMADirection ?? default(TransmissionDirection)
                     )
                     .WithReservedBits(0, 8)
+                },
+                {(long)Registers.DiscoveryControl, new DoubleWordRegister(this, resetValue: 0x00000000)
+                    .WithFlag(0, writeCallback: (_,__) => ExecuteDiscovery(), name: "REQ")
+                    .WithFlag(1, out fullDiscovery, name: "REQ_TYP")
+                    .WithFlag(2, out discoveryPassed, name:"PASS")
+                    .WithValueField(3,2, out resultOfLastDiscovery, name: "FAIL")
+                    .WithTaggedFlag("INHIBIT",5)
+                    .WithTaggedFlag("OE_VAL",6)
+                    .WithTaggedFlag("OE_EN",7)
+                    .WithTag("CMD_TYP",8,2)
+                    .WithFlag(10, out discoveryDummyCount, name: "DMY_CNT")
+                    .WithFlag(11, out discoveryABNUM, name: "ABNUM")
+                    .WithValueField(12,3, out discoveryNumberOfLines ,name: "NUM_LINES")
+                    .WithReservedBits(15, 1)
+                    .WithValueField(16,3, out discoveryBnk,name: "BNK")
+                    .WithReservedBits(19,13)
                 },
                 {(long)Registers.ControllerVersion, new DoubleWordRegister(this)
                     .WithValueField(0, 8, FieldMode.Read, name: "hardwareRevision",
@@ -464,16 +632,54 @@ namespace Antmicro.Renode.Peripherals.SPI
             Command5 = 0x0014,
             CommandStatusPointer = 0x0040,
             CommandStatus = 0x0044,
-            ControllerStatus = 0x0100,
-            AutoCommandStatus = 0x0104,
+            ControllerStatus = 0x0100, // GSTAT (General Controller Status)
+            AutoCommandStatus = 0x0104, // Auto Command Engine Thread Status Register
             InterruptStatus = 0x0110,
             InterruptEnable = 0x0114,
             AutoCommandCompleteInterruptStatus = 0x0120,
             AutoCommandErrorInterruptStatus = 0x0130,
             AutoCommandErrorInterruptEnable = 0x0134,
-            ControllerConfig = 0x0230,
+            DMAErrorAddressLow = 0x0150,
+            DMAErrorAddressHigh = 0x0154,
+            BootStatus = 0x0158,
+            LongPollingCount = 0x0208,
+            ShortPollingCount = 0x0208,
+            ControllerConfig = 0x0230, // Device Control Register
+            DMAInterfaceControl = 0x023C,
             DMASize = 0x0240,
             DMAStatus = 0x0244,
+            DMABufferAddress0 = 0x024C,
+            DMABufferAddress1 = 0x0250,
+            DiscoveryControl = 0x0260,
+            XIPConfiguration = 0x0388,
+            SequenceConfiguration0 = 0x0390,
+            SequenceConfiguration1 = 0x0394,
+            DACConfiguration = 0x0398,
+            DACAddressRemapping0 = 0x039C,
+            DACAddressRemapping1 = 0x03A0,
+            ResetSequenceConfiguration0 = 0x0400,
+            ResetSequenceConfiguration1 = 0x0404,
+            EraseSequenceConfiguration0 = 0x0410,
+            EraseSequenceConfiguration1 = 0x0414,
+            EraseSequenceConfiguration2 = 0x0418,
+            ProgramSequenceConfiguration0 = 0x0420,
+            ProgramSequenceConfiguration1 = 0x0424,
+            ProgramSequenceConfiguration2 = 0x0428,
+            ReadSequenceConfiguration0 = 0x430,
+            ReadSequenceConfiguration1 = 0x434,
+            ReadSequenceConfiguration2 = 0x438,
+            WriteEnableSequenceConfiguration = 0x440,
+            StatusSequenceConfiguration0 = 0x450,
+            StatusSequenceConfiguration1 = 0x454,
+            StatusSequenceConfiguration2 = 0x458,
+            StatusSequenceConfiguration3 = 0x45C,
+            StatusSequenceConfiguration4 = 0x460,
+            StatusSequenceConfiguration5 = 0x464,
+            StatusSequenceConfiguration6 = 0x468,
+            StatusSequenceConfiguration7 = 0x46C,
+            StatusSequenceConfiguration8 = 0x470,
+            StatusSequenceConfiguration9 = 0x474,
+            StatusSequenceConfiguration10 = 0x478,
             ControllerVersion = 0x0f00,
             ControllerFeatures = 0x0f04,
             DLLControl = 0x1034,

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -20,9 +20,11 @@ using static Antmicro.Renode.Utilities.BitHelper;
 
 namespace Antmicro.Renode.Peripherals.SD
 {
-    // Features NOT supported:
-    // * Toggling selected state
-    // * RCA (relative card address) filtering
+    // Only Spec v1.01 is supported.
+    // Spec v1.01 features NOT supported:
+    // * The following commands: CMD4, CMD15, CMD27, CMD32, CMD33, CMD38, CMD56, ACMD6, ACMD22, ACMD23, ACMD42
+    // * Respect of selected state
+    // * RCA (relative card address) filtering other than CMD7
     // As a result any SD controller with more than one SD card attached at the same time might not work properly.
     // Card type (SC/HC/XC/UC) is determined based on the provided capacity
     public class SDCard : ISPIPeripheral, IDisposable
@@ -186,8 +188,8 @@ namespace Antmicro.Renode.Peripherals.SD
         {
             BitStream result;
             this.Log(LogLevel.Noisy, "Command received: 0x{0:x} with arg 0x{1:x}", commandIndex, arg);
-            var treatNextCommandAsAppCommandLocal = treatNextCommandAsAppCommand;
-            treatNextCommandAsAppCommand = false;
+            var treatNextCommandAsAppCommandLocal = TreatNextCommandAsAppCommand;
+            TreatNextCommandAsAppCommand = false;
             if(!treatNextCommandAsAppCommandLocal || !TryHandleApplicationSpecificCommand((SdCardApplicationSpecificCommand)commandIndex, arg, out result))
             {
                 result = HandleStandardCommand((SdCardCommand)commandIndex, arg);
@@ -209,6 +211,12 @@ namespace Antmicro.Renode.Peripherals.SD
                 result = readContext.Data.AsByteArray(readContext.Offset, size);
                 Array.Reverse(result);
                 readContext.Move(size * 8);
+                // Requests with finite data automatically go to transfer state when finished
+                if(readContext.Offset >= readContext.Data.Length)
+                {
+                    state = SDCardState.Transfer;
+                    readContext.Data = null;
+                }
             }
             else
             {
@@ -234,6 +242,8 @@ namespace Antmicro.Renode.Peripherals.SD
 
         public BitStream CardIdentification => cardIdentificationGenerator.Bits;
 
+        public bool TreatNextCommandAsAppCommand { get; private set; }
+
         private SDCard(Stream dataBackend, long capacity, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined)
         {
             var blockLenghtInBytes = SDHelpers.BlockLengthInBytes(blockSize);
@@ -254,7 +264,7 @@ namespace Antmicro.Renode.Peripherals.SD
             blockLengthInBytes = SDHelpers.BlockLengthInBytes(sdCapacityParameters.BlockSize);
 
             cardStatusGenerator = new VariableLengthValue(32)
-                .DefineFragment(5, 1, () => (treatNextCommandAsAppCommand ? 1 : 0u), name: "APP_CMD bit")
+                .DefineFragment(5, 1, () => (TreatNextCommandAsAppCommand ? 1 : 0u), name: "APP_CMD bit")
                 .DefineFragment(8, 1, 1, name: "READY_FOR_DATA bit")
                 .DefineFragment(9, 4, () => (uint)state, name: "CURRENT_STATE")
             ;
@@ -418,7 +428,7 @@ namespace Antmicro.Renode.Peripherals.SD
         {
             readContext.Reset();
             writeContext.Reset();
-            treatNextCommandAsAppCommand = false;
+            TreatNextCommandAsAppCommand = false;
 
             state = SDCardState.Idle;
 
@@ -607,6 +617,9 @@ namespace Antmicro.Renode.Peripherals.SD
 
                 state = SDCardState.Standby;
 
+                // CMD7 requires us to come up with a new address each invocation
+                CardAddress += 1;
+
                 var status = CardStatus.AsUInt32();
                 return BitHelper.BitConcatenator.New()
                     .StackAbove(status, 13, 0)
@@ -628,20 +641,29 @@ namespace Antmicro.Renode.Peripherals.SD
                     // this command is not supported in the SPI mode
                     break;
                 }
-
-                // this is a toggle command:
-                // Select is used to start a transfer;
-                // Deselct is used to abort the active transfer
-                switch(state)
+                ushort rca = (ushort)(arg >> 16);
+                // If the argument RCA matches our RCA, go to transfer or programming mode, otherwise go to standby or disconnected mode (RCA 0 always does the latter)
+                if(rca == CardAddress && rca != 0)
                 {
-                case SDCardState.Standby:
-                    state = SDCardState.Transfer;
-                    break;
-
-                case SDCardState.Transfer:
-                case SDCardState.Programming:
-                    state = SDCardState.Standby;
-                    break;
+                    if(state == SDCardState.Standby)
+                    {
+                        state = SDCardState.Transfer;
+                    }
+                    else if(state == SDCardState.Disconnect)
+                    {
+                        state = SDCardState.Programming;
+                    }
+                }
+                else
+                {
+                    if(state == SDCardState.Transfer)
+                    {
+                        state = SDCardState.Standby;
+                    }
+                    else if(state == SDCardState.Programming)
+                    {
+                        state = SDCardState.Disconnect;
+                    }
                 }
 
                 return CardStatus;
@@ -748,7 +770,7 @@ namespace Antmicro.Renode.Peripherals.SD
                     : CardStatus;
 
             case SdCardCommand.AppCommand_CMD55:
-                treatNextCommandAsAppCommand = true;
+                TreatNextCommandAsAppCommand = true;
                 return spiMode
                     ? GenerateR1Response()
                     : CardStatus;
@@ -814,7 +836,6 @@ namespace Antmicro.Renode.Peripherals.SD
 
         private SDCardState state;
 
-        private bool treatNextCommandAsAppCommand;
         private uint blockLengthInBytes;
         private IoContext writeContext;
         private IoContext readContext;
@@ -838,6 +859,39 @@ namespace Antmicro.Renode.Peripherals.SD
         private const byte BlockBeginIndicator = 0xFE;
         private const int HighCapacityBlockLength = 512;
         private const byte DataAcceptedResponse = 0x05;
+
+        public enum SdCardCommand
+        {
+            GoIdleState_CMD0 = 0,
+            SendSupportInformation_CMD1 = 1,
+            SendCardIdentification_CMD2 = 2,
+            SendRelativeAddress_CMD3 = 3,
+            CheckSwitchableFunction_CMD6 = 6, // v1.1+
+            SelectDeselectCard_CMD7 = 7,
+            SendInterfaceConditionCommand_CMD8 = 8, // v2+
+            SendCardSpecificData_CMD9 = 9,
+            SendCardIdentification_CMD10 = 10,
+            StopTransmission_CMD12 = 12,
+            SendStatus_CMD13 = 13,
+            SetBlockLength_CMD16 = 16,
+            ReadSingleBlock_CMD17 = 17,
+            ReadMultipleBlocks_CMD18 = 18,
+            SendTuneBlock_CMD21 = 21,
+            SetBlockCount_CMD23 = 23,
+            WriteSingleBlock_CMD24 = 24,
+            WriteMultipleBlocks_CMD25 = 25,
+            IOReadWriteDirect_CM52 = 52,
+            AppCommand_CMD55 = 55,
+            ReadOperationConditionRegister_CMD58 = 58,
+            EnableCRCChecking_CMD59 = 59
+        }
+
+        public enum SdCardApplicationSpecificCommand
+        {
+            SendSDCardStatus_ACMD13 = 13,
+            SendOperatingConditionRegister_ACMD41 = 41,
+            SendSDConfigurationRegister_ACMD51 = 51
+        }
 
         private class SpiContext
         {
@@ -908,40 +962,6 @@ namespace Antmicro.Renode.Peripherals.SD
             private uint bytesLeft;
             private uint offset;
             private BitStream data;
-        }
-
-        private enum SdCardCommand
-        {
-            GoIdleState_CMD0 = 0,
-            SendSupportInformation_CMD1 = 1,
-            SendCardIdentification_CMD2 = 2,
-            SendRelativeAddress_CMD3 = 3,
-            CheckSwitchableFunction_CMD6 = 6,
-            SelectDeselectCard_CMD7 = 7,
-            // this command has been added in spec version 2.0 - we don't have to answer to it
-            SendInterfaceConditionCommand_CMD8 = 8,
-            SendCardSpecificData_CMD9 = 9,
-            SendCardIdentification_CMD10 = 10,
-            StopTransmission_CMD12 = 12,
-            SendStatus_CMD13 = 13,
-            SetBlockLength_CMD16 = 16,
-            ReadSingleBlock_CMD17 = 17,
-            ReadMultipleBlocks_CMD18 = 18,
-            SendTuneBlock_CMD21 = 21,
-            SetBlockCount_CMD23 = 23,
-            WriteSingleBlock_CMD24 = 24,
-            WriteMultipleBlocks_CMD25 = 25,
-            IOReadWriteDirect_CM52 = 52,
-            AppCommand_CMD55 = 55,
-            ReadOperationConditionRegister_CMD58 = 58,
-            EnableCRCChecking_CMD59 = 59
-        }
-
-        private enum SdCardApplicationSpecificCommand
-        {
-            SendSDCardStatus_ACMD13 = 13,
-            SendOperatingConditionRegister_ACMD41 = 41,
-            SendSDConfigurationRegister_ACMD51 = 51
         }
 
         [Flags]

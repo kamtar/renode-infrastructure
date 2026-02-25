@@ -41,7 +41,7 @@ namespace Antmicro.Renode.Peripherals.Bus
     /// </summary>
     [Icon("sysbus")]
     [ControllerMask(typeof(IPeripheral))]
-    public sealed partial class SystemBus : IBusController, IDisposable
+    public sealed partial class SystemBus : IBusController, IDisposable, IHasPreservableState
     {
         internal SystemBus(IMachine machine)
         {
@@ -201,8 +201,14 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public bool TryGetAllSymbolAddresses(string symbolName, out IEnumerable<ulong> symbolAddresses, ICPU context = null)
         {
-            var result = GetLookup(context).TryGetSymbolsByName(symbolName, out var symbols);
-            symbolAddresses = symbols.Select(symbol => symbol.Start.RawValue);
+            if(context != null && GetLookup(context).TryGetSymbolsByName(symbolName, out var contextSymbols))
+            {
+                symbolAddresses = contextSymbols.Select(symbol => symbol.Start.RawValue);
+                return true;
+            }
+            // Search global context if CPU context was not provided or does not contain the symbol
+            var result = GetLookup().TryGetSymbolsByName(symbolName, out var globalSymbols);
+            symbolAddresses = globalSymbols.Select(symbol => symbol.Start.RawValue);
             return result;
         }
 
@@ -674,25 +680,48 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public void LogAllPeripheralsAccess(bool enable = true)
+        public void LogAllPeripheralsAccess(bool enable = true, bool silent = false)
         {
-            EnableAllPeripheralAccessWrappers(typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging");
+            EnableAllPeripheralAccessWrappers(typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging", silent);
         }
 
-        public void LogPeripheralAccess(IBusPeripheral busPeripheral, bool enable = true)
+        public void LogPeripheralAccess(IBusPeripheral busPeripheral, bool enable = true, bool silent = false)
         {
-            EnablePeripheralAccessWrappers(busPeripheral, typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging");
+            EnablePeripheralAccessWrappers(busPeripheral, typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>), enable, "Logging", silent);
         }
 
-        public void EnableAllPeripheralAccessWrappers(Type readWrapper, Type writeWrapper, bool enable = true, string name = null)
+        public bool IsLoggingPeripheralAccessEnabled(IBusPeripheral busPeripheral)
+        {
+            return ArePeripheralAccessWrappersEnabled(busPeripheral, typeof(ReadLoggingWrapper<>), typeof(WriteLoggingWrapper<>));
+        }
+
+        public bool ArePeripheralAccessWrappersEnabled(IBusPeripheral busPeripheral, Type readWrapper, Type writeWrapper)
+        {
+            var enabled = false;
+            foreach(var peripherals in AllPeripherals)
+            {
+                peripherals.VisitAccessMethods(busPeripheral, pam =>
+                {
+                    enabled |= pam.HasWrappersOfType(readWrapper, writeWrapper);
+                    return pam;
+                });
+                if(enabled)
+                {
+                    return true;
+                }
+            }
+            return enabled;
+        }
+
+        public void EnableAllPeripheralAccessWrappers(Type readWrapper, Type writeWrapper, bool enable = true, string name = null, bool silent = false)
         {
             foreach(var p in AllPeripherals.SelectMany(x => x.Peripherals))
             {
-                EnablePeripheralAccessWrappers(p.Peripheral, readWrapper, writeWrapper, enable, name);
+                EnablePeripheralAccessWrappers(p.Peripheral, readWrapper, writeWrapper, enable, name, silent);
             }
         }
 
-        public void EnablePeripheralAccessWrappers(IBusPeripheral busPeripheral, Type readWrapper, Type writeWrapper, bool enable = true, string name = null)
+        public void EnablePeripheralAccessWrappers(IBusPeripheral busPeripheral, Type readWrapper, Type writeWrapper, bool enable = true, string name = null, bool silent = false)
         {
             foreach(var peripherals in AllPeripherals)
             {
@@ -700,7 +729,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                 {
                     if(enable == pam.HasWrappersOfType(readWrapper, writeWrapper))
                     {
-                        busPeripheral.Log(LogLevel.Info, "{0} is already {1}", name ?? $"The {readWrapper} wrapper", enable ? "enabled" : "disabled");
+                        if(!silent)
+                        {
+                            busPeripheral.Log(LogLevel.Info, "{0} is already {1}", name ?? $"The {readWrapper} wrapper", enable ? "enabled" : "disabled");
+                        }
                     }
                     else if(enable)
                     {
@@ -832,6 +864,17 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
+        public bool TryGetTransactionInitiator(out IPeripheral initiator)
+        {
+            if(threadLocalContext.InUse && threadLocalContext.Initiator != null)
+            {
+                initiator = threadLocalContext.Initiator;
+                return true;
+            }
+            initiator = null;
+            return false;
+        }
+
         public bool TryConvertStateToUlongForContext(IPeripheral context, IContextState cpuStateObj, out ulong? state)
         {
             state = null;
@@ -869,6 +912,16 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null)
         {
+            if(context is BaseCPU cpu && cpu.CheckExternalPermissions(address) == 0)
+            {
+                this.WarningLog(
+                    "Tried to write {0} bytes at 0x{1:X}, with incorrect permissions, write ignored.",
+                    count,
+                    address
+                );
+                return;
+            }
+
             using(SetLocalContext(context))
             {
                 var targets = FindTargets(address, checked((ulong)count), context);
@@ -920,6 +973,16 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null)
         {
+            if(context is BaseCPU cpu && cpu.CheckExternalPermissions(address) == 0)
+            {
+                this.WarningLog(
+                    "Tried to read {0} bytes at 0x{1:X}, with incorrect permissions, returning 0.",
+                    count,
+                    address
+                );
+                return;
+            }
+
             using(SetLocalContext(context))
             {
                 var targets = FindTargets(address, checked((ulong)count), context);
@@ -991,9 +1054,9 @@ namespace Antmicro.Renode.Peripherals.Bus
                 .Convert<IBusPeripheral, IMapped>();
         }
 
-        public bool IsMemory(ulong address, ICPU context = null)
+        public bool IsMemory(ulong address, ICPU context = null, ulong? initiatorState = null)
         {
-            return GetAccessiblePeripheralsForContext(context)
+            return GetAccessiblePeripheralsForContext(context, initiatorState)
                 .Any(x => x.Peripheral is IMemory && x.RegistrationPoint.Range.Contains(address));
         }
 
@@ -1137,7 +1200,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             Register(peripheral, (BusRangeRegistration)registrationPoint);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
         {
             Unregister(peripheral);
         }
@@ -1257,6 +1320,36 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             delayedInvalidation = value;
         }
+
+        public object ExtractPreservedState()
+        {
+            return AllPeripherals.SelectMany(x => x.Peripherals)
+                    .Select(x => (IBusPeripheral)x.Peripheral)
+                    .Where(x => IsLoggingPeripheralAccessEnabled(x))
+                    .Select(x => x.GetName()).ToList();
+        }
+
+        public void LoadPreservedState(object state)
+        {
+            if(!(state is List<string> peripheralsWithEnabledLoggingNames))
+            {
+                throw new RecoverableException("Unexpected state received while loading preserved state");
+            }
+
+            var busPeripherals = AllPeripherals.SelectMany(x => x.Peripherals)
+                                    .Select(x => x.Peripheral)
+                                    .Cast<IBusPeripheral>()
+                                    .Distinct()
+                                    .ToDictionary(x => x.GetName(), x => x);
+
+            LogAllPeripheralsAccess(false, true);
+            foreach(var peripheralName in peripheralsWithEnabledLoggingNames)
+            {
+                LogPeripheralAccess(busPeripherals[peripheralName], true);
+            }
+        }
+
+        public string PreservableName => this.GetName();
 
         public UnhandledAccessBehaviour UnhandledAccessBehaviour { get; set; }
 
@@ -1384,7 +1477,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                         {
                             var registration = entry.RegistrationPoint;
                             var normalizedRegistration = registration.WithInitiatorAndStateMask(registration.Initiator, StateMask.AllAccess);
-                            var methods = collection.FindAccessMethods(registration.Range.StartAddress, out _, out _);
+                            var methods = collection.FindAccessMethods(registration.Range.StartAddress, out _, out _, out _);
                             if(match == null)
                             {
                                 match = new FoundRegistrationInfo(registration, collection, methods);
@@ -1922,9 +2015,20 @@ namespace Antmicro.Renode.Peripherals.Bus
                                       && x.RegistrationPoint.StateMask?.Mask == registrationPoint.StateMask?.Mask);
                 if(intersecting != null)
                 {
-                    throw new RegistrationException($"Given address {registrationPoint.Range} for peripheral {peripheral} conflicts with address {intersecting.RegistrationPoint.Range} of peripheral {intersecting.Peripheral}", "address");
+                    throw new RegistrationException(
+                        $"Could not register {peripheral} at the given address {registrationPoint.Range} because it conflicts "
+                        + $"with peripheral {intersecting.Peripheral} registered at {intersecting.RegistrationPoint.Range}"
+                    );
                 }
 
+                if(peripheral is IKnownSize knownSizePeripheral && registrationPoint.Offset > 0)
+                {
+                    var size = (ulong)knownSizePeripheral.Size;
+                    if(registrationPoint.Offset >= size)
+                    {
+                        throw new RegistrationException($"Could not register {peripheral} with offset 0x{registrationPoint.Offset:X} as the offset is larger than the peripheral (0x{size:X})");
+                    }
+                }
                 var registeredPeripheral = new BusRegistered<IBusPeripheral>(peripheral, registrationPoint);
 
                 if(IsAddressRangeLocked(registrationPoint.Range, context))
@@ -2514,37 +2618,46 @@ namespace Antmicro.Renode.Peripherals.Bus
             // Adding the context key happens on peripheral registration.
             public void AddContextKey(IPeripheral key)
             {
-                if(key == null)
+                lock(locker)
                 {
-                    throw new ArgumentNullException(nameof(key));
+                    if(key == null)
+                    {
+                        throw new ArgumentNullException(nameof(key));
+                    }
+                    if(cpuLocalValues.ContainsKey(key))
+                    {
+                        return;
+                    }
+                    cpuLocalValues[key] = new Dictionary<StateMask, TValue>();
+                    cpuAllAccess[key] = cpuLocalValues[key][StateMask.AllAccess] = defaultFactory();
                 }
-                if(cpuLocalValues.ContainsKey(key))
-                {
-                    return;
-                }
-                cpuLocalValues[key] = new Dictionary<StateMask, TValue>();
-                cpuAllAccess[key] = cpuLocalValues[key][StateMask.AllAccess] = defaultFactory();
             }
 
             public void RemoveContextKey(IPeripheral key)
             {
-                if(key == null)
+                lock(locker)
                 {
-                    throw new ArgumentNullException(nameof(key));
+                    if(key == null)
+                    {
+                        throw new ArgumentNullException(nameof(key));
+                    }
+                    cpuLocalValues.Remove(key);
+                    DropCaches(); // has the effect of dropping caches when a peripheral is unregistered
                 }
-                cpuLocalValues.Remove(key);
-                DropCaches(); // has the effect of dropping caches when a peripheral is unregistered
             }
 
             public TReadOnlyValue this[IPeripheral key] => GetValue(key);
 
             public TReadOnlyValue GetValue(IPeripheral key, ulong? initiatorState = null)
             {
-                if(!TryGetValue(key, initiatorState, out var value))
+                lock(locker)
                 {
-                    throw new RecoverableException($"{typeof(TValue).Name} not found for the given context: {key.GetName()} in state: {initiatorState}");
+                    if(!TryGetValue(key, initiatorState, out var value))
+                    {
+                        throw new RecoverableException($"{typeof(TValue).Name} not found for the given context: {key.GetName()} in state: {initiatorState}");
+                    }
+                    return value;
                 }
-                return value;
             }
 
             // Perform a mutation on the value collection for a specific initiator state and mask pair (for example to add a new peripheral)
@@ -2565,85 +2678,103 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             public IEnumerable<TValue> GetAllDistinctValues()
             {
-                return cpuLocalValues.Values.SelectMany(v => v.Values).Concat(globalValue.Values).Distinct();
+                lock(locker)
+                {
+                    return cpuLocalValues.Values.SelectMany(v => v.Values).Concat(globalValue.Values).Distinct();
+                }
             }
 
             public IEnumerable<IPeripheral> GetAllContextKeys()
             {
-                return cpuLocalValues.Keys;
+                lock(locker)
+                {
+                    return cpuLocalValues.Keys;
+                }
             }
 
             public IEnumerable<StateMask> GetAllStateKeys(IPeripheral context)
             {
-                return (context == null ? globalValue : cpuLocalValues[context]).Keys;
+                lock(locker)
+                {
+                    return (context == null ? globalValue : cpuLocalValues[context]).Keys;
+                }
             }
 
             public bool TryGetValue(IPeripheral key, ulong? initiatorState, out TValue value)
             {
-                if(!initiatorState.HasValue)
+                lock(locker)
                 {
-                    if(key == null)
+                    if(!initiatorState.HasValue)
                     {
-                        value = globalAllAccess;
+                        if(key == null)
+                        {
+                            value = globalAllAccess;
+                            return true;
+                        }
+                        // Handle reads initiated by peripherals that are never used as a context and thus have no collections.
+                        // Then this will fail and it's up to the caller to fall back to the global collection.
+                        return cpuAllAccess.TryGetValue(key, out value);
+                    }
+                    if(key != null && !cpuInStateCache.ContainsKey(key))
+                    {
+                        cpuInStateCache[key] = new Dictionary<ulong, TValue>();
+                    }
+                    var cache = key == null ? globalCache : cpuInStateCache[key];
+                    if(cache.TryGetValue(initiatorState.Value, out var cachedValue))
+                    {
+                        value = cachedValue;
                         return true;
                     }
-                    // Handle reads initiated by peripherals that are never used as a context and thus have no collections.
-                    // Then this will fail and it's up to the caller to fall back to the global collection.
-                    return cpuAllAccess.TryGetValue(key, out value);
-                }
-                if(key != null && !cpuInStateCache.ContainsKey(key))
-                {
-                    cpuInStateCache[key] = new Dictionary<ulong, TValue>();
-                }
-                var cache = key == null ? globalCache : cpuInStateCache[key];
-                if(cache.TryGetValue(initiatorState.Value, out var cachedValue))
-                {
-                    value = cachedValue;
-                    return true;
-                }
-                else
-                {
-                    cache[initiatorState.Value] = cachedValue = defaultFactory();
-                    return TryGetValueForState(cachedValue, key, initiatorState, out value);
+                    else
+                    {
+                        cache[initiatorState.Value] = cachedValue = defaultFactory();
+                        return TryGetValueForState(cachedValue, key, initiatorState, out value);
+                    }
                 }
             }
 
             private bool TryGetValueForState(TValue cachedValue, IPeripheral key, ulong? initiatorState, out TValue value)
             {
-                // The core of the state filtering logic. Look up which elements fit the current initiator state.
-                // Then join all found state-specific collections of elements into the cached one for this state.
-                var collectionToSearch = globalValue.AsEnumerable();
-                if(key != null && cpuLocalValues.TryGetValue(key, out var thisCpuValues))
+                lock(locker)
                 {
-                    // Note that in order for the 'local peripheral overrides the global one' behavior to work as intended,
-                    // we must check the local peripherals first. That way they 'reserve' their spot in the cache. This function
-                    // also checks the global collection when called with a context argument, but it does it only after going
-                    // through the context-specific one to ensure this.
-                    collectionToSearch = thisCpuValues.Concat(collectionToSearch);
-                }
-                bool anyHit = false;
-                // Additionally, search the collections from the most to least specific (by number of set bits in the mask).
-                // This is mainly used so that if an conditionally-registered peripheral overlaps an unconditional one, the
-                // conditional peripheral will be prioritized.
-                foreach(var pair in collectionToSearch.OrderByDescending(pair => BitHelper.GetSetBitsCount(pair.Key.Mask)))
-                {
-                    var stateMask = pair.Key;
-                    if((initiatorState.Value & stateMask.Mask) == stateMask.State)
+                    // The core of the state filtering logic. Look up which elements fit the current initiator state.
+                    // Then join all found state-specific collections of elements into the cached one for this state.
+                    var collectionToSearch = globalValue.AsEnumerable();
+                    if(key != null && cpuLocalValues.TryGetValue(key, out var thisCpuValues))
                     {
-                        anyHit = true;
-                        /// <see cref="PeripheralCollection.Coalesce"> doesn't add overlapping peripherals. This means that for the 'local peripheral
-                        /// overrides the global one' behavior to work as intended we must check the local peripherals first, as we did above.
-                        cachedValue.Coalesce(pair.Value);
+                        // Note that in order for the 'local peripheral overrides the global one' behavior to work as intended,
+                        // we must check the local peripherals first. That way they 'reserve' their spot in the cache. This function
+                        // also checks the global collection when called with a context argument, but it does it only after going
+                        // through the context-specific one to ensure this.
+                        collectionToSearch = thisCpuValues.Concat(collectionToSearch);
                     }
+                    bool anyHit = false;
+                    // Additionally, search the collections from the most to least specific (by number of set bits in the mask).
+                    // This is mainly used so that if an conditionally-registered peripheral overlaps an unconditional one, the
+                    // conditional peripheral will be prioritized.
+                    foreach(var pair in collectionToSearch.OrderByDescending(pair => BitHelper.GetSetBitsCount(pair.Key.Mask)))
+                    {
+                        var stateMask = pair.Key;
+                        if((initiatorState.Value & stateMask.Mask) == stateMask.State)
+                        {
+                            anyHit = true;
+                            /// <see cref="PeripheralCollection.Coalesce"> doesn't add overlapping peripherals. This means that for the 'local peripheral
+                            /// overrides the global one' behavior to work as intended we must check the local peripherals first, as we did above.
+                            cachedValue.Coalesce(pair.Value);
+                        }
+                    }
+                    value = anyHit ? cachedValue : default(TValue);
+                    return anyHit;
                 }
-                value = anyHit ? cachedValue : default(TValue);
-                return anyHit;
             }
 
             private void DropCaches()
             {
-                cpuInStateCache.Clear();
-                globalCache.Clear();
+                lock(locker)
+                {
+                    cpuInStateCache.Clear();
+                    globalCache.Clear();
+                }
             }
 
             private readonly Dictionary<IPeripheral, Dictionary<StateMask, TValue>> cpuLocalValues = new Dictionary<IPeripheral, Dictionary<StateMask, TValue>>();

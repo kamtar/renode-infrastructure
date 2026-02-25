@@ -206,13 +206,27 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get
             {
-                return GetRegisterValue32((int)RiscV32Registers.STVEC);
+                return AfterSTVECRead(GetRegisterValue32((int)RiscV32Registers.STVEC));
             }
 
             set
             {
                 value = BeforeSTVECWrite(value);
                 SetRegisterValue32((int)RiscV32Registers.STVEC, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue JVT
+        {
+            get
+            {
+                return GetRegisterValue32((int)RiscV32Registers.JVT);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)RiscV32Registers.JVT, value);
             }
         }
 
@@ -494,6 +508,34 @@ namespace Antmicro.Renode.Peripherals.CPU
             set
             {
                 SetRegisterValue32((int)RiscV32Registers.PRIV, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue FFLAGS
+        {
+            get
+            {
+                return GetRegisterValue32((int)RiscV32Registers.FFLAGS);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)RiscV32Registers.FFLAGS, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue FRM
+        {
+            get
+            {
+                return GetRegisterValue32((int)RiscV32Registers.FRM);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)RiscV32Registers.FRM, value);
             }
         }
 
@@ -841,6 +883,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             { RiscV32Registers.F29,  new CPURegister(62, 64, isGeneral: false, isReadonly: false, aliases: new [] { "F29" }) },
             { RiscV32Registers.F30,  new CPURegister(63, 64, isGeneral: false, isReadonly: false, aliases: new [] { "F30" }) },
             { RiscV32Registers.F31,  new CPURegister(64, 64, isGeneral: false, isReadonly: false, aliases: new [] { "F31" }) },
+            { RiscV32Registers.FFLAGS,  new CPURegister(65, 32, isGeneral: false, isReadonly: false, aliases: new [] { "FFLAGS" }) },
+            { RiscV32Registers.FRM,  new CPURegister(66, 32, isGeneral: false, isReadonly: false, aliases: new [] { "FRM" }) },
             { RiscV32Registers.VSTART,  new CPURegister(101, 32, isGeneral: false, isReadonly: false, aliases: new [] { "VSTART" }) },
             { RiscV32Registers.VXSAT,  new CPURegister(102, 32, isGeneral: false, isReadonly: false, aliases: new [] { "VXSAT" }) },
             { RiscV32Registers.VXRM,  new CPURegister(103, 32, isGeneral: false, isReadonly: false, aliases: new [] { "VXRM" }) },
@@ -848,6 +892,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             { RiscV32Registers.SSTATUS,  new CPURegister(321, 32, isGeneral: false, isReadonly: false, aliases: new [] { "SSTATUS" }) },
             { RiscV32Registers.SIE,  new CPURegister(325, 32, isGeneral: false, isReadonly: false, aliases: new [] { "SIE" }) },
             { RiscV32Registers.STVEC,  new CPURegister(326, 32, isGeneral: false, isReadonly: false, aliases: new [] { "STVEC" }) },
+            { RiscV32Registers.JVT,  new CPURegister(344, 32, isGeneral: false, isReadonly: false, aliases: new [] { "JVT" }) },
             { RiscV32Registers.SSCRATCH,  new CPURegister(385, 32, isGeneral: false, isReadonly: false, aliases: new [] { "SSCRATCH" }) },
             { RiscV32Registers.SEPC,  new CPURegister(386, 32, isGeneral: false, isReadonly: false, aliases: new [] { "SEPC" }) },
             { RiscV32Registers.SCAUSE,  new CPURegister(387, 32, isGeneral: false, isReadonly: false, aliases: new [] { "SCAUSE" }) },
@@ -885,6 +930,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         SSTATUS = 321,
         SIE = 325,
         STVEC = 326,
+        JVT = 344,
         SSCRATCH = 385,
         SEPC = 386,
         SCAUSE = 387,
@@ -905,6 +951,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         MIP = 901,
         MSECCFG = 1863,
         PRIV = 4161,
+        FFLAGS = 65,
+        FRM = 66,
         VSTART = 101,
         VXSAT = 102,
         VXRM = 103,

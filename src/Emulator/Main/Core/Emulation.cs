@@ -419,6 +419,30 @@ namespace Antmicro.Renode.Core
             return false;
         }
 
+        public IEnumerable<T> GetEmulationElementsOfType<T>()
+        {
+            return GetEmulationElementsOfType(typeof(T)).Cast<T>();
+        }
+
+        public IEnumerable<IEmulationElement> GetEmulationElementsOfType(Type type)
+        {
+            return GetEmulationElements().Where(type.IsInstanceOfType);
+        }
+
+        public IEnumerable<IEmulationElement> GetEmulationElements()
+        {
+            IEnumerable<IEmulationElement> elements = Machines.Cast<IEmulationElement>();
+
+            foreach(var machine in Machines)
+            {
+                elements = elements.Concat(machine.GetPeripheralsOfType(typeof(IEmulationElement)));
+            }
+            elements = elements.Concat(ExternalsManager.GetExternalsOfType<IExternal>().Cast<IEmulationElement>());
+            elements = elements.Concat(HostMachine.GetOfType<IHostMachineElement>().Cast<IEmulationElement>());
+
+            return elements;
+        }
+
         public void Dispose()
         {
             FileFetcher.CancelDownload();
@@ -619,6 +643,8 @@ namespace Antmicro.Renode.Core
         public BlobManager BlobManager { get; set; }
 
         public AutoSnapshotCreator AutoSnapshotCreator { get; }
+
+        public bool ReverseExecutionEnabled { get; set; }
 
         [field: Transient]
         public event Action<IMachine, MachineStateChangedEventArgs> MachineStateChanged;

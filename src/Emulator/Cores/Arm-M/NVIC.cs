@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 // Copyright (c) 2020-2021 Microsoft
 //
@@ -17,6 +17,7 @@ using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -26,10 +27,11 @@ using Antmicro.Renode.Utilities;
 namespace Antmicro.Renode.Peripherals.IRQControllers
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class NVIC : IDoubleWordPeripheral, IHasDivisibleFrequency, IKnownSize, IIRQController
+    public class NVIC : IDoubleWordPeripheral, IHasDivisibleFrequency, IKnownSize, IIRQController, IHasMappedRegisters
     {
-        public NVIC(IMachine machine, long systickFrequency = 50 * 0x800000, byte priorityMask = 0xFF, bool haltSystickOnDeepSleep = true)
+        public NVIC(IMachine machine, ulong systickFrequency = 50 * 0x800000, byte priorityMask = 0xFF, bool haltSystickOnDeepSleep = true)
         {
+            mapper = new RegisterMapper(this.GetType());
             priorities = new ExceptionSimpleArray<byte>();
             activeIRQs = new Stack<int>();
             pendingIRQs = new SortedSet<int>();
@@ -517,6 +519,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             return ReadDoubleWord(offset, IsCurrentCPUInSecureState(out var _));
         }
 
+        public string OffsetToString(long offset) => mapper.ToString(offset);
+
         public void Reset()
         {
             RegisterCollection.Reset();
@@ -619,7 +623,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool PauseInsteadOfReset { get; set; }
 
-        public long Frequency
+        public ulong Frequency
         {
             get => systick.Get(IsCurrentCPUInSecureState(out var _)).Frequency;
             set
@@ -628,7 +632,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        public int Divider
+        public ulong Divider
         {
             get => systick.Get(IsCurrentCPUInSecureState(out var _)).Divider;
             set
@@ -926,8 +930,21 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 .WithFlag(18, name: "USGFAULTENA (Usage Fault Enable)")
                 .WithReservedBits(19, 13)
                 .WithChangeCallback((_, val) =>
-                    this.Log(LogLevel.Warning, "Changing value of the SHCSR register to 0x{0:X}, the register isn't supported by Renode", val)
+                    {
+                        // Don't warn about implemented fields.
+                        if(val != BitHelper.Bits(16, 3))
+                        {
+                            this.Log(LogLevel.Warning, "Changing value of the SHCSR register to 0x{0:X}, but only bits [16:18] are supported", val);
+                        }
+                    }
                 );
+
+            Registers.HardFaultStatus.Define(RegisterCollection)
+                .WithReservedBits(0, 1)
+                .WithTaggedFlag("VECTTBL", 1)
+                .WithReservedBits(2, 28)
+                .WithTaggedFlag("FORCED", 30)
+                .WithTaggedFlag("DEBUGEVT", 31);
 
             Registers.CacheSizeSelection.Define(RegisterCollection)
                 .WithTaggedFlag("InD (Instruction or Data Selection)", 0)
@@ -1732,6 +1749,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private readonly IMachine machine;
         private readonly Action resetMachine;
         private readonly ExceptionSimpleArray<byte> priorities;
+        private readonly RegisterMapper mapper;
 
         private readonly ExceptionSimpleArray<IRQState> irqs;
 
@@ -1814,7 +1832,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private class SysTick
         {
-            public SysTick(IMachine machine, NVIC parent, long systickFrequency, bool isSecure = false)
+            public SysTick(IMachine machine, NVIC parent, ulong systickFrequency, bool isSecure = false)
             {
                 IsSecure = isSecure;
                 this.parent = parent;
@@ -1906,7 +1924,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
             }
 
-            public long Frequency
+            public ulong Frequency
             {
                 get => systick.Frequency;
                 set
@@ -1915,7 +1933,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
             }
 
-            public int Divider
+            public ulong Divider
             {
                 get => systick.Divider;
                 set

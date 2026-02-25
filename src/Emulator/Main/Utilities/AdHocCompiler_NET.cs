@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -25,7 +25,9 @@ namespace Antmicro.Renode.Utilities
             // With .NET Core and above, one must explicitly specify a .dll extension for output assembly
             var outputFilePath = Path.ChangeExtension(tempFilePath, ".dll");
             var outputFileName = Path.GetFileName(outputFilePath);
-            var options = CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.CSharp9);
+            var options = CSharpParseOptions.Default
+                .WithLanguageVersion(LanguageVersion.CSharp9)
+                .WithPreprocessorSymbols("NET");
 
             var parsedSyntaxTrees = new List<SyntaxTree> { };
 
@@ -39,7 +41,7 @@ namespace Antmicro.Renode.Utilities
                 var sourceCode = File.ReadAllText(sourcePath);
                 var codeString = SourceText.From(sourceCode);
 
-                parsedSyntaxTrees.Add(SyntaxFactory.ParseSyntaxTree(codeString, options));
+                parsedSyntaxTrees.Add(SyntaxFactory.ParseSyntaxTree(codeString, options, sourcePath));
             }
 
             AssemblyHelper.GetAssembliesLocations().ToList()
@@ -50,14 +52,16 @@ namespace Antmicro.Renode.Utilities
                 references: references,
                 options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
                     optimizationLevel: OptimizationLevel.Release,
+                    allowUnsafe: true,
                     assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default)).Emit(outputFilePath);
 
             if(!result.Success)
             {
-                // Access diagnostic informations 
+                // Access diagnostic informations
                 var failures = result.Diagnostics.Where(diagnostic => diagnostic.IsWarningAsError || diagnostic.Severity == DiagnosticSeverity.Error);
-                var diagnosticString = string.Join(Environment.NewLine, failures.Select(x => x.ToString()));
-                throw new RecoverableException($"Could not compile assembly from: {sourcePaths}\n{diagnosticString}");
+                var diagnosticString = string.Join(Environment.NewLine, failures);
+                var sourcesString = string.Join(", ", sourcePaths);
+                throw new RecoverableException($"Could not compile assembly from: {sourcesString}\n{diagnosticString}");
             }
 
             return outputFilePath;

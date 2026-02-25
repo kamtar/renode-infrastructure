@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -81,6 +81,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
             if(!cache.ContainsKey(key))
             {
                 IDisassembler disas = new LLVMDisasWrapper(model, triple, flags);
+                Logger.Info($"Created new disassembler for triple {triple}, cpu {model}, with flags {flags}");
                 if(!xtensaSupportWarningIssued && triple == "xtensa")
                 {
                     Logger.Log(LogLevel.Warning, "The disassembler for Xtensa is currently an experimental feature in Renode");
@@ -202,7 +203,8 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                     return false;
                 }
 
-                opcode = Misc.HexStringToByteArray(result.OpcodeString.Trim(), true);
+                opcode = new byte[result.OpcodeSize];
+                Array.Copy(memory, memoryOffset, opcode, 0, result.OpcodeSize);
                 return true;
             }
 
@@ -369,7 +371,8 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                     return false;
                 }
 
-                opcode = Misc.HexStringToByteArray(result.OpcodeString, true);
+                opcode = new byte[result.OpcodeSize];
+                Array.Copy(memory, memoryOffset, opcode, 0, result.OpcodeSize);
                 return true;
             }
 

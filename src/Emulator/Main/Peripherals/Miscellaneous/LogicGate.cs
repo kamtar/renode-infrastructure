@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -7,12 +7,14 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
+using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -164,7 +166,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             Output.Set(InvertedOutput ? !output : output);
@@ -175,10 +177,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            if(!TimeDomainsManager.Instance.TryGetVirtualTimeStamp(out var vts))
-            {
-                vts = new TimeStamp(default(TimeInterval), EmulationManager.ExternalWorld);
-            }
+            var vts = TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp();
 
             foreach(var keyValue in receivers)
             {

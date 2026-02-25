@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2018 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -17,9 +17,8 @@ namespace Antmicro.Renode.Peripherals.Timers
 {
     public class OMAP_GPTimer : LimitTimer, IDoubleWordPeripheral
     {
-        public OMAP_GPTimer(IMachine machine) : base(machine.ClockSource, (38400000), direction: Direction.Ascending, limit: (0xFFFFFFFF), enabled: true)
+        public OMAP_GPTimer(IMachine machine) : base(machine.ClockSource, (38400000), direction: Direction.Ascending, limit: (0xFFFFFFFF), enabled: true, eventEnabled: true, autoUpdate: true)
         { // TODO: hack - 10 times slower, because of Stopwatch limitation
-            AutoUpdate = true;
             IRQ = new GPIO();
         }
 
@@ -58,11 +57,11 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 if((value & (1 << 5)) > 0)
                 {
-                    Divider = (int)Math.Pow(2, (((value >> 2) & 7) + 1));
+                    Divider = (ulong)Math.Pow(2, (((value >> 2) & 7) + 1));
                 }
                 else
                 {
-                    Divider = (int)Math.Pow(2, 0);
+                    Divider = (ulong)Math.Pow(2, 0);
                 }
                 Enabled = ((value & 1) > 0);
             }

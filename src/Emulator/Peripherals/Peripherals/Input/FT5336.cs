@@ -1,14 +1,18 @@
 //
-// Copyright (c) 2010-2020 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core;
+#if !NET
+using Antmicro.Renode.Exceptions;
+#endif
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.I2C;
 using Antmicro.Renode.Utilities;
@@ -22,9 +26,11 @@ namespace Antmicro.Renode.Peripherals.Input
     /// </summary>
     public sealed class FT5336 : II2CPeripheral, IAbsolutePositionPointerInput
     {
-        public FT5336(bool isRotated = false)
+        public FT5336(bool isRotated = false, bool isInvertedX = false, bool isInvertedY = false)
         {
             this.isRotated = isRotated;
+            this.isInvertedX = isInvertedX;
+            this.isInvertedY = isInvertedY;
             IRQ = new GPIO();
             Reset();
         }
@@ -82,16 +88,21 @@ namespace Antmicro.Renode.Peripherals.Input
 
         public void MoveTo(int x, int y)
         {
-            if(!isRotated)
+            if(isInvertedX)
             {
-                touchedPoints[0].X = (ushort)x;
-                touchedPoints[0].Y = (ushort)y;
+                x = MaxX - x;
             }
-            else
+            if(isInvertedY)
             {
-                touchedPoints[0].X = (ushort)y;
-                touchedPoints[0].Y = (ushort)x;
+                y = MaxY - y;
             }
+            if(isRotated)
+            {
+                Misc.Swap(ref x, ref y);
+            }
+
+            touchedPoints[0].X = (ushort)x;
+            touchedPoints[0].Y = (ushort)y;
             if(touchedPoints[0].Type == PointType.Down || touchedPoints[0].Type == PointType.Contact)
             {
                 this.NoisyLog("Moving the pointer at {0}x{1}", touchedPoints[0].X, touchedPoints[0].Y);
@@ -164,7 +175,7 @@ namespace Antmicro.Renode.Peripherals.Input
                 queue.Enqueue(0);
                 break;
             default:
-                throw new Exception("Should not reach here.");
+                throw new UnreachableException();
             }
             SetReturnValue(queue.ToArray());
         }
@@ -177,6 +188,8 @@ namespace Antmicro.Renode.Peripherals.Input
         private byte[] currentReturnValue;
         private Registers lastWriteRegister;
         private readonly bool isRotated;
+        private readonly bool isInvertedX;
+        private readonly bool isInvertedY;
 
         private readonly TouchedPoint[] touchedPoints = new TouchedPoint[5];
 

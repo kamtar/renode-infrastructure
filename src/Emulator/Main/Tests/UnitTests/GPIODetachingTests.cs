@@ -1,12 +1,15 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
 using System.Linq;
+using System.Reflection;
 
+using Antmicro.Renode.Connectors;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Peripherals.Bus;
@@ -57,7 +60,7 @@ namespace Antmicro.Renode.UnitTests
             machine.SystemBus.Register(gpioReceiverMock, new BusRangeRegistration(0x10, 0x10));
 
             //act
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
 
             //assert
             var connections = gpioByNumberConnectorPeripheralMock.Connections;
@@ -82,7 +85,7 @@ namespace Antmicro.Renode.UnitTests
             machine.SystemBus.Register(gpioReceiverMock3, new BusRangeRegistration(0x30, 0x10));
 
             //act
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
 
             //assert
             var connections = gpioByNumberConnectorPeripheralMock.Connections;
@@ -103,7 +106,7 @@ namespace Antmicro.Renode.UnitTests
             gpioSender.Irq.Connect(gpioReceiverMock, 1);
 
             //act
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(gpioReceiverMock);
             //assert
             Assert.IsFalse(gpioSender.Irq.IsConnected);
         }
@@ -131,7 +134,7 @@ namespace Antmicro.Renode.UnitTests
             a.Connections[1].Connect(c, 2);
 
             //act
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(b);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(b);
             var aConnections = a.Connections;
             var bConnections = b.Connections;
 
@@ -165,7 +168,7 @@ namespace Antmicro.Renode.UnitTests
             a.Connections[0].Connect(c, 1);
             Assert.True(a.Connections[0].Endpoints.Count(x => x.Receiver == c && x.Number == 1) == 1);
 
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(c);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)machine.SystemBus).Unregister(c);
 
             Assert.True(a.Connections[0].Endpoints.Count == 1);
             Assert.True(a.Connections[0].Endpoints[0].Receiver == b);
@@ -191,6 +194,129 @@ namespace Antmicro.Renode.UnitTests
             Assert.IsEmpty(gpioConnections[1].Endpoints);
             Assert.IsEmpty(gpioConnections[2].Endpoints);
             Assert.True(gpioReceiverMock == receiver);
+        }
+
+        [Test]
+        public void ShouldDisconnectGPIOEndpointFromRemovedExternal()
+        {
+            // init
+            EmulationManager.Instance.CurrentEmulation.Dispose();
+
+            var sender = new MockGPIOByNumberConnectorPeripheral(1);
+            var receiver = new MockGPIOByNumberConnectorPeripheral(1);
+            var manager = new ExternalsManager();
+            var connector = new GPIOConnector();
+
+            manager.AddExternal(connector, "connector");
+            machine.SystemBus.Register(sender, new BusRangeRegistration(0x0, 0x10));
+            machine.SystemBus.Register(receiver, new BusRangeRegistration(0x10, 0x10));
+
+            // act
+            EmulationManager.Instance.CurrentEmulation.AddMachine(machine);
+            Assert.IsTrue(EmulationManager.Instance.CurrentEmulation.Machines.Count() == 1);
+
+            connector.AttachTo(sender);
+            connector.SelectSourcePin(sender, 0);
+            Assert.IsTrue(sender.Connections[0].Endpoints.Count == 1);
+            Assert.IsTrue(sender.Connections[0].IsConnected);
+
+            connector.AttachTo(receiver);
+            connector.SelectDestinationPin(receiver, 0);
+
+            manager.RemoveExternal(connector);
+
+            Assert.IsEmpty(sender.Connections[0].Endpoints);
+            Assert.IsFalse(sender.Connections[0].IsConnected);
+        }
+
+        [Test]
+        public void ShouldDisconnectGPIOEndpointFromDisposedMachine()
+        {
+            // init
+            EmulationManager.Instance.CurrentEmulation.Dispose();
+
+            var machine2 = new Machine();
+
+            var sender = new MockGPIOByNumberConnectorPeripheral(1);
+            var receiver = new MockGPIOByNumberConnectorPeripheral(1);
+            var manager = new ExternalsManager();
+            var connector = new GPIOConnector();
+
+            manager.AddExternal(connector, "connector");
+            machine.SystemBus.Register(sender, new BusRangeRegistration(0x0, 0x10));
+            machine2.SystemBus.Register(receiver, new BusRangeRegistration(0x10, 0x10));
+
+            // act
+            EmulationManager.Instance.CurrentEmulation.AddMachine(machine);
+            EmulationManager.Instance.CurrentEmulation.AddMachine(machine2);
+            Assert.IsTrue(EmulationManager.Instance.CurrentEmulation.Machines.Count() == 2);
+
+            connector.AttachTo(sender);
+            connector.SelectSourcePin(sender, 0);
+            connector.AttachTo(receiver);
+            connector.SelectDestinationPin(receiver, 0);
+
+            var connectorPin = (GPIO)GetInstanceField(typeof(GPIOConnector), connector, "connectorPin");
+            var sourcePin = (GPIO)GetInstanceField(typeof(GPIOConnector), connector, "sourcePin");
+
+            Assert.IsTrue(connectorPin.Endpoints.Count() == 1);
+            Assert.IsTrue(connectorPin.IsConnected);
+            Assert.IsTrue(sourcePin.Endpoints.Count() == 1);
+            Assert.IsTrue(sourcePin.IsConnected);
+
+            ((Machine)machine).Dispose();
+
+            Assert.IsTrue(connectorPin.Endpoints.Count() == 1);
+            Assert.IsTrue(connectorPin.IsConnected);
+            Assert.IsEmpty(sourcePin.Endpoints);
+            Assert.IsFalse(sourcePin.IsConnected);
+        }
+
+        [Test]
+        public void ShouldDisconnectGPIOEndpointFromUnregisteredPeripheral()
+        {
+            // init
+            EmulationManager.Instance.CurrentEmulation.Dispose();
+
+            var sender = new MockGPIOByNumberConnectorPeripheral(1);
+            var receiver = new MockGPIOByNumberConnectorPeripheral(1);
+            var manager = new ExternalsManager();
+            var connector = new GPIOConnector();
+
+            manager.AddExternal(connector, "connector");
+            machine.SystemBus.Register(sender, new BusRangeRegistration(0x0, 0x10));
+            machine.SystemBus.Register(receiver, new BusRangeRegistration(0x10, 0x10));
+
+            // act
+            EmulationManager.Instance.CurrentEmulation.AddMachine(machine);
+            Assert.IsTrue(EmulationManager.Instance.CurrentEmulation.Machines.Count() == 1);
+
+            connector.AttachTo(sender);
+            connector.SelectSourcePin(sender, 0);
+            connector.AttachTo(receiver);
+            connector.SelectDestinationPin(receiver, 0);
+
+            var connectorPin = (GPIO)GetInstanceField(typeof(GPIOConnector), connector, "connectorPin");
+            var sourcePin = (GPIO)GetInstanceField(typeof(GPIOConnector), connector, "sourcePin");
+
+            Assert.IsTrue(connectorPin.Endpoints.Count() == 1);
+            Assert.IsTrue(connectorPin.IsConnected);
+            Assert.IsTrue(sourcePin.Endpoints.Count() == 1);
+            Assert.IsTrue(sourcePin.IsConnected);
+
+            ((SystemBus)machine.SystemBus).Unregister(sender);
+
+            Assert.IsTrue(connectorPin.Endpoints.Count() == 1);
+            Assert.IsTrue(connectorPin.IsConnected);
+            Assert.IsEmpty(sourcePin.Endpoints);
+            Assert.IsFalse(sourcePin.IsConnected);
+        }
+
+        private object GetInstanceField(Type type, object instance, string fieldname)
+        {
+            var bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var field = type.GetField(fieldname, bindingFlags);
+            return field.GetValue(instance);
         }
     }
 }

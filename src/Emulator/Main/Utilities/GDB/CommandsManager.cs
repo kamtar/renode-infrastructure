@@ -17,6 +17,8 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Time;
+using Antmicro.Renode.Utilities.GDB.Commands;
 
 namespace Antmicro.Renode.Utilities.GDB
 {
@@ -156,6 +158,47 @@ namespace Antmicro.Renode.Utilities.GDB
             return registers;
         }
 
+        public void AddBreakpoint(ulong address, BreakpointType type)
+        {
+            GetOrCreateCommand<BreakpointCommand>().InsertBreakpoint(type, address);
+        }
+
+        public void AddWatchpoint(WatchpointDescriptor descriptor, int counter = 1)
+        {
+            GetOrCreateCommand<BreakpointCommand>().InsertBreakpoint(BreakpointType.AccessWatchpoint, descriptor.Address, descriptor, counter);
+        }
+
+        public void RemoveAllBreakpoints()
+        {
+            var breakpointCommand = GetOrCreateCommand<BreakpointCommand>();
+            breakpointCommand.RemoveAllBreakpoints();
+            breakpointCommand.RemoveAllWatchpoints();
+        }
+
+        public void LoadLatestSnapshot(Action<CommandsManager> onLoadAction = null)
+        {
+            var currentTimeStamp = EmulationManager.Instance.CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
+            LoadLatestSnapshot(currentTimeStamp - TimeInterval.FromTicks(1), onLoadAction);
+        }
+
+        public void LoadLatestSnapshot(TimeInterval beforeOrAtTimeStamp, Action<CommandsManager> onLoadAction = null)
+        {
+            if(Machine.GdbStubs.Count > 1)
+            {
+                throw new RecoverableException("More than one GDB connection opened. This is currently not supported.");
+            }
+            var port = Machine.GdbStubs.Values.First().Terminal.Port.Value;
+            var machineName = Machine.ToString();
+
+            EmulationManager.Instance.LoadLatestSnapshot(beforeOrAtTimeStamp);
+            if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var newMachine))
+            {
+                throw new RecoverableException("Machine was not found in the snapshot.");
+            }
+            var newCommandsManager = newMachine.GdbStubs[port].CommandsManager;
+            onLoadAction?.Invoke(newCommandsManager);
+        }
+
         public IMachine Machine { get; }
 
         public ManagedCpusDictionary ManagedCpus { get; }
@@ -163,6 +206,10 @@ namespace Antmicro.Renode.Utilities.GDB
         public bool CanAttachCPU { get; set; }
 
         public ICpuSupportingGdb Cpu => selectedCpu;
+
+        public ISet<Tuple<ulong, BreakpointType>> Breakpoints => GetOrCreateCommand<BreakpointCommand>().Breakpoints;
+
+        public IDictionary<WatchpointDescriptor, int> Watchpoints => GetOrCreateCommand<BreakpointCommand>().Watchpoints;
 
         private static GDBFeatureDescriptor UnifyFeature(List<GDBFeatureDescriptor> featureVariations)
         {
@@ -245,6 +292,11 @@ namespace Antmicro.Renode.Utilities.GDB
             }
             ManagedCpus.Add(cpu);
             return true;
+        }
+
+        private T GetOrCreateCommand<T>() where T : Command
+        {
+            return GetOrCreateCommand(typeof(T)) as T;
         }
 
         private Command GetOrCreateCommand(Type t)

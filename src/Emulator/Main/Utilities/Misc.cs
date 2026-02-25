@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -233,8 +233,11 @@ namespace Antmicro.Renode.Utilities
             var t = obj.GetType();
             return Misc.PrettyPrintCollection(t.GetProperties().Select(p => (MemberInfo)p).Concat(t.GetFields().Select(f => (MemberInfo)f)).Select(f =>
                 {
-                    var value = f is FieldInfo fi ? fi.GetValue(obj) : (f as PropertyInfo).GetValue(obj);
-                    var valueStr = ((value?.GetType()?.IsEnum ?? false) || value is bool || value as int? <= 9 || value as ulong? <= 9) ? value.ToString() : $"0x{value:x}";
+                    var fi = f as FieldInfo;
+                    var pi = f as PropertyInfo;
+                    var type = fi?.FieldType ?? pi.PropertyType;
+                    var value = (fi != null) ? fi.GetValue(obj) : pi.GetValue(obj);
+                    var valueStr = (!type.IsPrimitive || value is bool || value as int? <= 9 || value as ulong? <= 9) ? (value?.ToString() ?? "(null)") : $"0x{value:x}";
                     return $"{f.Name} = {valueStr}";
                 }));
         }
@@ -1141,6 +1144,26 @@ namespace Antmicro.Renode.Utilities
             }
         }
 
+        public static int DivCeil(this int dividend, int divisor)
+        {
+            return (dividend + divisor - 1) / divisor;
+        }
+
+        public static uint DivCeil(this uint dividend, uint divisor)
+        {
+            return (dividend + divisor - 1) / divisor;
+        }
+
+        public static int AlignUpToMultipleOf(this int value, int unit)
+        {
+            return value.DivCeil(unit) * unit;
+        }
+
+        public static uint AlignUpToMultipleOf(this uint value, uint unit)
+        {
+            return value.DivCeil(unit) * unit;
+        }
+
         public static string PrettyPrintFlagsEnum(Enum enumeration)
         {
             var values = new List<string>();
@@ -1471,6 +1494,13 @@ namespace Antmicro.Renode.Utilities
             return value;
         }
 
+        public static int RotateLeft(int value, int positions)
+        {
+            positions &= 0x1F;
+            var number = (uint)value;
+            return (int)((number << positions) | (number >> (32 - positions)));
+        }
+
         public static void Times(this int times, Action<int> action)
         {
             for(var i = 0; i < times; i++)
@@ -1702,6 +1732,20 @@ namespace Antmicro.Renode.Utilities
                 throw new ArgumentNullException("tail");
             }
             return ConcatIterator(head, tail, true);
+        }
+
+        public static bool TryFirst<T>(this IEnumerable<T> source, Func<T, bool> predicate, out T result)
+        {
+            foreach(var item in source)
+            {
+                if(predicate(item))
+                {
+                    result = item;
+                    return true;
+                }
+            }
+            result = default;
+            return false;
         }
 
         public static bool IsOnOsX

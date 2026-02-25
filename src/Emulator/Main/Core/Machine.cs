@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -8,15 +8,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Text;
 
 using Antmicro.Migrant;
-using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.EventRecording;
 using Antmicro.Renode.Exceptions;
@@ -37,11 +36,11 @@ using Monitor = System.Threading.Monitor;
 
 namespace Antmicro.Renode.Core
 {
-    public class Machine : IMachine, IDisposable
+    public class Machine : IMachine, IDisposable, IHasPreservableState
     {
         public Machine(bool createLocalTimeSource = false)
         {
-            InitAtomicMemoryState();
+            atomicState = new AtomicState(this);
 
             collectionSync = new object();
             pausingSync = new object();
@@ -74,32 +73,6 @@ namespace Antmicro.Renode.Core
             machineCreatedAt = new DateTime(CustomDateTime.Now.Ticks, DateTimeKind.Local);
         }
 
-        [PostDeserialization]
-        public void InitAtomicMemoryState()
-        {
-            atomicMemoryStatePointer = Marshal.AllocHGlobal(AtomicMemoryStateSize);
-
-            // the beginning of an atomic memory state contains two 8-bit flags:
-            // byte 0: information if the mutex has already been initialized
-            // byte 1: information if the reservations array has already been initialized
-            //
-            // the first byte must be set to 0 at start and after each deserialization
-            // as this is crucial for proper memory initialization;
-            //
-            // the second one must be set to 0 at start, but should not be overwritten after deserialization;
-            // this is handled when saving `atomicMemoryState`
-            if(atomicMemoryState != null)
-            {
-                Marshal.Copy(atomicMemoryState, 0, atomicMemoryStatePointer, atomicMemoryState.Length);
-                atomicMemoryState = null;
-            }
-            else
-            {
-                // this write spans two 8-byte flags
-                Marshal.WriteInt16(atomicMemoryStatePointer, 0);
-            }
-        }
-
         public void Dispose()
         {
             lock(disposedSync)
@@ -126,6 +99,9 @@ namespace Antmicro.Renode.Core
             }
             gdbStubs.Clear();
 
+            DetachIncomingInterrupts(registeredPeripherals.ToArray());
+            DetachOutgoingInterrupts(registeredPeripherals);
+
             // ordering below is due to the fact that the CPU can use other peripherals, e.g. Memory so it should be disposed first
             // Mapped memory can be used as storage by other disposable peripherals which may want to read it while being disposed
             foreach(var peripheral in GetPeripheralsOfType<IDisposable>().OrderBy(x => x is ICPU ? 0 : x is IMapped ? 2 : 1))
@@ -143,7 +119,7 @@ namespace Antmicro.Renode.Core
             Profiler?.Dispose();
             Profiler = null;
 
-            Marshal.FreeHGlobal(AtomicMemoryStatePointer);
+            atomicState.Dispose();
 
             EmulationManager.Instance.CurrentEmulation.BackendManager.HideAnalyzersFor(this);
         }
@@ -185,8 +161,8 @@ namespace Antmicro.Renode.Core
                 x => x.Period.ToString(),
                 x => x.Value.ToString(),
                 x => x.Step.ToString(),
-                x => x.Period == 0 ? "---" : Misc.NormalizeDecimal((ulong)(x.Frequency * x.Step) / (double)x.Period) + "Hz",
-                x => (x.Frequency == 0 || x.Period == 0) ? "---" : Misc.NormalizeDecimal((ulong)x.Period / (x.Frequency * (double)x.Step)) + "s"
+                x => x.Period == 0 ? "---" : Misc.NormalizeDecimal((x.Frequency * x.Step) / (double)x.Period) + "Hz",
+                x => (x.Frequency == 0 || x.Period == 0) ? "---" : Misc.NormalizeDecimal(x.Period / (x.Frequency * (double)x.Step)) + "s"
             );
             return table.ToArray();
         }
@@ -245,7 +221,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -271,7 +247,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -294,7 +270,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -352,7 +328,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -461,6 +437,42 @@ namespace Antmicro.Renode.Core
             catch(SocketException e)
             {
                 throw new RecoverableException(string.Format("Could not start GDB server: {0}", e.Message));
+            }
+        }
+
+        public void StartGdbServer(SocketServerProvider terminal, IEnumerable<string> cpuNames = null)
+        {
+            if(!terminal.IsStarted)
+            {
+                throw new RecoverableException("Cannot start GDB server without started Socket");
+            }
+
+            var cpus = SystemBus.GetCPUs().OfType<ICpuSupportingGdb>();
+            if(!cpus.Any())
+            {
+                throw new RecoverableException("Cannot start GDB server with no CPUs");
+            }
+
+            if(cpuNames != null)
+            {
+                try
+                {
+                    var cpusByName = cpus.ToDictionary(x => GetLocalName(x), x => x);
+                    cpus = cpuNames.Select(cpuName => cpusByName[cpuName]);
+                }
+                catch(KeyNotFoundException)
+                {
+                    throw new RecoverableException("Could not find requested CPUs for GDB server");
+                }
+            }
+
+            try
+            {
+                AddCpusToGdbStub(terminal, cpus);
+            }
+            catch(SocketException e)
+            {
+                throw new RecoverableException($"Could not start GDB server: {e.Message}");
             }
         }
 
@@ -1002,6 +1014,19 @@ namespace Antmicro.Renode.Core
                 }
             }
 
+            // Create HST Store Table and assign it to CPUs
+            var atomicCPUs = SystemBus.GetCPUs()
+                .OfType<TranslationCPU>()
+                .Where(cpu => cpu.UseMachineAtomicState).ToArray();
+            if(atomicCPUs.Count() > 1)
+            {
+                atomicState.AllocateStoreTable();
+                foreach(var cpu in atomicCPUs)
+                {
+                    cpu.InitStoreTable();
+                }
+            }
+
             // Register io_executable flags for all ArrayMemory peripherals
             foreach(var context in SystemBus.GetAllContextKeys())
             {
@@ -1141,6 +1166,59 @@ namespace Antmicro.Renode.Core
             return name;
         }
 
+        public object ExtractPreservedState()
+        {
+            var state = new MachinePreservedState();
+            state.GdbStubsLoggingState = new Dictionary<int, bool>();
+            state.GdbStubsConnections = new List<Tuple<IList<string>, SocketServerProvider>>();
+            state.Breakpoints = new Dictionary<int, ISet<Tuple<ulong, BreakpointType>>>();
+            state.Watchpoints = new Dictionary<int, IDictionary<WatchpointDescriptor, int>>();
+            foreach(var stub in GdbStubs.Values)
+            {
+                state.GdbStubsLoggingState[stub.Port] = stub.LogsEnabled;
+                state.GdbStubsConnections.Add(Tuple.Create<IList<string>, SocketServerProvider>(stub.AttachedCPUNames.ToList(), stub.Terminal));
+                state.Breakpoints[stub.Port] = stub.CommandsManager.Breakpoints;
+                state.Watchpoints[stub.Port] = stub.CommandsManager.Watchpoints;
+            }
+            return state;
+        }
+
+        public void LoadPreservedState(object state)
+        {
+            if(!(state is MachinePreservedState preservedState))
+            {
+                throw new RecoverableException("Unexpected state received while loading preserved state");
+            }
+
+            foreach(var stubConnection in preservedState.GdbStubsConnections)
+            {
+                StartGdbServer(stubConnection.Item2, stubConnection.Item1);
+            }
+
+            foreach(var stubLoggingState in preservedState.GdbStubsLoggingState)
+            {
+                EnableGdbLogging(stubLoggingState.Key, stubLoggingState.Value);
+            }
+
+            foreach(var stubBreakpoints in preservedState.Breakpoints)
+            {
+                foreach(var breakpoint in stubBreakpoints.Value)
+                {
+                    GdbStubs[stubBreakpoints.Key].CommandsManager.AddBreakpoint(breakpoint.Item1, breakpoint.Item2);
+                }
+            }
+
+            foreach(var stubWatchpoints in preservedState.Watchpoints)
+            {
+                foreach(var watchpoint in stubWatchpoints.Value)
+                {
+                    GdbStubs[stubWatchpoints.Key].CommandsManager.AddWatchpoint(watchpoint.Key, watchpoint.Value);
+                }
+            }
+        }
+
+        public string PreservableName => $"Machine:{this.ToString()}";
+
         public DateTime RealTimeClockStart
         {
             get
@@ -1249,11 +1327,17 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        public IReadOnlyDictionary<int, GdbStub> GdbStubs => new ReadOnlyDictionary<int, GdbStub>(gdbStubs);
+
         public Profiler Profiler { get; private set; }
 
         public bool HasPlayer => player != null;
 
-        public IntPtr AtomicMemoryStatePointer => atomicMemoryStatePointer;
+        public IntPtr AtomicMemoryStatePointer => atomicState.AtomicMemoryStatePointer;
+
+        public IntPtr StoreTablePointer => atomicState.StoreTablePointer;
+
+        public int StoreTableBits => atomicState.StoreTableBits;
 
         public bool HasRecorder => recorder != null;
 
@@ -1290,6 +1374,14 @@ namespace Antmicro.Renode.Core
             {
                 foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2))
                 {
+                    var endpoints = gpio.Endpoints;
+                    for(var i = 0; i < endpoints.Count; ++i)
+                    {
+                        if(endpoints[i].Receiver is IConnectable<IPeripheral> connectable)
+                        {
+                            connectable.DetachFrom(peripheral);
+                        }
+                    }
                     gpio.Disconnect();
                 }
             }
@@ -1403,7 +1495,11 @@ namespace Antmicro.Renode.Core
                         var endpoints = gpio.Endpoints;
                         for(var i = 0; i < endpoints.Count; ++i)
                         {
-                            if(endpoints[i].Receiver == detachedPeripheral)
+                            if(endpoints[i].Receiver is IConnectable<IPeripheral> connectable)
+                            {
+                                connectable.DetachFrom(peripheral);
+                            }
+                            else if(endpoints[i].Receiver == detachedPeripheral)
                             {
                                 gpio.Disconnect(endpoints[i]);
                             }
@@ -1528,6 +1624,21 @@ namespace Antmicro.Renode.Core
                 gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation));
                 this.Log(LogLevel.Info, "CPUs: {0} were added to a new GDB server created on port :{1}", Misc.PrettyPrintCollection(cpus, c => $"\"{c.GetName()}\""), port);
             }
+        }
+
+        private void AddCpusToGdbStub(SocketServerProvider terminal, IEnumerable<ICpuSupportingGdb> cpus)
+        {
+            foreach(var cpu in cpus)
+            {
+                CheckIsCpuAlreadyAttached(cpu);
+            }
+            int port = terminal.Port.Value;
+
+            if(gdbStubs.ContainsKey(port))
+            {
+                throw new RecoverableException($"There is already a GdbStub for port ({port}) used by this Socket. Use port variant of this function if this is expected");
+            }
+            gdbStubs.Add(port, new GdbStub(this, cpus, terminal));
         }
 
         private void InnerUnregisterFromParent(IPeripheral peripheral)
@@ -1717,26 +1828,11 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        [PreSerialization]
-        private void SerializeAtomicMemoryState()
-        {
-            atomicMemoryState = new byte[AtomicMemoryStateSize];
-            Marshal.Copy(atomicMemoryStatePointer, atomicMemoryState, 0, atomicMemoryState.Length);
-            // the first byte of an atomic memory state contains value 0 or 1
-            // indicating if the mutex has already been initialized;
-            // the mutex must be restored after each deserialization, so here we force this value to 0
-            atomicMemoryState[0] = 0;
-        }
-
         private int currentStampLevel;
         private bool alreadyDisposed;
         private Action<string> userStateHook;
         private string userState;
         private State state;
-
-        [Transient]
-        private IntPtr atomicMemoryStatePointer;
-        private byte[] atomicMemoryState;
 
         private RealTimeClockMode realTimeClockMode;
         private List<IPeripheral> currentStamp;
@@ -1744,6 +1840,8 @@ namespace Antmicro.Renode.Core
         private Player player;
         private Recorder recorder;
         private readonly PausedState pausedState;
+
+        private readonly AtomicState atomicState;
 
         [Constructor]
         private readonly Dictionary<int, GdbStub> gdbStubs;
@@ -1780,9 +1878,6 @@ namespace Antmicro.Renode.Core
         private readonly object disposedSync;
 
         private const int InitialDirtyListLength = 1 << 16;
-
-        // TODO: this probably should be dynamically get from Tlib, but how to nicely do that in `Machine` class?
-        private const int AtomicMemoryStateSize = 25600;
 
         private sealed class PausedState : IDisposable
         {
@@ -2073,6 +2168,14 @@ namespace Antmicro.Renode.Core
             {
                 return GetByName(name);
             }
+        }
+
+        private struct MachinePreservedState
+        {
+            public IList<Tuple<IList<string>, SocketServerProvider>> GdbStubsConnections;
+            public IDictionary<int, bool> GdbStubsLoggingState;
+            public IDictionary<int, IDictionary<WatchpointDescriptor, int>> Watchpoints;
+            public IDictionary<int, ISet<Tuple<ulong, BreakpointType>>> Breakpoints;
         }
 
         private enum State

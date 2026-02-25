@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -27,7 +27,8 @@ namespace Antmicro.Renode.Peripherals.UART
             locker = new object();
             IRQ = new GPIO();
             SeparateRxIRQ = new GPIO();
-            DMA = new GPIO();
+            TransmitDMA = new GPIO();
+            ReceiveDMA = new GPIO();
             txQueue = new Queue<byte>();
             if(!Misc.IsPowerOfTwo(fifoSize))
             {
@@ -96,7 +97,9 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(19, out receiverOverrun, FieldMode.Read | FieldMode.WriteOneToClear, name: "OR / Receiver Overrun Flag")
                 .WithTaggedFlag("IDLE / Idle Line Flag", 20)
                 // Despite the name below flag should be set when Watermark level is exceeded
-                .WithFlag(21, FieldMode.Read, valueProviderCallback: _ => BufferState == BufferState.Ready, name: "RDRF / Receive Data Register Full")
+                .WithFlag(21, FieldMode.Read,
+                    valueProviderCallback: _ => (BufferState == BufferState.Ready || BufferState == BufferState.Full),
+                    name: "RDRF / Receive Data Register Full")
                 .WithFlag(22, FieldMode.Read, valueProviderCallback: _ => txQueue.Count == 0, name: "TC / Transmission Complete Flag")
                 .WithFlag(23, out transmitDataRegisterEmpty, FieldMode.Read, name: "TDRE / Transmission Data Register Empty Flag")
                 .WithTaggedFlag("RAF / Receiver Active Flag", 24)
@@ -155,6 +158,8 @@ namespace Antmicro.Renode.Peripherals.UART
             registersMap.Add(CommonRegistersOffset + (long)CommonRegs.Data, new DoubleWordRegister(this)
                 .WithValueField(0, 9, valueProviderCallback: _ =>
                     {
+                        dmaReceivedData = ReceiveDmaState;
+
                         if(!this.TryGetCharacter(out var b))
                         {
                             receiveFifoUnderflowInterrupt.Value = true;
@@ -162,8 +167,10 @@ namespace Antmicro.Renode.Peripherals.UART
                         }
                         else
                         {
+                            UpdateBufferState();
                             OnBufferStateChanged();
                         }
+
                         return b;
                     },
                     writeCallback: (_, val) =>
@@ -189,6 +196,9 @@ namespace Antmicro.Renode.Peripherals.UART
                             transmitFifoOverflowInterrupt.Value = true;
                             this.Log(LogLevel.Warning, "Trying to write to a full Tx FIFO.");
                         }
+
+                        dmaTransmittedData = TransmitDmaState;
+
                         UpdateGPIOOutputs();
                     })
                 .WithReservedBits(10, 1)
@@ -299,6 +309,11 @@ namespace Antmicro.Renode.Peripherals.UART
                     .WithReservedBits(27, 5)
                     .WithWriteCallback((_, __) => UpdateGPIOOutputs())
                 );
+
+                registersMap.Add(FifoRegistersOffset + (long)FifoRegs.DataReadOnly, new DoubleWordRegister(this)
+                    .WithValueField(0, 16, FieldMode.Read, valueProviderCallback: _ => TryGetCharacter(out var ch, peek: true) ? ch : (byte)0, name: "DATA")
+                    .WithReservedBits(16, 16)
+                );
             }
 
             registers = new DoubleWordRegisterCollection(this, registersMap);
@@ -340,7 +355,7 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 if(!IsDataRegister(offset))
                 {
-                    this.Log(LogLevel.Warning, "Trying to read byte from {0} (0x{0:X}), not supported", offset);
+                    this.Log(LogLevel.Warning, "Trying to write byte {0} to {1} (0x{1:X}), not supported", value, offset);
                     return;
                 }
 
@@ -396,7 +411,7 @@ namespace Antmicro.Renode.Peripherals.UART
 
                 base.WriteChar(data);
                 UpdateBufferState();
-                UpdateInterrupt();
+                UpdateGPIOOutputs();
             }
         }
 
@@ -416,13 +431,15 @@ namespace Antmicro.Renode.Peripherals.UART
 
         public BufferState BufferState { get; private set; }
 
-        public long Size => 0x30;
+        public long Size => 0x800;
 
         public GPIO IRQ { get; }
 
         public GPIO SeparateRxIRQ { get; }
 
-        public GPIO DMA { get; }
+        public GPIO ReceiveDMA { get; }
+
+        public GPIO TransmitDMA { get; }
 
         public event Action BroadcastLINBreak;
 
@@ -463,13 +480,14 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             UpdateFillLevels();
             UpdateInterrupt();
-            UpdateDMA();
+            UpdateTxDMA();
+            UpdateRxDMA();
         }
 
         private void UpdateInterrupt()
         {
             var rxUnderflow = receiveFifoUnderflowEnabled.Value && receiveFifoUnderflowInterrupt.Value;
-            var rx = receiverInterruptEnabled.Value && BufferState == BufferState.Ready; // Watermark level exceeded
+            var rx = receiverInterruptEnabled.Value && (BufferState == BufferState.Ready || BufferState == BufferState.Full); // Watermark level exceeded
             var linBreak = linBreakDetect.Value && linBreakDetectInterruptEnable.Value;
             var rxOverrun = overrunInterruptEnable.Value && receiverOverrun.Value;
             var rxRequest = rxUnderflow || rx || linBreak || rxOverrun;
@@ -495,15 +513,60 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
-        private void UpdateDMA()
+        private void UpdateTxDMA()
         {
-            var drqState = false;
+            if(dmaTransmitInProgress)
+            {
+                return;
+            }
 
-            drqState |= transmitterDMAEnabled.Value && transmitDataRegisterEmpty.Value;
-            drqState |= receiverDMAEnabled.Value && BufferState == BufferState.Full;
+            dmaTransmitInProgress = true;
+            while(TransmitDmaState)
+            {
+                this.DebugLog("Setting TransmitDMA to true");
+                dmaTransmittedData = false;
+                TransmitDMA.Set();
+                // Transmission is instantaneous, so we either deassert signal immediately if we received data,
+                // or we keep the signal in high state and break the loop waiting on the next transfer
+                if(!dmaTransmittedData)
+                {
+                    break;
+                }
+                else
+                {
+                    this.DebugLog("Setting TransmitDMA to false");
+                    TransmitDMA.Unset();
+                }
+            }
+            dmaTransmitInProgress = false;
+            dmaTransmittedData = false;
+        }
 
-            DMA.Set(drqState);
-            this.Log(LogLevel.Noisy, "Setting DMA request to {0}", drqState);
+        private void UpdateRxDMA()
+        {
+            if(dmaReceiveInProgress)
+            {
+                return;
+            }
+
+            dmaReceiveInProgress = true;
+            while(ReceiveDmaState)
+            {
+                this.DebugLog("Setting ReceiveDMA request to true");
+                dmaReceivedData = false;
+                ReceiveDMA.Set();
+                if(!dmaReceivedData)
+                {
+                    break;
+                }
+                else
+                {
+                    this.DebugLog("Setting ReceiveDMA to false");
+                    ReceiveDMA.Unset();
+                }
+            }
+            dmaReceiveInProgress = false;
+            dmaReceivedData = false;
         }
 
         private void UpdateFillLevels()
@@ -573,9 +636,14 @@ namespace Antmicro.Renode.Peripherals.UART
             if(count >= rxMaxBytes)
             {
                 BufferState = BufferState.Full;
+                return;
             }
             BufferState = BufferState.Ready;
         }
+
+        private bool TransmitDmaState => transmitterDMAEnabled.Value && transmitDataRegisterEmpty.Value;
+
+        private bool ReceiveDmaState => receiverDMAEnabled.Value && BufferState == BufferState.Full;
 
         private long CommonRegistersOffset => hasGlobalRegisters ? 0x10 : 0x0;
 
@@ -583,6 +651,11 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private uint transmitWatermark;
         private uint receiveWatermark;
+
+        private bool dmaReceiveInProgress;
+        private bool dmaTransmitInProgress;
+        private bool dmaReceivedData;
+        private bool dmaTransmittedData;
 
         private BufferState latestBufferState = BufferState.Empty;
         private int rxMaxBytes = 1;
@@ -654,6 +727,7 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             Fifo = 0x0,
             Watermark = 0x4,
+            DataReadOnly = 0x8,
         }
     }
 }

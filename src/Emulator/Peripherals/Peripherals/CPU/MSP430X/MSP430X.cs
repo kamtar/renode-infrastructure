@@ -99,16 +99,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             throw new RecoverableException("This feature is not implemented yet");
         }
 
-        public void AddHook(ulong addr, Action<ICpuSupportingGdb, ulong> hook)
+        public void AddHook(ulong addr, CpuAddressHook hook)
         {
             if(!hooks.ContainsKey(addr))
             {
-                hooks.Add(addr, new HashSet<Action<ICpuSupportingGdb, ulong>>());
+                hooks.Add(addr, new HashSet<CpuAddressHook>());
             }
             hooks[addr].Add(hook);
         }
 
-        public void RemoveHook(ulong addr, Action<ICpuSupportingGdb, ulong> hook)
+        public void RemoveHook(ulong addr, CpuAddressHook hook)
         {
             if(!hooks.ContainsKey(addr))
             {
@@ -131,6 +131,14 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void RemoveAllHooks()
         {
             hooks.Clear();
+        }
+
+        public void RemoveHooks(CpuAddressHook hookToRemove)
+        {
+            foreach(var hook in hooks.Values.Where(x => x.Contains(hookToRemove)))
+            {
+                hook.Remove(hookToRemove);
+            }
         }
 
         public void SetRegister(int register, RegisterValue value)
@@ -1594,9 +1602,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private readonly List<PendingWatchpoint> pendingWatchpoints = new List<PendingWatchpoint>();
         private readonly SortedSet<int> pendingInterrupt = new SortedSet<int>();
-        private readonly IDictionary<ulong, HashSet<Action<ICpuSupportingGdb, ulong>>> hooks =
-            new Dictionary<ulong, HashSet<Action<ICpuSupportingGdb, ulong>>>();
-
+        private readonly IDictionary<ulong, HashSet<CpuAddressHook>> hooks = new Dictionary<ulong, HashSet<CpuAddressHook>>();
         private readonly SortedList<ulong, ArrayMemory> arrayMemoryList = new SortedList<ulong, ArrayMemory>();
 
         private const uint InterruptVectorStart = 0xFFFE;

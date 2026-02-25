@@ -1,11 +1,12 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -373,7 +374,7 @@ namespace Antmicro.Renode.Core.Extensions
                             }
                             break;
                         default:
-                            throw new Exception("Unreachable");
+                            throw new UnreachableException();
                         }
 
                         lineNum++;
@@ -399,7 +400,7 @@ namespace Antmicro.Renode.Core.Extensions
             loader.LoadFileChunks(fileName, chunks, cpu);
         }
 
-        public static void LoadSFDP(this GenericSpiFlash loader, ReadFilePath fileName)
+        public static void LoadSFDP(this ISFDPPeripheral loader, ReadFilePath fileName)
         {
             Logger.LogAs(loader, LogLevel.Debug, "Loading SFDP file {0}.", fileName);
             try

@@ -33,6 +33,8 @@ using Antmicro.Renode.Utilities.Collections;
 
 namespace Antmicro.Renode.Logging
 {
+    public class PeripheralLogLevelState : Dictionary<ILoggerBackend, Dictionary<string, Dictionary<string, LogLevel>>> { }
+
     public static class Logger
     {
         public static void AddBackend(ILoggerBackend backend, string name, bool overwrite = false)
@@ -427,12 +429,22 @@ namespace Antmicro.Renode.Logging
 
         public static void LogUnhandledRead(this IPeripheral peripheral, long offset)
         {
-            peripheral.Log(LogLevel.Warning, "Unhandled read from offset 0x{0:X}.", offset);
+            var registerName = "";
+            if(peripheral is IHasMappedRegisters mapped)
+            {
+                registerName = $" ({mapped.OffsetToString(offset)})";
+            }
+            peripheral.Log(LogLevel.Warning, "Unhandled read from offset 0x{0:X}{1}.", offset, registerName);
         }
 
         public static void LogUnhandledWrite(this IPeripheral peripheral, long offset, ulong value)
         {
-            peripheral.Log(LogLevel.Warning, "Unhandled write to offset 0x{0:X}, value 0x{1:X}.", offset, value);
+            var registerName = "";
+            if(peripheral is IHasMappedRegisters mapped)
+            {
+                registerName = $" ({mapped.OffsetToString(offset)})";
+            }
+            peripheral.Log(LogLevel.Warning, "Unhandled write to offset 0x{0:X}{1}, value 0x{2:X}.", offset, registerName, value);
         }
 
         public static bool PrintFullName { get; set; }
@@ -473,7 +485,7 @@ namespace Antmicro.Renode.Logging
         private static readonly FastReadConcurrentCollection<ILoggerBackend> backends = new FastReadConcurrentCollection<ILoggerBackend>();
         private static readonly ConcurrentDictionary<BackendSourceIdPair, LogLevel> levels = new ConcurrentDictionary<BackendSourceIdPair, LogLevel>();
 
-        internal class ActualLogger : ILogger
+        internal class ActualLogger : ILogger, IHasPreservableState
         {
             public ActualLogger()
             {
@@ -482,6 +494,7 @@ namespace Antmicro.Renode.Logging
 
             public void Dispose()
             {
+                EmulationManager.PreservableManager.UnregisterPreservable(this);
                 if(!SynchronousLogging)
                 {
                     StopLoggingThread();
@@ -590,6 +603,59 @@ namespace Antmicro.Renode.Logging
                 FlushBackends();
                 StartLoggingThread();
             }
+
+            public object ExtractPreservedState()
+            {
+                var peripheralsWithDifferentLoggingLevel = new PeripheralLogLevelState();
+
+                foreach(var backend in Logger.GetBackends())
+                {
+                    var customLogLevels = backend.Value.GetCustomLogLevels();
+                    if(customLogLevels.Count > 0)
+                    {
+                        peripheralsWithDifferentLoggingLevel[backend.Value] = new Dictionary<string, Dictionary<string, LogLevel>>();
+                        foreach(var custom in customLogLevels)
+                        {
+                            TryGetName(custom.Key, out string peripheralName, out string machineName);
+                            if(!peripheralsWithDifferentLoggingLevel[backend.Value].TryGetValue(machineName, out var machineDict))
+                            {
+                                machineDict = new Dictionary<string, LogLevel>();
+                                peripheralsWithDifferentLoggingLevel[backend.Value][machineName] = machineDict;
+                            }
+                            machineDict[peripheralName] = custom.Value;
+                        }
+                    }
+                }
+                return peripheralsWithDifferentLoggingLevel;
+            }
+
+            public void LoadPreservedState(object state)
+            {
+                if(!(state is PeripheralLogLevelState peripheralsWithDifferentLoggingLevel))
+                {
+                    throw new RecoverableException("Unexpected state received while loading preserved state");
+                }
+
+                foreach(var backendToMachine in peripheralsWithDifferentLoggingLevel)
+                {
+                    foreach(var machineToPeripheral in backendToMachine.Value)
+                    {
+                        if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineToPeripheral.Key, out var machine))
+                        {
+                            throw new RecoverableException($"Could not restore peripherals' logging level for Machine: {machineToPeripheral.Key}");
+                        }
+                        foreach(var peripheral in machineToPeripheral.Value)
+                        {
+                            IEmulationElement emulationElement = null;
+                            EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheral.Key, machine, out emulationElement);
+                            int id = EmulationManager.Instance.CurrentEmulation.CurrentLogger.GetOrCreateSourceId(emulationElement);
+                            backendToMachine.Key.SetLogLevel(peripheral.Value, id);
+                        }
+                    }
+                }
+            }
+
+            public string PreservableName => "ActualLogger";
 
             public bool SynchronousLogging
             {
@@ -705,6 +771,8 @@ namespace Antmicro.Renode.Logging
                 SynchronousLogging = ConfigurationManager.Instance.Get("general", "use-synchronous-logging", false);
                 alwaysAppendMachineName = ConfigurationManager.Instance.Get("general", "always-log-machine-name", false);
                 aggregateLogs = ConfigurationManager.Instance.Get("general", "collapse-repeated-log-entries", true);
+
+                EmulationManager.PreservableManager.RegisterPreservable(this, livesThroughEmulationChange: false);
 
                 if(!SynchronousLogging)
                 {

@@ -9,6 +9,7 @@ using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals.Bus;
@@ -55,6 +56,16 @@ namespace Antmicro.Renode.Peripherals.MTD
             }
             base.WriteDoubleWord(offset, value);
         }
+
+        public void TriggerProgrammingSequenceError(int bankId) => TriggerError(bankId, Error.ProgrammingSequence);
+
+        public void TriggerOperationError(int bankId) => TriggerError(bankId, Error.Operation);
+
+        public void TriggerSingleEccError(int bankId) => TriggerError(bankId, Error.SingleECC);
+
+        public void TriggerDoubleEccError(int bankId) => TriggerError(bankId, Error.DoubleECC);
+
+        public void TriggerInconsistencyError(int bankId) => TriggerError(bankId, Error.Inconsistency);
 
         public GPIO IRQ { get; } = new GPIO();
 
@@ -114,6 +125,16 @@ namespace Antmicro.Renode.Peripherals.MTD
             {
                 bank.DefineRegisters();
             }
+        }
+
+        private void TriggerError(int bankId, Error error)
+        {
+            if(bankId < 1 || bankId > NrOfBanks)
+            {
+                throw new RecoverableException($"Bank ID must be in range [1, {NrOfBanks}]. Ignoring operation.");
+            }
+
+            banks[bankId - 1].TriggerError(error);
         }
 
         private void UpdateInterrupts()
@@ -185,6 +206,15 @@ namespace Antmicro.Renode.Peripherals.MTD
 
         private const int NrOfBanks = 2;
 
+        public enum Error
+        {
+            ProgrammingSequence,
+            Operation,
+            SingleECC,
+            DoubleECC,
+            Inconsistency,
+        }
+
         private class Bank
         {
             public Bank(STM32H7_FlashController parent, int id, MappedMemory memory)
@@ -210,6 +240,32 @@ namespace Antmicro.Renode.Peripherals.MTD
             {
                 bankEraseRequest.Value = true;
                 BankErase();
+            }
+
+            public void TriggerError(Error error)
+            {
+                switch(error)
+                {
+                case Error.ProgrammingSequence:
+                    bankProgrammingErrorStatus.Value = true;
+                    break;
+                case Error.Operation:
+                    bankOperationErrorStatus.Value = true;
+                    break;
+                case Error.SingleECC:
+                    bankSingleEccErrorStatus.Value = true;
+                    break;
+                case Error.DoubleECC:
+                    bankDoubleEccErrorStatus.Value = true;
+                    break;
+                case Error.Inconsistency:
+                    bankInconsistencyErrorStatus.Value = true;
+                    break;
+                default:
+                    parent.WarningLog("Invalid error type {0}. Ignoring operation.", error);
+                    return;
+                }
+                parent.UpdateInterrupts();
             }
 
             public void HandleMemoryProgramWrite(IPeripheral writeTarget, ulong address, uint width)
@@ -296,11 +352,11 @@ namespace Antmicro.Renode.Peripherals.MTD
                     .WithTaggedFlag($"STRBERRIE{Id}", 19)
                     .WithReservedBits(20, 1)
                     .WithFlag(21, out bankInconsistencyErrorIrqEnable, name: $"INCERRIE{Id}")
-                    .WithTaggedFlag($"OPERRIE{Id}", 22)
+                    .WithFlag(22, out bankOperationErrorIrqEnable, name: $"OPERRIE{Id}")
                     .WithTaggedFlag($"RDPERRIE{Id}", 23)
                     .WithTaggedFlag($"RDSERRIE{Id}", 24)
-                    .WithTaggedFlag($"SNECCERRIE{Id}", 25)
-                    .WithTaggedFlag($"DBECCERRIE{Id}", 26)
+                    .WithFlag(25, out bankSingleEccErrorIrqEnable, name: $"SNECCERRIE{Id}")
+                    .WithFlag(26, out bankDoubleEccErrorIrqEnable, name: $"DBECCERRIE{Id}")
                     .WithTaggedFlag($"CRCENDIE{Id}", 27)
                     .WithTaggedFlag($"CRCRDERRIE{Id}", 28)
                     .WithReservedBits(29, 3);
@@ -318,11 +374,11 @@ namespace Antmicro.Renode.Peripherals.MTD
                     .WithTaggedFlag($"STRBERR{Id}", 19)
                     .WithReservedBits(20, 1)
                     .WithFlag(21, out bankInconsistencyErrorStatus, FieldMode.Read, name: $"INCERR{Id}")
-                    .WithTaggedFlag($"OPERR{Id}", 22)
+                    .WithFlag(22, out bankOperationErrorStatus, FieldMode.Read, name: $"OPERR{Id}")
                     .WithTaggedFlag($"RDPERR{Id}", 23)
                     .WithTaggedFlag($"RDSERR{Id}", 24)
-                    .WithTaggedFlag($"SNECCERR{Id}", 25)
-                    .WithTaggedFlag($"DBECCERR{Id}", 26)
+                    .WithFlag(25, out bankSingleEccErrorStatus, FieldMode.Read, name: $"SNECCERR{Id}")
+                    .WithFlag(26, out bankDoubleEccErrorStatus, FieldMode.Read, name: $"DBECCERR{Id}")
                     .WithTaggedFlag($"CRCEND{Id}", 27)
                     .WithReservedBits(28, 4);
 
@@ -337,11 +393,14 @@ namespace Antmicro.Renode.Peripherals.MTD
                     .WithReservedBits(20, 1)
                     .WithFlag(21, FieldMode.Set, name: $"CLR_INCERR{Id}",
                         writeCallback: (_, val) => { if(val) bankInconsistencyErrorStatus.Value = false; })
-                    .WithTaggedFlag($"CLR_OPERR{Id}", 22)
+                    .WithFlag(22, FieldMode.Set, name: $"CLR_OPERR{Id}",
+                        writeCallback: (_, val) => { if(val) bankOperationErrorStatus.Value = false; })
                     .WithTaggedFlag($"CLR_RDPERR{Id}", 23)
                     .WithTaggedFlag($"CLR_RDSERR{Id}", 24)
-                    .WithTaggedFlag($"CLR_SNECCERR{Id}", 25)
-                    .WithTaggedFlag($"CLR_DBECCERR{Id}", 26)
+                    .WithFlag(25, FieldMode.Set, name: $"CLR_SNECCERR{Id}",
+                        writeCallback: (_, val) => { if(val) bankSingleEccErrorStatus.Value = false; })
+                    .WithFlag(26, FieldMode.Set, name: $"CLR_DBECCERR{Id}",
+                        writeCallback: (_, val) => { if(val) bankDoubleEccErrorStatus.Value = false; })
                     .WithTaggedFlag($"CLR_CRCEND{Id}", 27)
                     .WithReservedBits(28, 4)
                     .WithWriteCallback((_, __) => parent.UpdateInterrupts());
@@ -359,7 +418,10 @@ namespace Antmicro.Renode.Peripherals.MTD
 
             public bool IrqStatus => (bankEndOfProgramIrqEnabled.Value && bankEndOfProgramIrqStatus.Value) ||
                                      (bankInconsistencyErrorIrqEnable.Value && bankInconsistencyErrorStatus.Value) ||
-                                     (bankProgrammingErrorIrqEnable.Value && bankProgrammingErrorStatus.Value);
+                                     (bankProgrammingErrorIrqEnable.Value && bankProgrammingErrorStatus.Value) ||
+                                     (bankOperationErrorIrqEnable.Value && bankOperationErrorStatus.Value) ||
+                                     (bankSingleEccErrorIrqEnable.Value && bankSingleEccErrorStatus.Value) ||
+                                     (bankDoubleEccErrorIrqEnable.Value && bankDoubleEccErrorStatus.Value);
 
             public bool WriteEnabled => bankWriteEnabled.Value;
 
@@ -427,6 +489,12 @@ namespace Antmicro.Renode.Peripherals.MTD
             private IFlagRegisterField bankInconsistencyErrorStatus;
             private IFlagRegisterField bankProgrammingErrorIrqEnable;
             private IFlagRegisterField bankProgrammingErrorStatus;
+            private IFlagRegisterField bankOperationErrorIrqEnable;
+            private IFlagRegisterField bankOperationErrorStatus;
+            private IFlagRegisterField bankSingleEccErrorIrqEnable;
+            private IFlagRegisterField bankSingleEccErrorStatus;
+            private IFlagRegisterField bankDoubleEccErrorIrqEnable;
+            private IFlagRegisterField bankDoubleEccErrorStatus;
 
             private byte bankWriteProtectionCurrentValue;
             private int bankWriteBufferCounter;
