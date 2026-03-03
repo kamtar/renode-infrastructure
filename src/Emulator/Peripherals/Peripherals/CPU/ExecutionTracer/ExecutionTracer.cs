@@ -86,14 +86,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void TrackVectorConfiguration()
         {
-            if(!(AttachedCPU is ICPUWithPostOpcodeExecutionHooks) || !(AttachedCPU.Architecture.StartsWith("riscv")))
+            if(!AttachedCPU.Architecture.StartsWith("riscv"))
             {
                 throw new RecoverableException($"{nameof(TrackVectorConfiguration)} is not available on this platform");
             }
-            var cpuWithPostOpcodeExecutionHooks = AttachedCPU as ICPUWithPostOpcodeExecutionHooks;
-            cpuWithPostOpcodeExecutionHooks.EnablePostOpcodeExecutionHooks(1u);
+
             // 0x7057 it the fixed part of the vcfg opcodes
-            cpuWithPostOpcodeExecutionHooks.AddPostOpcodeExecutionHook(0x7057, 0x7057, (pc, _) =>
+            AttachedCPU.AddPostOpcodeExecutionHook(0x7057, 0x7057, (pc, _) =>
             {
                 var vl = AttachedCPU.GetRegister(RiscVVlRegisterIndex);
                 var vtype = AttachedCPU.GetRegister(RiscVVtypeRegisterIndex);
@@ -104,21 +103,90 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void TrackRiscvAtomics()
         {
             const ulong amo = 0x2F; // The 'Zaamo' atomics all have the 'opcode' field as this.
-            const ulong opcode_mask = 0b1111111; // 7 bits
+            const ulong opcodeMask = 0b1111111; // 7 bits
 
-            if(!(AttachedCPU is ICPUWithPreOpcodeExecutionHooks cpuWithPreOpcodeExecutionHooks) || !(AttachedCPU.Architecture.StartsWith("riscv")))
+            if(!AttachedCPU.Architecture.StartsWith("riscv"))
             {
-                throw new RecoverableException($"{nameof(TrackRiscvAtomics)} pre-operands are not available on this platform");
+                throw new RecoverableException($"{nameof(TrackRiscvAtomics)} is not available on this platform");
             }
-            cpuWithPreOpcodeExecutionHooks.EnablePreOpcodeExecutionHooks(1u);
-            cpuWithPreOpcodeExecutionHooks.AddPreOpcodeExecutionHook(opcode_mask, amo, (pc, opcode) => EnqueueRiscvAtomicOperands(pc, opcode, false));
 
-            if(!(AttachedCPU is ICPUWithPostOpcodeExecutionHooks cpuWithPostOpcodeExecutionHooks) || !(AttachedCPU.Architecture.StartsWith("riscv")))
+            AttachedCPU.AddPreOpcodeExecutionHook(opcodeMask, amo, (pc, opcode) => EnqueueRiscvAtomicOperands(pc, opcode, false));
+            AttachedCPU.AddPostOpcodeExecutionHook(opcodeMask, amo, (pc, opcode) => EnqueueRiscvAtomicOperands(pc, opcode, true));
+        }
+
+        public void TrackRegisters(ulong opcodeMask = 0x0, ulong opcodeValue = 0x0, bool traceRegistersBefore = true)
+        {
+            var registers = AttachedCPU.GetRegisters();
+            TrackRegisters(registers, opcodeMask, opcodeValue, traceRegistersBefore);
+        }
+
+        public void TrackRegisters(int[] registerIndices, ulong opcodeMask = 0x0, ulong opcodeValue = 0x0, bool traceRegistersBefore = true)
+        {
+            var registers = new List<CPURegister>(registerIndices.Length);
+            var invalid = new List<int>(0);
+
+            foreach(var index in registerIndices)
             {
-                throw new RecoverableException($"{nameof(TrackRiscvAtomics)} post-operands are not available on this platform");
+                try
+                {
+                    registers.Add(AttachedCPU.GetRegisters().First(x => x.Index == index));
+                }
+                catch(InvalidOperationException)
+                {
+                    invalid.Add(index);
+                }
             }
-            cpuWithPostOpcodeExecutionHooks.EnablePostOpcodeExecutionHooks(1u);
-            cpuWithPostOpcodeExecutionHooks.AddPostOpcodeExecutionHook(opcode_mask, amo, (pc, opcode) => EnqueueRiscvAtomicOperands(pc, opcode, true));
+
+            if(invalid.Count > 0)
+            {
+                throw new RecoverableException("Can't find registers " + string.Join(", ", invalid));
+            }
+
+            TrackRegisters(registers, opcodeMask, opcodeValue, traceRegistersBefore);
+        }
+
+        public void TrackRegisters(string[] registersNames, ulong opcodeMask = 0x0, ulong opcodeValue = 0x0, bool traceRegistersBefore = true)
+        {
+            var registers = new List<CPURegister>(registersNames.Length);
+            var invalid = new List<string>(0);
+
+            foreach(var name in registersNames)
+            {
+                try
+                {
+                    registers.Add(AttachedCPU.GetRegisters().First(x =>
+                        x.Aliases != null &&
+                        x.Aliases.Any(alias => string.Equals(alias, name, StringComparison.InvariantCultureIgnoreCase))
+                    ));
+                }
+                catch(InvalidOperationException)
+                {
+                    invalid.Add(name);
+                }
+            }
+
+            if(invalid.Count > 0)
+            {
+                throw new RecoverableException("Can't find registers " + string.Join(", ", invalid));
+            }
+
+            TrackRegisters(registers, opcodeMask, opcodeValue, traceRegistersBefore);
+        }
+
+        public void TrackRegisters(IEnumerable<CPURegister> registers, ulong opcodeMask = 0x0, ulong opcodeValue = 0x0, bool traceRegistersBefore = true)
+        {
+            if(traceRegistersBefore)
+            {
+                AttachedCPU.AddPreOpcodeExecutionHook(opcodeMask, opcodeValue, (pc, _) =>
+                {
+                    EnqueueRegisters(pc, registers, true);
+                });
+            }
+
+            AttachedCPU.AddPostOpcodeExecutionHook(opcodeMask, opcodeValue, (pc, _) =>
+            {
+                EnqueueRegisters(pc, registers, false);
+            });
         }
 
         public void Dispose()
@@ -238,6 +306,17 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new NotImplementedException("Support for 128-bit AMO execution tracing not yet implemented");
             }
             currentAdditionalData.Enqueue(new RiscVAtomicInstructionData(isAfterExecution, pc, funct5, rdValue, rs1Value, rs2Value, width, memoryValue ?? throw new InvalidOperationException($"{nameof(memoryValue)} must be set")));
+        }
+
+        private void EnqueueRegisters(ulong pc, IEnumerable<CPURegister> registers, bool preOpcode)
+        {
+            var registersInfo = new List<Tuple<CPURegister, RegisterValue>>();
+
+            foreach(var register in registers)
+            {
+                registersInfo.Add(Tuple.Create(register, AttachedCPU.GetRegister(register.Index)));
+            }
+            currentAdditionalData.Enqueue(new RegistersData(pc, registersInfo, preOpcode));
         }
 
         private void WriterThreadBody()
