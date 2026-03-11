@@ -406,6 +406,7 @@
     <Compile Include="Emulator/Cores/RiscV/VeeR_EL2_PIC.cs" />
     <Compile Include="Emulator/Cores/RiscV/ExternalPMPBase.cs" />
     <Compile Include="Emulator/Cores/RiscV/RiscVExternalPMP.cs" />
+    <Compile Include="Emulator/Cores/RiscV/RiscVLLVMModelEncoder.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Emulator/Cores/RiscV/RiscV32Registers.tt">
@@ -816,7 +817,6 @@
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/SunxiTimer.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/TexasInstrumentsTimer.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/IRQControllers/AINTC.cs" />
-    <Compile Include="Emulator/Peripherals/Peripherals/I2C/STM32F4_I2C.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/STM32F4_RTC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/BitBanding.cs">
       <DependentUpon>BitBanding.tt</DependentUpon>
@@ -885,7 +885,8 @@
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/ExternalCPU.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/Synchronizer.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/HookDescriptor.cs" />
-    <Compile Include="Emulator/Peripherals/Peripherals/CPU/Disassembler/IDisassembler.cs" />
+    <Compile Include="Emulator/Peripherals/Peripherals/CPU/Disassembler/DisassemblyResult.cs" />
+    <Compile Include="Emulator/Peripherals/Peripherals/CPU/Disassembler/IFlaglessDiassembler.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/Registers/IRegisters.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/Registers/RegistersGroup.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/UART/SemihostingUart.cs" />
@@ -1317,9 +1318,7 @@
     <Compile Include="Emulator/Peripherals/Peripherals/Bus/ARM_NetworkInterconnect.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Mocks/MockDoubleWordPeripheralWithOnlyRegionReadMethod.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/LPC_Clock0.cs" />
-    <Compile Include="Emulator/Peripherals/Peripherals/CPU/LLVMArchitectureMapping.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Video/Allegro_E310.cs" />
-    <Compile Include="Emulator/Peripherals/Peripherals/CPU/Assembler/IAssembler.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/Assembler/LLVMAssembler.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Analog/STM32F3_ADC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/CPU/MSP430X/MSP430X.cs" />
@@ -1862,6 +1861,7 @@
     <Compile Include="Emulator/Main/Utilities/GDB/GdbStub.cs" />
     <Compile Include="Emulator/Main/Utilities/GDB/WatchpointDescriptor.cs" />
     <Compile Include="Emulator/Main/Peripherals/CPU/ICpuSupportingGdb.cs" />
+    <Compile Include="Emulator/Main/Peripherals/CPU/ICPUSupportingLLVMDisas.cs" />
     <Compile Include="Emulator/Main/Peripherals/CPU/ICPUWithMMU.cs" />
     <Compile Include="Emulator/Main/Peripherals/IPeripheralWithTransactionState.cs" />
     <Compile Include="Emulator/Main/Peripherals/CPU/GDB/GDBTypeBitField.cs" />
@@ -2015,6 +2015,7 @@
     <Compile Include="Emulator/Main/Exceptions/UnreachableException.cs"/>
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/NXP_XRDC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/SEMA42.cs" />
+    <Compile Include="Emulator/Peripherals/Peripherals/I2C/STM32F1_I2C.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt">

@@ -54,7 +54,7 @@ namespace Antmicro.Renode.Peripherals.CPU
     /// <see cref="TranslationCPU"/> implements <see cref="ICluster{T}"/> interface
     /// to seamlessly handle either cluster or CPU as a parameter to different methods.
     /// </summary>
-    public abstract partial class TranslationCPU : BaseCPU, ICluster<TranslationCPU>, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU, IHasPreservableState
+    public abstract partial class TranslationCPU : BaseCPU, ICluster<TranslationCPU>, IGPIOReceiver, ICpuSupportingGdb, ICPUWithExternalMmu, ICPUWithMMU, INativeUnwindable, ICPUWithMetrics, ICPUWithMappedMemory, ICPUWithRegisters, ICPUWithMemoryAccessHooks, IControllableCPU, IHasPreservableState, ICPUSupportingLLVMDisas
     {
         public void AddHookAtInterruptBegin(Action<ulong> hook)
         {
@@ -432,7 +432,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             return pauseGuard.RequestTranslationBlockRestart(quiet);
         }
 
-        public uint AssembleBlock(ulong addr, string instructions, uint flags = 0)
+        public uint AssembleBlock(ulong addr, string instructions, string triple = null, bool alternateDialect = false)
         {
             if(Assembler == null)
             {
@@ -443,7 +443,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             // We don't care if translation fails here (the address is unchanged in this case)
             TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
 
-            var result = Assembler.AssembleBlock(addr, instructions, flags);
+            var result = Assembler.AssembleBlock(addr, instructions, triple, alternateDialect);
             Bus.WriteBytes(result, addr, true, context: this);
             return (uint)result.Length;
         }
@@ -674,7 +674,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void ActivateNewHooks() => hooks.ActivateNewHooks();
 
-        public string DisassembleBlock(ulong addr = ulong.MaxValue, uint blockSize = 40, uint flags = 0)
+        public string DisassembleBlock(ulong addr = ulong.MaxValue, uint blockSize = 40, string triple = null, bool alternateDialect = false)
         {
             if(Disassembler == null)
             {
@@ -690,7 +690,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
 
             var opcodes = Bus.ReadBytes(addr, (int)blockSize, true, context: this);
-            Disassembler.DisassembleBlock(addr, opcodes, flags, out var result);
+            Disassembler.DisassembleBlock(addr, opcodes, triple, alternateDialect, out var result);
             return result;
         }
 
@@ -789,6 +789,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         public abstract RegisterValue GetRegister(int register);
 
         public abstract IEnumerable<CPURegister> GetRegisters();
+
+        public abstract string GetLLVMTriple(uint flags);
 
         public string PreservableName => $"TranslationCPU:{this.GetName()}";
 
@@ -1016,6 +1018,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         public abstract List<GDBFeatureDescriptor> GDBFeatures { get; }
 
         public abstract string GDBArchitecture { get; }
+
+        public abstract string[] AllLLVMTriples { get; }
+
+        public abstract string LLVMModel { get; }
+
+        public abstract Endianess DisassemblyHexFormatting { get; }
 
         public readonly bool UseMachineAtomicState;
 
@@ -1475,7 +1483,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             var symbol = Bus.FindSymbolAt(pc, this);
             var tab = Bus.ReadBytes(phy, (int)size, true, context: this);
-            Disassembler.DisassembleBlock(pc, tab, flags, out var disas);
+            Disassembler.DisassembleBlock(pc, tab, flags, false, out var disas);
 
             if(disas == null)
             {

@@ -18,17 +18,16 @@ namespace Antmicro.Renode.UserInterface
 {
     public static class ShellProvider
     {
-        public static Shell GenerateShell(Monitor monitor, bool forceVCursor = false)
+        public static Shell GenerateShell(Monitor monitor)
         {
             var settings = new ShellSettings
             {
-                NormalPrompt = new Prompt("(monitor) ", ConsoleColor.DarkRed),
+                NormalPrompt = new Prompt("(monitor) ", ConsoleColor.Red),
                 BannerProvider = () => Enumerable.Repeat(Environment.NewLine, NumberOfDummyLines).Aggregate(String.Empty, (x, y) => x + y) + EmulationManager.Instance.VersionString,
                 PreprocessSuggestionsInput = Monitor.SanitizePathSeparator,
                 UseBuiltinQuit = false,
                 UseBuiltinHelp = false,
                 UseBuiltinSave = false,
-                ForceVirtualCursor = forceVCursor,
                 ClearScreen = false,
                 DirectorySeparator = '/',
                 HistorySavePath = ConfigurationManager.Instance.Get("general", "history-path", Path.Combine(Emulator.UserDirectoryPath, "history"))

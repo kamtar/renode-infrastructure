@@ -1,19 +1,11 @@
 //
-// Copyright (c) 2010-2021 Antmicro
-// Copyright (c) 2011-2015 Realtime Embedded
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 {
-    public interface IDisassembler
-    {
-        bool TryDisassembleInstruction(ulong pc, byte[] memory, uint flags, out DisassemblyResult result, int memoryOffset = 0);
-
-        bool TryDecodeInstruction(ulong pc, byte[] memory, uint flags, out byte[] opcode, int memoryOffset = 0);
-    }
-
     public struct DisassemblyResult
     {
         public ulong PC { get; set; }
@@ -26,7 +18,13 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 
         public override string ToString()
         {
-            return $"0x{PC:x8}:   {OpcodeString} {DisassemblyString}";
+            if(DisassemblyString == null || DisassemblyString == "")
+            {
+                return $"0x{PC:x8}:   {OpcodeString}";
+            }
+            // This is a sane minimal length, based on some different binaries for quark.
+            // X86 instructions do not have the upper limit of lenght, so we have to approximate.
+            return $"0x{PC:x8}:   {OpcodeString,-14} {DisassemblyString}";
         }
     }
 }

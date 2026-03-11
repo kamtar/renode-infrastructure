@@ -10,23 +10,21 @@ using System.Runtime.InteropServices;
 
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.CPU.Disassembler;
 
 namespace Antmicro.Renode.Peripherals.CPU.Assembler
 {
-    public class LLVMAssembler : IAssembler
+    public class LLVMAssembler
     {
-        public LLVMAssembler(ICPU cpu)
+        public LLVMAssembler(ICPUSupportingLLVMDisas cpu)
         {
-            if(!LLVMArchitectureMapping.IsSupported(cpu))
-            {
-                throw new ArgumentOutOfRangeException(nameof(cpu));
-            }
             this.cpu = cpu;
         }
 
-        public byte[] AssembleBlock(ulong pc, string code, uint flags)
+        public byte[] AssembleBlock(ulong pc, string code, string triple, bool alternateDialect)
         {
-            LLVMArchitectureMapping.GetTripleAndModelKey(cpu, ref flags, out var triple, out var model);
+            LLVMDisassembler.ValidateTriple(cpu, ref triple);
+            var model = cpu.LLVMModel;
             // We need to initialize the architecture to be used before trying to assemble.
             // It's OK and cheap to initialize it multiple times, as this only sets a few pointers.
             init_llvm_architecture(triple);
@@ -40,7 +38,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Assembler
             IntPtr outLen;
             try
             {
-                ok = llvm_asm(triple, model, flags, code, pc, out output, out outLen);
+                ok = llvm_asm(triple, model, alternateDialect ? 1 : 0u, code, pc, out output, out outLen);
             }
             catch(EntryPointNotFoundException e)
             {
@@ -70,6 +68,6 @@ namespace Antmicro.Renode.Peripherals.CPU.Assembler
 
         private static bool xtensaSupportWarningIssued = false;
 
-        private readonly ICPU cpu;
+        private readonly ICPUSupportingLLVMDisas cpu;
     }
 }
