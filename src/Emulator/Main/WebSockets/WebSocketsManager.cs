@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -47,12 +47,14 @@ namespace Antmicro.Renode.WebSockets
                 maxPort = portToUse;
             }
 
-            if(!TryCreateListener(minPort, maxPort, out port, out httpListener))
+            if(!TryCreateListener(minPort, maxPort, out var port, out httpListener))
             {
                 return false;
             }
 
-            Logger.Log(LogLevel.Info, $"Listening on port {port}");
+            Port = port;
+
+            Logger.Log(LogLevel.Info, $"Listening on port {Port}");
             listenerTask = Task.Run(AsyncListener);
 
             return true;
@@ -65,7 +67,7 @@ namespace Antmicro.Renode.WebSockets
                 return false;
             }
 
-            Logger.Log(LogLevel.Info, $"Listening for new requests at http://localhost:{port}{endpoint}");
+            Logger.Log(LogLevel.Info, $"Listening for new requests at http://localhost:{Port}{endpoint}");
             endpoints.Add(endpoint, provider);
 
             return true;
@@ -78,7 +80,7 @@ namespace Antmicro.Renode.WebSockets
                 return false;
             }
 
-            Logger.Log(LogLevel.Debug, $"Stopped listening for new requests at endpoint: http://localhost:{port}{endpoint}");
+            Logger.Log(LogLevel.Debug, $"Stopped listening for new requests at endpoint: http://localhost:{Port}{endpoint}");
             endpoints.Remove(endpoint);
 
             return true;
@@ -107,6 +109,8 @@ namespace Antmicro.Renode.WebSockets
             listenerTask.Wait();
         }
 
+        public int Port { get; private set; }
+
         private WebSocketsManager()
         {
             endpoints = new Dictionary<string, IWebSocketServerProvider>();
@@ -118,17 +122,19 @@ namespace Antmicro.Renode.WebSockets
         {
             for(port = minPort; port <= maxPort; port++)
             {
-                httpListener = new HttpListener();
-                httpListener.Prefixes.Add(GetAddress(port));
-                try
+                httpListener = TryCreateListener($"http://*:{port}/");
+                if(httpListener != null)
                 {
-                    httpListener.Start();
                     return true;
                 }
-                catch(Exception)
+#if PLATFORM_WINDOWS
+                // On Windows, we need admin permissions to bind to all interfaces, so we need to fall back to localhost if binding to `*` fails.
+                httpListener = TryCreateListener($"http://localhost:{port}/");
+                if(httpListener != null)
                 {
-                    continue;
+                    return true;
                 }
+#endif
             }
 
             httpListener = null;
@@ -136,9 +142,19 @@ namespace Antmicro.Renode.WebSockets
             return false;
         }
 
-        private string GetAddress(int port)
+        private HttpListener TryCreateListener(string address)
         {
-            return $"http://+:{port}/";
+            var listener = new HttpListener();
+            listener.Prefixes.Add(address);
+            try
+            {
+                listener.Start();
+                return listener;
+            }
+            catch(Exception)
+            {
+            }
+            return null;
         }
 
         private async Task AsyncListener()
@@ -197,7 +213,6 @@ namespace Antmicro.Renode.WebSockets
 
         private HttpListener httpListener;
         private Task listenerTask;
-        private int port;
         private bool alreadyDisposed;
         private readonly CancellationTokenSource cancellationToken;
         private readonly Dictionary<string, IWebSocketServerProvider> endpoints;
