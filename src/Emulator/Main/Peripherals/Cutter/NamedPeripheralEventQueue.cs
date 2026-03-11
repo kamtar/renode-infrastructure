@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace Antmicro.Renode.Peripherals.Cutter.Peripherals
 {
@@ -7,12 +8,13 @@ namespace Antmicro.Renode.Peripherals.Cutter.Peripherals
     {
         public event Action<string> EventQueued;
 
-        public NamedPeripheralEventQueue()
+        public NamedPeripheralEventQueue(Func<string> timestampProvider = null)
         {
             sync = new object();
             queue = new Queue<string>();
             watchedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             watchAll = true;
+            this.timestampProvider = timestampProvider;
         }
 
         public void WatchAll()
@@ -70,10 +72,15 @@ namespace Antmicro.Renode.Peripherals.Cutter.Peripherals
             var safeKey = Escape(key);
             var safeEvent = Escape(eventName ?? string.Empty);
             var safeData = Escape(data ?? string.Empty);
-            var payload = string.Format("{0}|{1}|{2}", safeKey, safeEvent, safeData);
+            var safeTimestamp = Escape(GetTimestamp());
+            var payload = string.Format("{0}|{1}|{2}|{3}", safeKey, safeEvent, safeData, safeTimestamp);
 
             lock(sync)
             {
+                while(queue.Count >= MaxQueueDepth)
+                {
+                    queue.Dequeue();
+                }
                 queue.Enqueue(payload);
             }
 
@@ -113,6 +120,83 @@ namespace Antmicro.Renode.Peripherals.Cutter.Peripherals
             }
         }
 
+        public static string ResolveVirtualTimestamp(object machine)
+        {
+            if(machine == null)
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                var localTimeSourceProperty = machine.GetType().GetProperty("LocalTimeSource");
+                var localTimeSource = localTimeSourceProperty != null ? localTimeSourceProperty.GetValue(machine) : null;
+                if(localTimeSource == null)
+                {
+                    return string.Empty;
+                }
+
+                var elapsedProperty = localTimeSource.GetType().GetProperty("ElapsedVirtualTime");
+                var elapsedVirtualTime = elapsedProperty != null ? elapsedProperty.GetValue(localTimeSource) : null;
+                if(elapsedVirtualTime == null)
+                {
+                    return string.Empty;
+                }
+
+                var totalSecondsProperty = elapsedVirtualTime.GetType().GetProperty("TotalSeconds");
+                if(totalSecondsProperty != null)
+                {
+                    var value = totalSecondsProperty.GetValue(elapsedVirtualTime);
+                    if(value != null)
+                    {
+                        var seconds = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                        return seconds.ToString("0.000000000", CultureInfo.InvariantCulture);
+                    }
+                }
+
+                var toTimeSpanMethod = elapsedVirtualTime.GetType().GetMethod("ToTimeSpan", Type.EmptyTypes);
+                if(toTimeSpanMethod != null)
+                {
+                    var timeSpan = toTimeSpanMethod.Invoke(elapsedVirtualTime, null);
+                    if(timeSpan != null)
+                    {
+                        var totalSecondsPropertyOnTimeSpan = timeSpan.GetType().GetProperty("TotalSeconds");
+                        if(totalSecondsPropertyOnTimeSpan != null)
+                        {
+                            var value = totalSecondsPropertyOnTimeSpan.GetValue(timeSpan);
+                            if(value != null)
+                            {
+                                var seconds = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                                return seconds.ToString("0.000000000", CultureInfo.InvariantCulture);
+                            }
+                        }
+                    }
+                }
+            }
+            catch(Exception)
+            {
+            }
+
+            return string.Empty;
+        }
+
+        private string GetTimestamp()
+        {
+            if(timestampProvider == null)
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return timestampProvider() ?? string.Empty;
+            }
+            catch(Exception)
+            {
+                return string.Empty;
+            }
+        }
+
         private static string Escape(string input)
         {
             return input.Replace("\\", "\\\\").Replace("|", "\\|");
@@ -121,6 +205,8 @@ namespace Antmicro.Renode.Peripherals.Cutter.Peripherals
         private readonly object sync;
         private readonly Queue<string> queue;
         private readonly HashSet<string> watchedKeys;
+        private readonly Func<string> timestampProvider;
         private bool watchAll;
+        private const int MaxQueueDepth = 20000;
     }
 }
