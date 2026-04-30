@@ -1679,6 +1679,7 @@
     <Compile Include="Emulator/Main/Peripherals/Wireless/WirelessMedium.cs" />
     <Compile Include="Emulator/Main/Peripherals/Wireless/IEEE802_15_4Medium.cs" />
     <Compile Include="Emulator/Main/Peripherals/Wireless/BLEMedium.cs" />
+    <Compile Include="Emulator/Main/Peripherals/Wireless/UwbMedium.cs" />
     <Compile Include="Emulator/Main/Peripherals/Wireless/InterferenceQueue.cs" />
     <Compile Include="Emulator/Main/Utilities/ProgressMonitor.cs" />
     <Compile Include="Emulator/Main/Utilities/IProgressMonitorHandler.cs" />
