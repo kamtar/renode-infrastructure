@@ -1,20 +1,12 @@
-//
-// Copyright (c) 2010-2026 Antmicro
-//
-// This file is licensed under the MIT License.
-// Full license text is available in 'licenses/MIT.txt'.
-//
 using System;
 using System.Collections.Generic;
 using System.Linq;
-
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
-using Antmicro.Renode.Utilities;
-
+using  Antmicro.Renode.Peripherals.Network;
 namespace Antmicro.Renode.Peripherals.Wireless
 {
     public static class UwbMediumExtensions
@@ -25,7 +17,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
     }
 
-    public sealed class UwbMedium : IHasChildren<IMediumFunction>, IExternal, IConnectable<IRadio>, INetworkLogWireless
+    public sealed class UwbMedium : IHasChildren<IMediumFunction>, IExternal, IConnectable<IRadio>, INetworkLogWireless, INetworkInterface 
     {
         public UwbMedium()
         {
@@ -153,6 +145,27 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
+            var transmitTime = TimeDomainsManager.Instance.VirtualTimeStamp;
+            var setTransmitTime = sender.GetType().GetMethod("SetTransmitTimeFromMedium");
+            if(setTransmitTime != null)
+            {
+                // This timestamp is authoritative for the over-the-air event.
+                // DW1000.cs and UwbMedium.cs are compiled by Renode as separate
+                // script assemblies, so a concrete DW1000 cast cannot be used.
+                setTransmitTime.Invoke(sender, new object[] { transmitTime });
+            }
+
+            ulong? dwTransmitTimestamp = null;
+            var getTransmitTimestamp = sender.GetType().GetMethod("GetTransmitTimestampForMedium");
+            if(getTransmitTimestamp != null)
+            {
+                dwTransmitTimestamp = (ulong)getTransmitTimestamp.Invoke(sender, null);
+            }
+            else
+            {
+                this.WarningLog("Radio type {0} does not expose SetTransmitTimeFromMedium; check which DW1000.cs Renode loaded.", sender.GetType().AssemblyQualifiedName);
+            }
+
             foreach(var radioAndPosition in radios.Where(x => x.Key != sender))
             {
                 var receiver = radioAndPosition.Key;
@@ -164,8 +177,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     continue;
                 }
 
-                var deliveryTime = ApplyPropagationDelay(TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp(), senderPosition, radioAndPosition.Value);
+                var deliveryTime = ApplyPropagationDelay(transmitTime, senderPosition, radioAndPosition.Value);
                 var distanceMeters = CalculateDistanceMeters(senderPosition, radioAndPosition.Value);
+                var propagationNanoseconds = CalculatePropagationDelayNanoseconds(senderPosition, radioAndPosition.Value);
 
                 var packetCopy = packet.ToArray();
                 if(radioHooks.TryGetValue(receiver, out var hook))
@@ -173,7 +187,24 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     hook(packetCopy);
                 }
 
-                receiver.GetMachine().HandleTimeDomainEvent(receiver.ReceiveFrame, packetCopy, sender, deliveryTime, () =>
+                Action<byte[], IRadio> receiveAction = receiver.ReceiveFrame;
+                var receiveAtDwTimestamp = receiver.GetType().GetMethod("ReceiveFrameAtDwTimestamp");
+                if(receiveAtDwTimestamp != null && dwTransmitTimestamp.HasValue)
+                {
+                    var propagationTicks = (ulong)Math.Round(propagationNanoseconds * DwTicksPerNanosecond);
+                    var receiveTimestamp = (dwTransmitTimestamp.Value + propagationTicks) & DwTimeMask;
+                    receiveAction = (receivedPacket, frameSender) => receiveAtDwTimestamp.Invoke(receiver, new object[] { receivedPacket, frameSender, receiveTimestamp });
+                }
+                else
+                {
+                    var receiveAtMediumTime = receiver.GetType().GetMethod("ReceiveFrameAtMediumTime");
+                    if(receiveAtMediumTime != null)
+                    {
+                        receiveAction = (receivedPacket, frameSender) => receiveAtMediumTime.Invoke(receiver, new object[] { receivedPacket, frameSender, deliveryTime });
+                    }
+                }
+
+                receiver.GetMachine().HandleTimeDomainEvent(receiveAction, packetCopy, sender, deliveryTime, () =>
                 {
                     this.NoisyLog("Packet {0}:chan{1} -> {2}:chan{3} delivered, size {4}, distance {5:F3}m, at {6}.", senderName, sender.Channel, receiverName, receiver.Channel, packet.Length, distanceMeters, deliveryTime.TimeElapsed);
                     FrameTransmitted?.Invoke(this, sender, receiver, packetCopy);
@@ -184,15 +215,16 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private TimeStamp ApplyPropagationDelay(TimeStamp currentTime, Position senderPosition, Position receiverPosition)
         {
             var distanceMeters = CalculateDistanceMeters(senderPosition, receiverPosition);
-            var propagationDelayNanoseconds = additionalDelayNanoseconds;
-            if(distanceMeters > 0)
-            {
-                propagationDelayNanoseconds += distanceMeters / propagationSpeedMetersPerSecond * NanosecondsPerSecond;
-            }
-
+            var propagationDelayNanoseconds = CalculatePropagationDelayNanoseconds(senderPosition, receiverPosition);
             var roundedNanoseconds = propagationDelayNanoseconds <= 0 ? 0UL : (ulong)Math.Ceiling((double)propagationDelayNanoseconds);
             this.NoisyLog("Applying propagation delay of {0}ns for distance {1:F3}m.", roundedNanoseconds, distanceMeters);
             return new TimeStamp(currentTime.TimeElapsed + TimeInterval.FromNanoseconds(roundedNanoseconds), currentTime.Domain);
+        }
+
+        private decimal CalculatePropagationDelayNanoseconds(Position senderPosition, Position receiverPosition)
+        {
+            var distanceMeters = CalculateDistanceMeters(senderPosition, receiverPosition);
+            return additionalDelayNanoseconds + (distanceMeters <= 0 ? 0 : distanceMeters / propagationSpeedMetersPerSecond * NanosecondsPerSecond);
         }
 
         private static decimal CalculateDistanceMeters(Position senderPosition, Position receiverPosition)
@@ -211,5 +243,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private const decimal SpeedOfLightMetersPerSecond = 299792458m;
         private const decimal NanosecondsPerSecond = 1000000000m;
+        private const decimal DwTicksPerNanosecond = 63.8976m;
+        private const ulong DwTimeMask = 0xFFFFFFFFFFul;
     }
 }
