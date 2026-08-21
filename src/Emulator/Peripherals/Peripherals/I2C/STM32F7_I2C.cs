@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -15,12 +15,14 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.I2C
 {
+    [AllowedTranslations(AllowedTranslation.ByteToDoubleWord)]
     public sealed class STM32F7_I2C : SimpleContainer<II2CPeripheral>, II2CPeripheral, IDoubleWordPeripheral, IKnownSize
     {
         public STM32F7_I2C(IMachine machine) : base(machine)
         {
             EventInterrupt = new GPIO();
             ErrorInterrupt = new GPIO();
+            DmaReceive = new GPIO();
             registers = CreateRegisters();
             Reset();
         }
@@ -106,6 +108,8 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         public GPIO ErrorInterrupt { get; private set; }
 
+        public GPIO DmaReceive { get; }
+
         public bool RxNotEmpty => rxData.Count > 0;
 
         public bool OwnAddress1Enabled => ownAddress1Enabled.Value;
@@ -127,7 +131,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                         .WithTag("ANFOFF", 12, 1)
                         .WithReservedBits(13, 1)
                         .WithTag("TXDMAEN", 14, 1)
-                        .WithTag("RXDMAEN", 15, 1)
+                        .WithFlag(15, out rxDmaReceive, name: "RXDMAEN")
                         .WithTag("SBC", 16, 1)
                         .WithFlag(17, out noStretch, name: "NOSTRETCH")
                         .WithTag("WUPEN", 18, 1)
@@ -223,7 +227,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 }, {
                     (long)Registers.InterruptAndStatus, new DoubleWordRegister(this, 1)
                         .WithFlag(0,
-                            valueProviderCallback: _ => txData.Count == 0,
+                            valueProviderCallback: _ => true,
                             writeCallback: (_, value)=>
                             {
                                 if(value)
@@ -358,6 +362,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             else
             {
                 transmitInterruptStatus = true;
+                WriteToSlave();
             }
             Update();
         }
@@ -372,6 +377,8 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private uint ReceiveDataRead()
         {
+            DmaReceive.Unset();
+
             if(rxData.Count > 0)
             {
                 var value = rxData.Dequeue();
@@ -379,6 +386,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                 {
                     SetTransferCompleteFlags(); //TC/TCR is set when NBYTES data have been transfered
                 }
+
+                DmaReceive.Set(rxDmaReceive.Value && rxData.Count > 0);
+
                 return value;
             }
             this.Log(LogLevel.Warning, "Receive buffer underflow!");
@@ -405,17 +415,22 @@ namespace Antmicro.Renode.Peripherals.I2C
                 return;
             }
             txData.Enqueue((byte)newValue);
+            WriteToSlave();
+        }
+
+        private void SlaveTransmitDataWrite(uint newValue)
+        {
+            txData.Enqueue((byte)newValue);
+        }
+
+        private void WriteToSlave()
+        {
             if(txData.Count == (int)bytesToTransfer.Value)
             {
                 currentSlave.Write(txData.ToArray());
                 txData.Clear();
                 SetTransferCompleteFlags();
             }
-        }
-
-        private void SlaveTransmitDataWrite(uint newValue)
-        {
-            txData.Enqueue((byte)newValue);
         }
 
         private void SetTransferCompleteFlags()
@@ -450,6 +465,8 @@ namespace Antmicro.Renode.Peripherals.I2C
                 || (nackReceivedInterruptEnabled.Value && false) //TODO: implement NACKF
                 || (addressMatchedInterruptEnabled.Value && addressMatched.Value);
             EventInterrupt.Set(value);
+
+            DmaReceive.Set(rxDmaReceive.Value && rxData.Count > 0);
         }
 
         private II2CPeripheral currentSlave;
@@ -485,6 +502,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private IFlagRegisterField addressMatched;
         private IFlagRegisterField start;
         private IFlagRegisterField stop;
+        private IFlagRegisterField rxDmaReceive;
 
         private readonly DoubleWordRegisterCollection registers;
 

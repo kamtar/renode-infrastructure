@@ -1,9 +1,13 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -12,20 +16,20 @@ using Antmicro.Renode.Peripherals.CPU;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class SAM4S_RSTC : BasicDoubleWordPeripheral, IGPIOReceiver, IKnownSize
+    public class SAM4S_RSTC : BasicDoubleWordPeripheral, IGPIOReceiver, IKnownSize, IHasOwnLife
     {
-        public SAM4S_RSTC(IMachine machine) : base(machine)
+        public SAM4S_RSTC(IMachine machine, List<IPeripheral> ignored = null) : base(machine)
         {
+            ignoredPeripherals = ignored;
+
+            NRST.Set();
             DefineRegisters();
         }
 
-        public void InvokeReset(ResetType reason, bool resetProcessor = false, bool resetPeripherals = false, bool assertPin = false)
+        public void InvokeReset(ResetType reason, bool resetProcessor = false, bool resetPeripherals = false, bool resetExternal = false)
         {
-            if(!resetProcessor && !resetPeripherals && assertPin)
+            if(!resetProcessor && !resetPeripherals && !resetExternal)
             {
-                this.Log(LogLevel.Info, "Asserting IRQ pin");
-                userResetStatus = true;
-                IRQ.Set();
                 return;
             }
 
@@ -42,34 +46,81 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 resetVector = "peripherals";
             }
-            else
+            if(resetExternal)
             {
-                return;
+                if(resetVector == null)
+                {
+                    resetVector = "externals";
+                }
+                else
+                {
+                    resetVector += " with externals";
+                }
             }
 
             this.Log(LogLevel.Info, "Resetting {0}", resetVector);
             lastResetReason.Value = reason;
 
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu) && resetProcessor)
+            if(resetExternal)
             {
-                if(!(cpu is CortexM cortexM))
+                outputState = false;
+                if(inputState)
                 {
-                    this.Log(LogLevel.Error, "CPU reset has been requested, but the CPU is not cortex-m; is platform configuration correct?");
-                    return;
+                    this.Log(LogLevel.Info, "Asserting NRST pin");
+                    NRST.Unset();
                 }
-
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
-                {
-                    var currentVectorBase = cortexM.VectorTableOffset;
-                    cpu.Reset();
-                    cortexM.VectorTableOffset = currentVectorBase;
-                    cpu.Resume();
-                });
             }
 
             if(resetPeripherals)
             {
-                machine.RequestResetInSafeState(unresetable: new IPeripheral[] { this, cpu, machine.SystemBus });
+                var cpu = CPU;
+                var exclude = new List<IPeripheral> { this, machine.SystemBus, cpu };
+                if(!resetProcessor && Watchdog != null)
+                {
+                    exclude.Add(Watchdog);
+                }
+
+                if(ignoredPeripherals != null)
+                {
+                    exclude.AddRange(ignoredPeripherals);
+                }
+
+                var currentVectorBase = cpu?.VectorTableOffset ?? 0x0;
+                machine.RequestResetInSafeState(unresetable: exclude,
+                    postReset: () =>
+                    {
+                        FinishExternalReset();
+                        PostReset?.Invoke(lastResetReason.Value);
+                        if(resetProcessor && cpu != null)
+                        {
+                            cpu.Reset();
+                            cpu.VectorTableOffset = currentVectorBase;
+                            cpu.Resume();
+                        }
+                    }
+                );
+            }
+            else if(resetProcessor)
+            {
+                var cpu = CPU;
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                {
+                    Watchdog?.Reset();
+                    if(cpu != null)
+                    {
+                        var currentVectorBase = cpu.VectorTableOffset;
+                        cpu.Reset();
+                        cpu.VectorTableOffset = currentVectorBase;
+                        cpu.Resume();
+                    }
+                    FinishExternalReset();
+                    PostReset?.Invoke(lastResetReason.Value);
+                });
+            }
+            else
+            {
+                FinishExternalReset();
+                PostReset?.Invoke(lastResetReason.Value);
             }
         }
 
@@ -80,28 +131,60 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 this.Log(LogLevel.Warning, "Tried to write to pin different than 0, ignoring");
                 return;
             }
-
-            if(!state && userResetEnabled)
+            if(state == inputState)
             {
-                InvokeReset(ResetType.UserReset, resetProcessor: true);
-            }
-            else if(previousPinState && !state)
-            {
-                InvokeReset(ResetType.UserReset, assertPin: !userResetEnabled && userResetInterrupt);
+                return;
             }
 
-            previousPinState = state;
+            // set userResetStatus on rising edge
+            userResetStatus = NRST.IsSet && !state;
+            inputState = state;
+            NRST.Set(outputState && state);
+            if(userResetStatus && userResetEnabled)
+            {
+                InvokeReset(ResetType.UserReset, resetProcessor: true, resetPeripherals: true);
+            }
+            UpdateInterrupts();
         }
 
         public override void Reset()
         {
             base.Reset();
+            inputState = true;
+            outputState = true;
+            NRST.Set();
             IRQ.Unset();
         }
 
+        public void Start()
+        {
+            InitCPU();
+        }
+
+        public void Pause()
+        {
+            // Intentionally left empty
+        }
+
+        public void Resume()
+        {
+            // Intentionally left empty
+        }
+
+        [DefaultInterrupt]
         public GPIO IRQ { get; } = new GPIO();
 
+        public GPIO NRST { get; } = new GPIO();
+
+        public bool LingerNRST { get; set; }
+
         public long Size => 0x10;
+
+        public IPeripheral Watchdog { get; set; }
+
+        public bool IsPaused => false;
+
+        public event Action<ResetType> PostReset;
 
         private void DefineRegisters()
         {
@@ -132,18 +215,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithFlag(0, FieldMode.Read, name: "URSTS",
                     valueProviderCallback: _ =>
                     {
+                        UpdateInterrupts();
                         var previousValue = userResetStatus;
-                        if(previousValue && userResetInterrupt)
-                        {
-                            IRQ.Unset();
-                        }
                         userResetStatus = false;
                         return previousValue;
                     })
                 .WithReservedBits(1, 7)
                 .WithEnumField(8, 3, out lastResetReason, name: "RSTTYP")
                 .WithReservedBits(11, 5)
-                .WithTaggedFlag("NRSTL", 16)
+                .WithFlag(16, FieldMode.Read, name: "NRSTL",
+                    valueProviderCallback: _ => NRST.IsSet)
                 .WithFlag(17, FieldMode.Read, name: "SRCMP",
                     valueProviderCallback: _ => false)
                 .WithReservedBits(18, 14)
@@ -165,18 +246,113 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         return;
                     }
 
+                    var userReset = !userResetEnabled && resetEnabled.Value && !inputState;
                     userResetEnabled = resetEnabled.Value;
                     userResetInterrupt = interruptEnabled.Value;
+                    if(userReset)
+                    {
+                        InvokeReset(ResetType.UserReset, true, true, false);
+                    }
+                    UpdateInterrupts();
                 })
             ;
         }
 
+        private void InitCPU()
+        {
+            if(cpuChecked)
+            {
+                return;
+            }
+
+            var icpu = machine.SystemBus.GetCPUs().SingleOrDefault();
+            if(icpu == null)
+            {
+                this.Log(LogLevel.Error, "Invalid configuration, a single-core platform is required");
+            }
+            else if(!(icpu is CortexM cortexM))
+            {
+                this.Log(LogLevel.Error, "Invalid configuration, the CPU is required to be a cortex-m");
+            }
+            else
+            {
+                cpu = cortexM;
+            }
+            cpuChecked = true;
+        }
+
+        private void FinishExternalReset()
+        {
+            if(outputState)
+            {
+                return;
+            }
+            outputState = true;
+
+            if(inputState && !LingerNRST)
+            {
+                // both input and output are high
+                NRST.Set();
+                return;
+            }
+            if(lastResetReason.Value == ResetType.UserReset)
+            {
+                // trigger user reset only once
+                this.Log(LogLevel.Noisy, "Breaking user resetting");
+                if(inputState)
+                {
+                    // stop lingering NRST assert
+                    NRST.Set();
+                }
+                return;
+            }
+
+            PostReset?.Invoke(lastResetReason.Value);
+
+            if(!inputState)
+            {
+                this.Log(LogLevel.Debug, "Invoking User Reset post reset");
+            }
+            else
+            {
+                this.Log(LogLevel.Debug, "Invoking lingering User Reset post NRST assertion");
+            }
+
+            // won't recurse infinitely due to triggering user reset only once check
+            InvokeReset(ResetType.UserReset, true, true, false);
+        }
+
+        private void UpdateInterrupts()
+        {
+            var state = userResetStatus && !userResetEnabled && userResetInterrupt;
+            if(!IRQ.IsSet && state)
+            {
+                this.Log(LogLevel.Noisy, "Asserting IRQ pin");
+            }
+            IRQ.Set(state);
+        }
+
+        private CortexM CPU
+        {
+            get
+            {
+                InitCPU();
+                return cpu;
+            }
+        }
+
         private IEnumRegisterField<ResetType> lastResetReason;
 
-        private bool previousPinState;
+        private bool inputState = true;
+        private bool outputState = true;
         private bool userResetStatus;
         private bool userResetEnabled;
         private bool userResetInterrupt;
+
+        private CortexM cpu;
+        private bool cpuChecked;
+
+        private readonly IList<IPeripheral> ignoredPeripherals;
 
         private const int ResetPassword = 0xA5;
 

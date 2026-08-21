@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -18,65 +18,61 @@ using Antmicro.Renode.Time;
 namespace Antmicro.Renode.Peripherals.UART
 {
     [AllowedTranslations(AllowedTranslation.WordToDoubleWord | AllowedTranslation.ByteToDoubleWord)]
-    public class STM32_UART : BasicDoubleWordPeripheral, IUART
+    public class STM32_UART : BasicDoubleWordPeripheral, IUART, IDelayableUART
     {
         public STM32_UART(IMachine machine, uint frequency = 8000000) : base(machine)
         {
             this.frequency = frequency;
             DefineRegisters();
+            UpdateBaudrate();
         }
 
         public void WriteChar(byte value)
         {
-            if(!usartEnabled.Value && !receiverEnabled.Value)
+            if(!usartEnabled.Value || !receiverEnabled.Value)
             {
                 this.Log(LogLevel.Warning, "Received a character, but the receiver is not enabled, dropping.");
                 return;
             }
-            receiveFifo.Enqueue(value);
-            readFifoNotEmpty.Value = true;
 
-            if(BaudRate == 0)
+            if(receiverThread == null)
             {
-                this.Log(LogLevel.Warning, "Unknown baud rate, couldn't trigger the idle line interrupt");
-            }
-            else
-            {
-                // Setup a timeout of 1 UART frame (8 bits) for Idle line detection
                 idleLineDetectedCancellationTokenSrc?.Cancel();
-
-                var idleLineIn = (8 * 1000000) / BaudRate;
-                idleLineDetectedCancellationTokenSrc = new CancellationTokenSource();
-                machine.ScheduleAction(TimeInterval.FromMicroseconds(idleLineIn), _ => ReportIdleLineDetected(idleLineDetectedCancellationTokenSrc.Token), name: $"{nameof(STM32_UART)} Idle line detected");
+                ReceiveChar(value);
+                return;
             }
 
-            if(dmaReceptionRequest.Value)
+            lock(intermediateReceiveQueue)
             {
-                DMARequest.Blink();
+                idleLineDetectedCancellationTokenSrc?.Cancel();
+                intermediateReceiveQueue.Enqueue(value);
+                // Restart the receiver only when the queue changes from empty to nonempty.
+                if(intermediateReceiveQueue.Count == 1)
+                {
+                    receiverThread.Restart();
+                }
             }
-
-            Update();
         }
 
         public override void Reset()
         {
             base.Reset();
-            idleLineDetectedCancellationTokenSrc?.Cancel();
+            UpdateBaudrate();
+            lock(intermediateReceiveQueue)
+            {
+                idleLineDetectedCancellationTokenSrc?.Cancel();
+                receiverThread?.Stop();
+                intermediateReceiveQueue.Clear();
+            }
             receiveFifo.Clear();
             IRQ.Set(false);
         }
 
-        public uint BaudRate
-        {
-            get
-            {
-                //OversamplingMode.By8 means we ignore the oldest bit of dividerFraction.Value
-                var fraction = oversamplingMode.Value == OversamplingMode.By16 ? dividerFraction.Value : dividerFraction.Value & 0b111;
+        public TimeInterval CharacterTransmissionDelay { get; set; } = TimeInterval.Empty;
 
-                var divisor = 8 * (2 - (int)oversamplingMode.Value) * (dividerMantissa.Value + fraction / 16.0);
-                return divisor == 0 ? 0 : (uint)(frequency / divisor);
-            }
-        }
+        public TimeInterval CharacterReceptionDelay { get; set; } = TimeInterval.Empty;
+
+        public uint BaudRate => baudrate;
 
         public Bits StopBits
         {
@@ -104,6 +100,36 @@ namespace Antmicro.Renode.Peripherals.UART
                                         Parity.Odd) :
                                     Parity.None;
 
+        public bool AutoUpdateDelay
+        {
+            get => autoUpdateDelay;
+            set
+            {
+                autoUpdateDelay = value;
+                if(AutoUpdateDelay)
+                {
+                    UpdateDelay();
+                }
+            }
+        }
+
+        public double DelayMultiplier
+        {
+            get => delayMultiplier;
+            set
+            {
+                delayMultiplier = value;
+                if(AutoUpdateDelay)
+                {
+                    UpdateDelay();
+                }
+            }
+        }
+
+        // The STM32 UART includes the parity bit in its word length, unlike others such as the SAM USART.
+        // Therefore, to get the number of bits utilized to represent just the character, we subtract the parity bit.
+        public uint CharacterLength => (wordLength0.Value ? 9U : 8U) - (ParityBit == Parity.None ? 0U : 1U);
+
         [DefaultInterrupt]
         public GPIO IRQ { get; } = new GPIO();
 
@@ -111,6 +137,38 @@ namespace Antmicro.Renode.Peripherals.UART
 
         [field: Transient]
         public event Action<byte> CharReceived;
+
+        private void ReceiveChar(byte value)
+        {
+            receiveFifo.Enqueue(value);
+            readFifoNotEmpty.Value = true;
+
+            if(BaudRate == 0)
+            {
+                this.Log(LogLevel.Warning, "Unknown baud rate, couldn't trigger the idle line interrupt");
+            }
+            else
+            {
+                lock(intermediateReceiveQueue)
+                {
+                    if(intermediateReceiveQueue.Count == 0)
+                    {
+                        // Setup a timeout of 1 UART frame for Idle line detection
+                        idleLineDetectedCancellationTokenSrc = new CancellationTokenSource();
+                        var idleLineDetectedCancellationToken = idleLineDetectedCancellationTokenSrc.Token;
+                        var idleFrameDuration = this.GetActualTransmissionDuration(CharacterLength);
+                        machine.ScheduleAction(idleFrameDuration, _ => ReportIdleLineDetected(idleLineDetectedCancellationToken), name: $"{nameof(STM32_UART)} Idle line detected");
+                    }
+                }
+            }
+
+            if(dmaReceptionRequest.Value)
+            {
+                DMARequest.Blink();
+            }
+
+            Update();
+        }
 
         private void DefineRegisters()
         {
@@ -160,6 +218,7 @@ namespace Antmicro.Renode.Peripherals.UART
             Register.BaudRate.Define(this, name: "USART_BRR")
                 .WithValueField(0, 4, out dividerFraction, name: "DIV_Fraction")
                 .WithValueField(4, 12, out dividerMantissa, name: "DIV_Mantissa")
+                .WithChangeCallback((_, __) => UpdateBaudrate())
             ;
             Register.Control1.Define(this, name: "USART_CR1")
                 .WithTaggedFlag("SBK", 0)
@@ -174,7 +233,13 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithEnumField(9, 1, out paritySelection, name: "PS")
                 .WithFlag(10, out parityControlEnabled, name: "PCE")
                 .WithTaggedFlag("WAKE", 11)
-                .WithTaggedFlag("M", 12)
+                .WithFlag(12, out wordLength0, name: "M",
+                    changeCallback: (_, __) =>
+                    {
+                        this.WarningLog("9-bit word mode is not implemented");
+                        wordLength0.Value = false;
+                    }
+                )
                 .WithFlag(13, out usartEnabled, name: "UE")
                 .WithReservedBits(14, 1)
                 .WithEnumField(15, 1, out oversamplingMode, name: "OVER8")
@@ -185,6 +250,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     {
                         idleLineDetectedCancellationTokenSrc?.Cancel();
                     }
+                    UpdateBaudrate();
                     Update();
                 })
             ;
@@ -227,6 +293,38 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
+        private void UpdateDelay()
+        {
+            if(baudrate == 0)
+            {
+                CharacterTransmissionDelay = TimeInterval.Empty;
+                return;
+            }
+
+            CharacterTransmissionDelay = this.GetActualTransmissionDuration(CharacterLength) * DelayMultiplier;
+        }
+
+        private void UpdateBaudrate()
+        {
+            // OversamplingMode.By8 means we ignore the oldest bit of dividerFraction.Value
+            var fraction = oversamplingMode.Value == OversamplingMode.By16 ? dividerFraction.Value : dividerFraction.Value & 0b111;
+
+            var divisor = 8 * (2 - (int)oversamplingMode.Value) * (dividerMantissa.Value + fraction / 16.0);
+            var newBaudrate = divisor == 0 ? 0 : (uint)(frequency / divisor);
+
+            if(baudrate == newBaudrate)
+            {
+                return;
+            }
+            baudrate = newBaudrate;
+
+            ConfigureReceiverThread();
+            if(AutoUpdateDelay)
+            {
+                UpdateDelay();
+            }
+        }
+
         private void Update()
         {
             IRQ.Set(
@@ -235,6 +333,62 @@ namespace Antmicro.Renode.Peripherals.UART
                 (transmitDataRegisterEmptyInterruptEnabled.Value) || // TXE is assumed to be true
                 (transmissionCompleteInterruptEnabled.Value && transmissionComplete.Value)
             );
+        }
+
+        private void ConfigureReceiverThread()
+        {
+            lock(intermediateReceiveQueue)
+            {
+                if(baudrate == 0)
+                {
+                    // Drain the intermediate queue before disabling pacing to preserve character order.
+                    while(intermediateReceiveQueue.TryDequeue(out var value))
+                    {
+                        ReceiveChar(value);
+                    }
+                    receiverThread?.Dispose();
+                    receiverThread = null;
+                    return;
+                }
+
+                receiverThread?.Dispose();
+                receiverThread = machine.ObtainManagedThread(
+                    action: () =>
+                    {
+                        byte value;
+                        lock(intermediateReceiveQueue)
+                        {
+                            if(!intermediateReceiveQueue.TryDequeue(out value))
+                            {
+                                return;
+                            }
+                        }
+
+                        if(!usartEnabled.Value || !receiverEnabled.Value)
+                        {
+                            this.Log(LogLevel.Warning, "Received a character, but the receiver is not enabled, dropping.");
+                            return;
+                        }
+
+                        ReceiveChar(value);
+                    },
+                    period: this.GetActualTransmissionDuration(CharacterLength),
+                    name: $"{nameof(STM32_UART)} receiver",
+                    owner: this,
+                    stopCondition: () =>
+                    {
+                        lock(intermediateReceiveQueue)
+                        {
+                            return intermediateReceiveQueue.Count == 0;
+                        }
+                    }
+                );
+
+                if(intermediateReceiveQueue.Count > 0)
+                {
+                    receiverThread.Restart();
+                }
+            }
         }
 
         private CancellationTokenSource idleLineDetectedCancellationTokenSrc;
@@ -249,6 +403,7 @@ namespace Antmicro.Renode.Peripherals.UART
         private IFlagRegisterField transmissionCompleteInterruptEnabled;
         private IEnumRegisterField<ParitySelection> paritySelection;
         private IFlagRegisterField parityControlEnabled;
+        private IFlagRegisterField wordLength0;
         private IFlagRegisterField usartEnabled;
         private IEnumRegisterField<StopBitsValues> stopBits;
         private IFlagRegisterField dmaReceptionRequest;
@@ -257,9 +412,16 @@ namespace Antmicro.Renode.Peripherals.UART
         private IFlagRegisterField transmitDataRegisterEmptyInterruptEnabled;
         private IValueRegisterField dividerFraction;
 
+        private uint baudrate;
+        private bool autoUpdateDelay;
+        private double delayMultiplier = 1;
+
+        private IManagedThread receiverThread;
+
         private readonly uint frequency;
 
         private readonly Queue<byte> receiveFifo = new Queue<byte>();
+        private readonly Queue<byte> intermediateReceiveQueue = new Queue<byte>();
 
         private enum OversamplingMode
         {

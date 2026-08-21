@@ -1,11 +1,12 @@
 ﻿//
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Globalization;
+using System.Numerics;
 using System.Text.RegularExpressions;
 
 using Antmicro.Renode.Debugging;
@@ -18,7 +19,15 @@ namespace Antmicro.Renode.Time
     /// Represents time interval.
     /// Right now it has the resolution of 10^-9 second, but is intended for future extension.
     /// </summary>
-    public struct TimeInterval : IComparable<TimeInterval>, IEquatable<TimeInterval>
+    public struct TimeInterval : IComparable<TimeInterval>, IEquatable<TimeInterval>,
+        IAdditionOperators<TimeInterval, TimeInterval, TimeInterval>,
+        ISubtractionOperators<TimeInterval, TimeInterval, TimeInterval>,
+        IComparisonOperators<TimeInterval, TimeInterval, bool>,
+        IEqualityOperators<TimeInterval, TimeInterval, bool>,
+        IMultiplyOperators<TimeInterval, ulong, TimeInterval>,
+        IMultiplyOperators<TimeInterval, double, TimeInterval>,
+        IDivisionOperators<TimeInterval, ulong, TimeInterval>,
+        IDivisionOperators<TimeInterval, double, TimeInterval>
     {
         // this method is required by a parsing mechanism in the monitor
         public static explicit operator TimeInterval(string s)
@@ -173,6 +182,26 @@ namespace Antmicro.Renode.Time
         public static bool operator !=(TimeInterval t1, TimeInterval t2)
         {
             return t1.ticks != t2.ticks;
+        }
+
+        public static TimeInterval operator *(TimeInterval t, double n)
+        {
+            return new TimeInterval(checked((ulong)(t.ticks * n)));
+        }
+
+        public static TimeInterval operator *(TimeInterval t, ulong n)
+        {
+            return new TimeInterval(checked(t.ticks * n));
+        }
+
+        public static TimeInterval operator /(TimeInterval t, double n)
+        {
+            return new TimeInterval(checked((ulong)(t.ticks / n)));
+        }
+
+        public static TimeInterval operator /(TimeInterval t, ulong n)
+        {
+            return new TimeInterval(checked(t.ticks / n));
         }
 
         public static readonly TimeInterval Empty = FromTicks(0);

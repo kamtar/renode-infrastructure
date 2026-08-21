@@ -133,6 +133,7 @@ namespace Antmicro.Renode.Peripherals.Network
                     {(long)RegistersDMAChannel.TxDescriptorListAddress  + offset, new DoubleWordRegister(parent)
                         .WithValueField(0, 32, out txDescriptorRingStart, writeCallback: (_, __) =>
                         {
+                            txDescriptorRingStart.Value &= DMAAddressMask;
                             txDescriptorRingCurrent.Value = txDescriptorRingStart.Value;
                         },
                         name: "DMACTxDLAR.TDESLA (Start of Transmit List)")
@@ -140,6 +141,7 @@ namespace Antmicro.Renode.Peripherals.Network
                     {(long)RegistersDMAChannel.RxDescriptorListAddress + offset, new DoubleWordRegister(parent)
                         .WithValueField(0, 32, out rxDescriptorRingStart, writeCallback: (_, __) =>
                         {
+                            rxDescriptorRingStart.Value &= DMAAddressMask;
                             rxDescriptorRingCurrent.Value = rxDescriptorRingStart.Value;
                         },
                         name: "DMACRxDLAR.RDESLA (Start of Receive List)")
@@ -147,6 +149,7 @@ namespace Antmicro.Renode.Peripherals.Network
                     {(long)RegistersDMAChannel.TxDescriptorTailPointer + offset, new DoubleWordRegister(parent)
                         .WithValueField(0, 32, out txDescriptorRingTail, writeCallback: (previousValue, _) =>
                         {
+                            txDescriptorRingTail.Value &= DMAAddressMask;
                             var clearTxFinishedRing = txDescriptorRingTail.Value != txDescriptorRingCurrent.Value;
                             if((txState & DMAState.Suspended) != 0 || clearTxFinishedRing)
                             {
@@ -159,6 +162,7 @@ namespace Antmicro.Renode.Peripherals.Network
                     {(long)RegistersDMAChannel.RxDescriptorTailPointer + offset, new DoubleWordRegister(parent)
                         .WithValueField(0, 32, out rxDescriptorRingTail, writeCallback: (previousValue, _) =>
                         {
+                            rxDescriptorRingTail.Value &= DMAAddressMask;
                             var clearRxFinishedRing = rxDescriptorRingTail.Value != rxDescriptorRingCurrent.Value;
                             if((rxState & DMAState.Suspended) != 0 || clearRxFinishedRing)
                             {
@@ -531,9 +535,18 @@ namespace Antmicro.Renode.Peripherals.Network
                     writeBackStructure.OuterVlanTag = 0x0;
                     writeBackStructure.InnerVlanTag = 0x0;
                     writeBackStructure.OamSubtypeCodeOrMACControlPacketOpcode = (uint)frame.UnderlyingPacket.Type;
-                    writeBackStructure.IpHeaderError = false;
                     writeBackStructure.Ipv4HeaderPresent = frame.UnderlyingPacket.Type == EthernetPacketType.IpV4;
                     writeBackStructure.Ipv6HeaderPresent = frame.UnderlyingPacket.Type == EthernetPacketType.IpV6;
+
+                    // Validate IP header checksum if checksum offload is enabled
+                    writeBackStructure.IpHeaderError = false;
+                    writeBackStructure.IpChecksumBypassed = !parent.checksumOffloadEnable.Value;
+                    if(parent.checksumOffloadEnable.Value && writeBackStructure.Ipv4HeaderPresent)
+                    {
+                        var ipv4Packet = (IPv4Packet)frame.UnderlyingPacket.PayloadPacket;
+                        writeBackStructure.IpHeaderError = !ipv4Packet.ValidChecksum;
+                    }
+
                     if(writeBackStructure.Ipv4HeaderPresent || writeBackStructure.Ipv6HeaderPresent)
                     {
                         switch(((IpPacket)frame.UnderlyingPacket.PayloadPacket).NextHeader)
@@ -622,6 +635,27 @@ namespace Antmicro.Renode.Peripherals.Network
                     writeBackStructure.ReceiveWatchdogTimeout = false;
                     writeBackStructure.GiantPacket = false;
                     writeBackStructure.CrcError = parent.crcCheckDisable.Value ? false : !EthernetFrame.CheckCRC(bytes);
+
+                    // Validate payload checksum if checksum offload is enabled
+                    writeBackStructure.IpPayloadError = false;
+                    if(parent.checksumOffloadEnable.Value && (writeBackStructure.Ipv4HeaderPresent || writeBackStructure.Ipv6HeaderPresent))
+                    {
+                        var ipPacket = (IpPacket)frame.UnderlyingPacket.PayloadPacket;
+                        if(ipPacket.PayloadPacket is TcpPacket tcpPacket)
+                        {
+                            writeBackStructure.IpPayloadError = !tcpPacket.ValidChecksum;
+                        }
+                        else if(ipPacket.PayloadPacket is UdpPacket udpPacket)
+                        {
+                            // UDP checksum is optional in IPv4, mandatory in IPv6
+                            if(udpPacket.Checksum != 0 || writeBackStructure.Ipv6HeaderPresent)
+                            {
+                                writeBackStructure.IpPayloadError = !udpPacket.ValidChecksum;
+                            }
+                        }
+                        // Note: ICMP checksum validation could be added here if PacketDotNet supports it
+                    }
+
                     writeBackStructure.ErrorSummary = new bool[]
                     {
                         writeBackStructure.DribbleBitError,
@@ -762,6 +796,16 @@ namespace Antmicro.Renode.Peripherals.Network
                             case RegisterSourceAddressOperation.MACAddressRegister1Replace:
                                 sourceAddress = parent.MAC1;
                                 break;
+                            case RegisterSourceAddressOperation.MACAddressFromInputSignals:
+                                if(!parent.externalMacAddress.HasValue)
+                                {
+                                    this.Log(LogLevel.Warning, "Attempted to use external MAC address, but no address was provied");
+                                }
+                                else
+                                {
+                                    sourceAddress = parent.externalMacAddress;
+                                }
+                                break;
                             default:
                                 this.Log(LogLevel.Error, "Using a reserved value in ETH_MACCR.SARC register.");
                                 break;
@@ -777,7 +821,7 @@ namespace Antmicro.Renode.Peripherals.Network
                                     buffer,
                                     (uint)maximumSegmentSize.Value,
                                     latestTxContext,
-                                    parent.checksumOffloadEnable.Value,
+                                    true, // TSO always requires checksum offload
                                     parent.SendFrame,
                                     sourceAddress
                                 );
@@ -789,7 +833,7 @@ namespace Antmicro.Renode.Peripherals.Network
                                 frameAssembler = new FrameAssembler(
                                     parent,
                                     structure.CrcPadControl,
-                                    parent.checksumOffloadEnable.Value ? structure.ChecksumControl : ChecksumOperation.None,
+                                    structure.ChecksumControl, // TX checksum insertion is controlled by descriptor CIC field, not MACCR.IPC (RX-only)
                                     parent.SendFrame
                                 );
                             }
@@ -847,6 +891,7 @@ namespace Antmicro.Renode.Peripherals.Network
                         writeBackStructure.LateCollision = false;
                         writeBackStructure.NoCarrier = false;
                         writeBackStructure.LossOfCarrier = false;
+                        // Payload checksum errors are reported on RX path, but TX path report is not implemented yet by this model
                         writeBackStructure.PayloadChecksumError = false;
                         writeBackStructure.PacketFlushed = false;
                         writeBackStructure.JabberTimeout = false;
@@ -947,6 +992,14 @@ namespace Antmicro.Renode.Peripherals.Network
             private ulong TxProgrammableBurstLength => txProgrammableBurstLength.Value * ProgrammableBurstLengthMultiplier;
 
             private ulong RxProgrammableBurstLength => rxProgrammableBurstLength.Value * ProgrammableBurstLengthMultiplier;
+
+            private ulong DMAAddressMask => parent.DMABusWidth switch
+            {
+                BusWidth.Bits32 => ~(ulong)0b111,
+                BusWidth.Bits64 => ~(ulong)0b1111,
+                BusWidth.Bits128 => ~(ulong)0b11111,
+                _ => throw new NotImplementedException()
+            };
 
             private IValueRegisterField maximumSegmentSize;
             private IFlagRegisterField programmableBurstLengthTimes8;

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -33,7 +33,29 @@ using Antmicro.Renode.Utilities.Collections;
 
 namespace Antmicro.Renode.Logging
 {
-    public class PeripheralLogLevelState : Dictionary<ILoggerBackend, Dictionary<string, Dictionary<string, LogLevel>>> { }
+    public class LoggerState : Dictionary<ILoggerBackend, BackendState> { }
+
+    public class BackendState
+    {
+        public BackendState(LogLevel logLevel)
+        {
+            LogLevel = logLevel;
+            PeripheralsCustomLogLevel = new Dictionary<string, Dictionary<string, LogLevel>>();
+        }
+
+        public void Add(string machineName, string peripheralName, LogLevel logLevel)
+        {
+            if(!PeripheralsCustomLogLevel.TryGetValue(machineName, out var machineDict))
+            {
+                machineDict = new Dictionary<string, LogLevel>();
+                PeripheralsCustomLogLevel[machineName] = machineDict;
+            }
+            machineDict[peripheralName] = logLevel;
+        }
+
+        public readonly LogLevel LogLevel;
+        public readonly IDictionary<string, Dictionary<string, LogLevel>> PeripheralsCustomLogLevel;
+    }
 
     public static class Logger
     {
@@ -453,16 +475,6 @@ namespace Antmicro.Renode.Logging
 
         public static readonly LogLevel DefaultLogLevel = LogLevel.Info;
 
-        internal static ILogger GetLogger()
-        {
-            var logger = new ActualLogger();
-            foreach(var backend in backends.Items)
-            {
-                backend.Reset();
-            }
-            return logger;
-        }
-
         private static string GetGenericName(object o)
         {
             if(Misc.IsPythonObject(o))
@@ -480,6 +492,26 @@ namespace Antmicro.Renode.Logging
 
         private static ulong nextEntryId = 0;
         private static LogLevel minLevel = DefaultLogLevel;
+
+        [Flags]
+        public enum TimestampType
+        {
+            None = 0b0,
+            Host = 0b01,
+            Virtual = 0b10,
+            Both = Host | Virtual,
+        }
+
+        internal static ILogger GetLogger()
+        {
+            var logger = new ActualLogger();
+            foreach(var backend in backends.Items)
+            {
+                backend.Reset();
+            }
+            return logger;
+        }
+
         private static readonly object backendsChangeLock = new object();
         private static readonly ConcurrentDictionary<string, ILoggerBackend> backendNames = new ConcurrentDictionary<string, ILoggerBackend>();
         private static readonly FastReadConcurrentCollection<ILoggerBackend> backends = new FastReadConcurrentCollection<ILoggerBackend>();
@@ -557,7 +589,9 @@ namespace Antmicro.Renode.Logging
                     message = string.Format(message, args);
                 }
 
-                var entry = new LogEntry(CustomDateTime.Now, type, message, sourceId, alwaysAppendMachineName, Thread.CurrentThread.ManagedThreadId);
+                var virtualTimestamp = EmulationManager.Instance.CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
+                var hostTimestamp = CustomDateTime.Now;
+                var entry = new LogEntry(hostTimestamp, virtualTimestamp, type, message, sourceId, alwaysAppendMachineName, Thread.CurrentThread.ManagedThreadId);
 
                 if(SynchronousLogging)
                 {
@@ -606,50 +640,68 @@ namespace Antmicro.Renode.Logging
 
             public object ExtractPreservedState()
             {
-                var peripheralsWithDifferentLoggingLevel = new PeripheralLogLevelState();
+                var loggerState = new LoggerState();
 
-                foreach(var backend in Logger.GetBackends())
+                foreach(var backend in Logger.GetBackends().Values)
                 {
-                    var customLogLevels = backend.Value.GetCustomLogLevels();
+                    var backendState = new BackendState(backend.GetLogLevel());
+                    var customLogLevels = backend.GetCustomLogLevels();
                     if(customLogLevels.Count > 0)
                     {
-                        peripheralsWithDifferentLoggingLevel[backend.Value] = new Dictionary<string, Dictionary<string, LogLevel>>();
                         foreach(var custom in customLogLevels)
                         {
-                            TryGetName(custom.Key, out string peripheralName, out string machineName);
-                            if(!peripheralsWithDifferentLoggingLevel[backend.Value].TryGetValue(machineName, out var machineDict))
+                            if(!TryGetName(custom.Key, out string peripheralName, out string machineName))
                             {
-                                machineDict = new Dictionary<string, LogLevel>();
-                                peripheralsWithDifferentLoggingLevel[backend.Value][machineName] = machineDict;
+                                Log(LogLevel.Warning, "Could not extract logging level for key: {0} in backend: {1}", custom.Key, backend);
+                                continue;
                             }
-                            machineDict[peripheralName] = custom.Value;
+                            backendState.Add(machineName, peripheralName, custom.Value);
                         }
                     }
+
+                    if(backendState.LogLevel != DefaultLogLevel || backendState.PeripheralsCustomLogLevel.Count > 0)
+                    {
+                        loggerState.Add(backend, backendState);
+                    }
                 }
-                return peripheralsWithDifferentLoggingLevel;
+
+                return loggerState;
             }
 
             public void LoadPreservedState(object state)
             {
-                if(!(state is PeripheralLogLevelState peripheralsWithDifferentLoggingLevel))
+                if(!(state is LoggerState loggerState))
                 {
                     throw new RecoverableException("Unexpected state received while loading preserved state");
                 }
 
-                foreach(var backendToMachine in peripheralsWithDifferentLoggingLevel)
+                foreach(var backendToState in loggerState)
                 {
-                    foreach(var machineToPeripheral in backendToMachine.Value)
+                    var backend = backendToState.Key;
+                    var backendState = backendToState.Value;
+
+                    backend.Reset();
+                    backend.SetLogLevel(backendState.LogLevel);
+
+                    foreach(var machineToPeripherals in backendState.PeripheralsCustomLogLevel)
                     {
-                        if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineToPeripheral.Key, out var machine))
+                        var machineName = machineToPeripherals.Key;
+                        var peripheralStates = machineToPeripherals.Value;
+
+                        if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var machine))
                         {
-                            throw new RecoverableException($"Could not restore peripherals' logging level for Machine: {machineToPeripheral.Key}");
+                            throw new RecoverableException($"Could not restore peripherals' logging level for Machine: {machineName}");
                         }
-                        foreach(var peripheral in machineToPeripheral.Value)
+
+                        foreach(var peripheralState in peripheralStates)
                         {
+                            var peripheralName = peripheralState.Key;
+                            var peripheralLogLevel = peripheralState.Value;
+
                             IEmulationElement emulationElement = null;
-                            EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheral.Key, machine, out emulationElement);
+                            EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheralName, machine, out emulationElement);
                             int id = EmulationManager.Instance.CurrentEmulation.CurrentLogger.GetOrCreateSourceId(emulationElement);
-                            backendToMachine.Key.SetLogLevel(peripheral.Value, id);
+                            backend.SetLogLevel(peripheralLogLevel, id);
                         }
                     }
                 }
@@ -729,7 +781,7 @@ namespace Antmicro.Renode.Logging
                 var allBackends = Logger.backends.Items;
                 for(var i = 0; i < allBackends.Length; i++)
                 {
-                    allBackends[i].Log(entry);
+                    allBackends[i].Log(entry, timestampType);
                 }
             }
 
@@ -772,6 +824,7 @@ namespace Antmicro.Renode.Logging
                 alwaysAppendMachineName = ConfigurationManager.Instance.Get("general", "always-log-machine-name", false);
                 aggregateLogs = ConfigurationManager.Instance.Get("general", "collapse-repeated-log-entries", true);
 
+                timestampType = ConfigurationManager.Instance.Get("general", "log-timestamps-type", Logger.TimestampType.Host);
                 EmulationManager.PreservableManager.RegisterPreservable(this, livesThroughEmulationChange: false);
 
                 if(!SynchronousLogging)
@@ -832,6 +885,9 @@ namespace Antmicro.Renode.Logging
             private Timer logAggregatorTimer;
             [Transient]
             private bool aggregateLogs;
+
+            [Transient]
+            private Logger.TimestampType timestampType;
 
             [Transient]
             private bool alwaysAppendMachineName;

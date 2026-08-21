@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -417,8 +418,7 @@ namespace Antmicro.Renode.Utilities
         public static IEnumerable<T> Prefix<T>(IEnumerable<T> enumerable, Func<T, T, T> function)
         {
             var enumerator = enumerable.GetEnumerator();
-            // Using `out var` here causes a compiler crash in Mono 6.8.0.105+dfsg-3.3 from Debian
-            if(!enumerator.TryGetNext(out T prefix))
+            if(!enumerator.TryGetNext(out var prefix))
             {
                 yield break;
             }
@@ -439,55 +439,10 @@ namespace Antmicro.Renode.Utilities
             throw new ArgumentException($"Can't cast {number.GetType()} to ulong", "number");
         }
 
-#if !NET
-        // Enumerable.TakeLast is in the standard library on .NET Core but isn't available on .NET Framework
-        public static IEnumerable<T> TakeLast<T>(this IEnumerable<T> @this, int count)
-        {
-            // This will enumerate the collection twice - it might be not optimal for performance sensitive operations
-            return @this.Skip(Math.Max(0, @this.Count() - count));
-        }
-
-        public static IEnumerable<T[]> Chunk<T>(this IEnumerable<T> @this, int size)
-        {
-            var buffer = new Queue<T>();
-            foreach(var item in @this)
-            {
-                buffer.Enqueue(item);
-                if(buffer.Count == size)
-                {
-                    yield return buffer.ToArray();
-                    buffer.Clear();
-                }
-            }
-
-            if(buffer.Count > 0)
-            {
-                yield return buffer.ToArray();
-            }
-        }
-
-        public static void Fill<T>(this T[] array, T value, int startIndex = 0, int? count = null)
-        {
-            if(startIndex >= array.Length || startIndex < 0)
-            {
-                throw new ArgumentException("has to be a legal index", nameof(startIndex));
-            }
-            count = count ?? array.Length - startIndex;
-            if(startIndex + count.Value > array.Length)
-            {
-                throw new ArgumentException("value out of bounds", nameof(count));
-            }
-            for(var i = 0; i < count.Value; ++i)
-            {
-                array[startIndex + i] = value;
-            }
-        }
-#else
         public static void Fill<T>(this T[] array, T value, int startIndex = 0, int? count = null)
         {
             Array.Fill(array, value, startIndex, count ?? array.Length - startIndex);
         }
-#endif
 
         public static IEnumerable<T> Iterate<T>(Func<T> function)
         {
@@ -840,6 +795,14 @@ namespace Antmicro.Renode.Utilities
                 return true;
             }
 
+            // If BaseDirectory is empty (e.g. when hosted as a native library), fall back to
+            // the physical location of this assembly on disk.
+            var assemblyLocation = Path.GetDirectoryName(typeof(Misc).Assembly.Location);
+            if(!string.IsNullOrEmpty(assemblyLocation) && TryGetRootDirectory(assemblyLocation, out directory))
+            {
+                return true;
+            }
+
             // If we couldn't find root directory in previous step, try again
             // starting from directory of main process' executable. This is fallback for
             // when Renode was executed from self-contained binary.
@@ -939,6 +902,24 @@ namespace Antmicro.Renode.Utilities
             }
             outputFileFullPath = CopyToFile(libraryStream, libraryFile);
             return true;
+        }
+
+        public static bool TryCopyToTemporaryFile(string inputFile, out string temporaryFileFullPath, string temporaryFileSuffix = null)
+        {
+            temporaryFileFullPath = TemporaryFilesManager.Instance.GetTemporaryFile(temporaryFileSuffix);
+            try
+            {
+                using(var inputFileStream = new FileStream(inputFile, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    CopyToFile(inputFileStream, temporaryFileFullPath);
+                }
+                return true;
+            }
+            catch
+            {
+                temporaryFileFullPath = null;
+                return false;
+            }
         }
 
         public static ulong GrayToBinary(ulong grayEncoding)
@@ -1141,24 +1122,23 @@ namespace Antmicro.Renode.Utilities
             }
         }
 
-        public static int DivCeil(this int dividend, int divisor)
+        public static T DivCeil<T>(this T dividend, T divisor) where T : IBinaryInteger<T>
         {
-            return (dividend + divisor - 1) / divisor;
+            var quotient = dividend / divisor;
+            var remainder = dividend % divisor;
+
+            var roundUp = remainder != T.Zero && ((remainder > T.Zero) == (divisor > T.Zero));
+            return roundUp ? quotient + T.One : quotient;
         }
 
-        public static uint DivCeil(this uint dividend, uint divisor)
-        {
-            return (dividend + divisor - 1) / divisor;
-        }
-
-        public static int AlignUpToMultipleOf(this int value, int unit)
+        public static T AlignUpToMultipleOf<T>(this T value, T unit) where T : IBinaryInteger<T>
         {
             return value.DivCeil(unit) * unit;
         }
 
-        public static uint AlignUpToMultipleOf(this uint value, uint unit)
+        public static T AlignDownToMultipleOf<T>(this T value, T unit) where T : IBinaryInteger<T>
         {
-            return value.DivCeil(unit) * unit;
+            return value / unit * unit;
         }
 
         public static string PrettyPrintFlagsEnum(Enum enumeration)
@@ -1598,13 +1578,6 @@ namespace Antmicro.Renode.Utilities
             return -1;
         }
 
-#if !NET
-        public static TSource MinBy<TSource, T>(this IEnumerable<TSource> source, Func<TSource, T> map) where T: IComparable<T>
-        {
-            return source.Aggregate((a, b) => map(a).CompareTo(map(b)) < 0 ? a : b);
-        }
-#endif
-
         public static string Stringify<TSource>(this IEnumerable<TSource> source, string separator = " ", int limitPerLine = 0)
         {
             return Stringify(source.Select(x => x == null ? String.Empty : x.ToString()), separator, limitPerLine);
@@ -1680,6 +1653,30 @@ namespace Antmicro.Renode.Utilities
         public static IEnumerable<int> ConcatRangeFromTo(this IEnumerable<int> enumerable, int start, int stopIncluded)
         {
             return enumerable.Concat(Enumerable.Range(start, stopIncluded - start + 1));
+        }
+
+        public static int BinarySearch<T>(this IList<T> list, Func<T, int> comp)
+        {
+            int first = 0;
+            int last = list.Count;
+            while(first != last)
+            {
+                int idx = (first + last) / 2;
+                var compRes = comp(list[idx]);
+                if(compRes < 0)
+                {
+                    last = idx;
+                }
+                else if(compRes > 0)
+                {
+                    first = idx + 1;
+                }
+                else
+                {
+                    return idx;
+                }
+            }
+            return ~first;
         }
 
         // MoreLINQ - Extensions to LINQ to Objects
@@ -1913,7 +1910,7 @@ namespace Antmicro.Renode.Utilities
         }
 
         private const BindingFlags DefaultBindingFlags = BindingFlags.Public | BindingFlags.NonPublic |
-                BindingFlags.Instance | BindingFlags.DeclaredOnly;
+                BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
 
         private const int MACLength = 14;
         private const int ZeroPrefixPosition = 4;

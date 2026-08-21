@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2022-2025 Silicon Labs
 //
 // This file is licensed under the MIT License.
@@ -13,6 +13,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Time;
 
 using Org.BouncyCastle.Crypto.Engines;
@@ -42,49 +43,49 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             SoftwareReset = false;
         }
 
-        [ConnectionRegionAttribute("rngctrl_s")]
+        [ConnectionRegion("rngctrl_s")]
         public uint ReadDoubleWordRegisterSecure(long offset)
         {
             return ReadRegister(offset);
         }
 
-        [ConnectionRegionAttribute("rngctrl_ns")]
+        [ConnectionRegion("rngctrl_ns")]
         public uint ReadDoubleWordRegisterNonSecure(long offset)
         {
             return ReadRegister(offset);
         }
 
-        [ConnectionRegionAttribute("rngctrl_s")]
+        [ConnectionRegion("rngctrl_s")]
         public void WriteDoubleWordRegisterSecure(long offset, uint value)
         {
             WriteRegister(offset, value);
         }
 
-        [ConnectionRegionAttribute("rngctrl_ns")]
+        [ConnectionRegion("rngctrl_ns")]
         public void WriteDoubleWordRegisterNonSecure(long offset, uint value)
         {
             WriteRegister(offset, value);
         }
 
-        [ConnectionRegionAttribute("rngfifo_s")]
+        [ConnectionRegion("rngfifo_s")]
         public uint ReadDoubleWordFifoSecure(long offset)
         {
             return ReadFifo(offset);
         }
 
-        [ConnectionRegionAttribute("rngfifo_ns")]
+        [ConnectionRegion("rngfifo_ns")]
         public uint ReadDoubleWordFifoNonSecure(long offset)
         {
             return ReadFifo(offset);
         }
 
-        [ConnectionRegionAttribute("rngfifo_s")]
+        [ConnectionRegion("rngfifo_s")]
         public void WriteDoubleWordFifoSecure(long _, uint __)
         {
             // Writing not supported
         }
 
-        [ConnectionRegionAttribute("rngfifo_ns")]
+        [ConnectionRegion("rngfifo_ns")]
         public void WriteDoubleWordFifoNonSecure(long _, uint __)
         {
             // Writing not supported
@@ -431,6 +432,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             Unused      = 7,
         }
 
+        [RegistersDescription("rngctrl_s", "rngctrl_ns")]
         private enum Registers
         {
             RngControl                              = 0x000,

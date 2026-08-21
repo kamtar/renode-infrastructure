@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -142,9 +142,9 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// Fluent API for tagged field creation. For parameters see <see cref="PeripheralRegister.Tag"/>.
         /// </summary>
         /// <returns>This register with a defined tag field.</returns>
-        public static T WithTag<T>(this T register, string name, int position, int width) where T : PeripheralRegister
+        public static T WithTag<T>(this T register, string name, int position, int width, bool silent = false) where T : PeripheralRegister
         {
-            register.Tag(name, position, width);
+            register.Tag(name, position, width, silent: silent);
             return register;
         }
 
@@ -152,11 +152,11 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// Fluent API for creating a set of tagged fields. For parameters see <see cref="PeripheralRegister.Tag"/>.
         /// </summary>
         /// <returns>This register with a defined tag field set.</returns>
-        public static T WithTags<T>(this T register, string name, int position, int width, int count) where T : PeripheralRegister
+        public static T WithTags<T>(this T register, string name, int position, int width, int count, bool silent = false) where T : PeripheralRegister
         {
             for(var i = 0; i < count; i++)
             {
-                register.Tag(name == null ? null : $"{name}_{i}", position + (i * width), width);
+                register.Tag(name == null ? null : $"{name}_{i}", position + (i * width), width, silent: silent);
             }
             return register;
         }
@@ -165,9 +165,9 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// Fluent API for tagged flag creation - a tag of width equal to 1. For parameters see <see cref="PeripheralRegister.DefineValueField"/>.
         /// </summary>
         /// <returns>This register with a defined tag field.</returns>
-        public static T WithTaggedFlag<T>(this T register, string name, int position) where T : PeripheralRegister
+        public static T WithTaggedFlag<T>(this T register, string name, int position, bool silent = false) where T : PeripheralRegister
         {
-            register.Tag(name, position, 1);
+            register.TaggedFlag(name, position, silent);
             return register;
         }
 
@@ -193,6 +193,26 @@ namespace Antmicro.Renode.Core.Structure.Registers
             Action<ulong, ulong> writeCallback = null, Action<ulong, ulong> changeCallback = null, Func<ulong, ulong> valueProviderCallback = null, Action<ulong, ulong> shadowReloadCallback = null, bool softResettable = true, string name = null) where T : PeripheralRegister
         {
             valueField = register.DefineValueField(position, width, mode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, softResettable, name);
+            return register;
+        }
+
+        public static T WithConditionallyWritableValueField<T>(this T register, int position, int width, out IValueRegisterField valueField, Func<bool> writabilityCondition, Action<ulong, ulong> readCallback = null,
+            Action<ulong, ulong> writeCallback = null, Action<ulong, ulong> changeCallback = null, Func<ulong, ulong> valueProviderCallback = null, bool softResettable = true, string name = null)
+            where T : PeripheralRegister
+        {
+            IValueRegisterField vf = null;
+            vf = register.DefineValueField(position, width, FieldMode.Read | FieldMode.Write, readCallback, writeCallback, changeCallback: (oldValue, value) =>
+            {
+                if(!writabilityCondition())
+                {
+                    vf.Value = oldValue;
+                }
+                else
+                {
+                    changeCallback?.Invoke(oldValue, value);
+                }
+            }, valueProviderCallback, null, softResettable, name);
+            valueField = vf;
             return register;
         }
 
@@ -235,6 +255,27 @@ namespace Antmicro.Renode.Core.Structure.Registers
             return register;
         }
 
+        public static R WithConditionallyWritableEnumField<R, T>(this R register, int position, int width, out IEnumRegisterField<T> enumField, Func<bool> writabilityCondition, Action<T, T> readCallback = null,
+            Action<T, T> writeCallback = null, Action<T, T> changeCallback = null, Func<T, T> valueProviderCallback = null, bool softResettable = true, string name = null)
+            where R : PeripheralRegister
+            where T : struct, IConvertible
+        {
+            IEnumRegisterField<T> ef = null;
+            ef = register.DefineEnumField<T>(position, width, FieldMode.Read | FieldMode.Write, readCallback, writeCallback, changeCallback: (oldValue, value) =>
+            {
+                if(!writabilityCondition())
+                {
+                    ef.Value = oldValue;
+                }
+                else
+                {
+                    changeCallback?.Invoke(oldValue, value);
+                }
+            }, valueProviderCallback, null, softResettable, name);
+            enumField = ef;
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for creation of set of enum fields. For parameters see the other overload of <see cref="PeripheralRegisterExtensions.WithEnumFields"/>.
         /// </summary>
@@ -271,6 +312,18 @@ namespace Antmicro.Renode.Core.Structure.Registers
                     softResettable,
                     name == null ? null : $"{name}_{j}");
             }
+            return register;
+        }
+
+        /// <summary>
+        /// Fluent API for packet field creation. For parameters see <see cref="PeripheralRegister.DefinePacketField"/>.
+        /// </summary>
+        /// <returns>This register with a defined packet field.</returns>
+        public static R WithPacketField<R, T>(this R register, int position, int width, FieldMode mode = FieldMode.Read | FieldMode.Write, Action<T, T> readCallback = null,
+            Action<T, T> writeCallback = null, Action<T, T> changeCallback = null, Func<T, T> valueProviderCallback = null, Action<T, T> shadowReloadCallback = null, bool softResettable = true, string name = null) where R : PeripheralRegister
+            where T : struct
+        {
+            register.DefinePacketField<T>(position, width, mode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, softResettable, name);
             return register;
         }
 
@@ -339,6 +392,26 @@ namespace Antmicro.Renode.Core.Structure.Registers
             return register;
         }
 
+        public static T WithConditionallyWritableFlag<T>(this T register, int position, out IFlagRegisterField flagField, Func<bool> writabilityCondition, Action<bool, bool> readCallback = null,
+            Action<bool, bool> writeCallback = null, Action<bool, bool> changeCallback = null, Func<bool, bool> valueProviderCallback = null, bool softResettable = true, string name = null)
+            where T : PeripheralRegister
+        {
+            IFlagRegisterField ff = null;
+            ff = register.DefineFlagField(position, FieldMode.Read | FieldMode.Write, readCallback, writeCallback, changeCallback: (oldValue, value) =>
+            {
+                if(!writabilityCondition())
+                {
+                    ff.Value = oldValue;
+                }
+                else
+                {
+                    changeCallback?.Invoke(oldValue, value);
+                }
+            }, valueProviderCallback, null, softResettable, name);
+            flagField = ff;
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for creation of sets of flag fields. For parameters see the other overload of <see cref="PeripheralRegisterExtensions.WithFlags"/>.
         /// This overload allows you to retrieve the created array of fields via <c>flagFields</c> parameter.
@@ -369,9 +442,9 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// Fluent API for tagging bits as "RESERVED". For description see <see cref="PeripheralRegister.Reserved"/>.
         /// </summary>
         /// <returns>This register with a new "RESERVED" tag.</returns>
-        public static T WithReservedBits<T>(this T register, int position, int width, uint? allowedValue = null) where T : PeripheralRegister
+        public static T WithReservedBits<T>(this T register, int position, int width, uint? allowedValue = null, bool silent = false) where T : PeripheralRegister
         {
-            register.Reserved(position, width, allowedValue);
+            register.Reserved(position, width, allowedValue, silent);
             return register;
         }
 
@@ -387,6 +460,16 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
     public static class QuadWordRegisterExtensions
     {
+        /// <summary>
+        /// Fluent API for before read callback registration. For description see <see cref="QuadWordRegister.DefineBeforeReadCallback"/>.
+        /// </summary>
+        /// <returns>This register with a defined callback.</returns>
+        public static QuadWordRegister WithBeforeReadCallback(this QuadWordRegister register, Action<ulong> beforeReadCallback)
+        {
+            register.DefineBeforeReadCallback(beforeReadCallback);
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for read callback registration. For description see <see cref="QuadWordRegister.DefineReadCallback"/>.
         /// </summary>
@@ -416,10 +499,30 @@ namespace Antmicro.Renode.Core.Structure.Registers
             register.DefineChangeCallback(changeCallback);
             return register;
         }
+
+        /// <summary>
+        /// Fluent API for adding register to a collection. For description see <see cref="BaseRegisterCollection.AddRegister"/>.
+        /// </summary>
+        /// <returns>This register.</returns>
+        public static QuadWordRegister DefinedFor(this QuadWordRegister register, QuadWordRegisterCollection collection, System.Enum o)
+        {
+            collection.AddRegister(Convert.ToInt64(o), register);
+            return register;
+        }
     }
 
     public static class DoubleWordRegisterExtensions
     {
+        /// <summary>
+        /// Fluent API for before read callback registration. For description see <see cref="DoubleWordRegister.DefineBeforeReadCallback"/>.
+        /// </summary>
+        /// <returns>This register with a defined callback.</returns>
+        public static DoubleWordRegister WithBeforeReadCallback(this DoubleWordRegister register, Action<uint> beforeReadCallback)
+        {
+            register.DefineBeforeReadCallback(beforeReadCallback);
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for read callback registration. For description see <see cref="DoubleWordRegister.DefineReadCallback"/>.
         /// </summary>
@@ -449,10 +552,30 @@ namespace Antmicro.Renode.Core.Structure.Registers
             register.DefineChangeCallback(changeCallback);
             return register;
         }
+
+        /// <summary>
+        /// Fluent API for adding register to a collection. For description see <see cref="BaseRegisterCollection.AddRegister"/>.
+        /// </summary>
+        /// <returns>This register.</returns>
+        public static DoubleWordRegister DefinedFor(this DoubleWordRegister register, DoubleWordRegisterCollection collection, System.Enum o)
+        {
+            collection.AddRegister(Convert.ToInt64(o), register);
+            return register;
+        }
     }
 
     public static class WordRegisterExtensions
     {
+        /// <summary>
+        /// Fluent API for before read callback registration. For description see <see cref="WordRegister.DefineBeforeReadCallback"/>.
+        /// </summary>
+        /// <returns>This register with a defined callback.</returns>
+        public static WordRegister WithBeforeReadCallback(this WordRegister register, Action<ushort> beforeReadCallback)
+        {
+            register.DefineBeforeReadCallback(beforeReadCallback);
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for read callback registration. For description see <see cref="WordRegister.DefineReadCallback"/>.
         /// </summary>
@@ -482,10 +605,30 @@ namespace Antmicro.Renode.Core.Structure.Registers
             register.DefineChangeCallback(changeCallback);
             return register;
         }
+
+        /// <summary>
+        /// Fluent API for adding register to a collection. For description see <see cref="BaseRegisterCollection.AddRegister"/>.
+        /// </summary>
+        /// <returns>This register.</returns>
+        public static WordRegister DefinedFor(this WordRegister register, WordRegisterCollection collection, System.Enum o)
+        {
+            collection.AddRegister(Convert.ToInt64(o), register);
+            return register;
+        }
     }
 
     public static class ByteRegisterExtensions
     {
+        /// <summary>
+        /// Fluent API for before read callback registration. For description see <see cref="ByteRegister.DefineBeforeReadCallback"/>.
+        /// </summary>
+        /// <returns>This register with a defined callback.</returns>
+        public static ByteRegister WithBeforeReadCallback(this ByteRegister register, Action<byte> beforeReadCallback)
+        {
+            register.DefineBeforeReadCallback(beforeReadCallback);
+            return register;
+        }
+
         /// <summary>
         /// Fluent API for read callback registration. For description see <see cref="ByteRegister.DefineReadCallback"/>.
         /// </summary>
@@ -513,6 +656,16 @@ namespace Antmicro.Renode.Core.Structure.Registers
         public static ByteRegister WithChangeCallback(this ByteRegister register, Action<byte, byte> changeCallback)
         {
             register.DefineChangeCallback(changeCallback);
+            return register;
+        }
+
+        /// <summary>
+        /// Fluent API for adding register to a collection. For description see <see cref="BaseRegisterCollection.AddRegister"/>.
+        /// </summary>
+        /// <returns>This register.</returns>
+        public static ByteRegister DefinedFor(this ByteRegister register, ByteRegisterCollection collection, System.Enum o)
+        {
+            collection.AddRegister(Convert.ToInt64(o), register);
             return register;
         }
     }

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -11,13 +11,15 @@ using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.DMA;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class STM32_DMAMUX : BasicDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput
+    public class STM32_DMAMUX : BasicDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput, IDMA
     {
-        public STM32_DMAMUX(Machine machine, int numberOfOutputRequestChannels, int numberOfRequestGeneratorChannels) : base(machine)
+        public STM32_DMAMUX(Machine machine, int numberOfInputRequestChannels, int numberOfOutputRequestChannels, int numberOfRequestGeneratorChannels) : base(machine)
         {
+            nrOfInputRequestChannels = numberOfInputRequestChannels;
             nrOfOutputRequestChannels = numberOfOutputRequestChannels;
             nrOfRequestGeneratorChannels = numberOfRequestGeneratorChannels;
 
@@ -45,15 +47,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 if(requestId[channelId].Value == (ulong)number)
                 {
-                    this.NoisyLog("Set IRQ {0}: {1}", number, value);
+                    this.NoisyLog("Set IRQ for channel (request id {1}): {2}", channelId, number, value);
                     Connections[channelId].Set(value);
                 }
             }
         }
 
+        public void RequestTransfer(int number)
+        {
+            OnGPIO(number, true);
+            OnGPIO(number, false);
+        }
+
         public long Size => 0x400;
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
+
+        public int NumberOfChannels { get => nrOfInputRequestChannels; }
 
         private void DefineRegisters()
         {
@@ -103,6 +113,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IValueRegisterField[] requestId;
 
+        private readonly int nrOfInputRequestChannels;
         private readonly int nrOfOutputRequestChannels;
         private readonly int nrOfRequestGeneratorChannels;
 

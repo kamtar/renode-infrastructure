@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
@@ -265,7 +266,7 @@ namespace Antmicro.Renode.Utilities
         };
 
         // This list filters out assemblies that are known not to be interesting for TypeManager.
-        // It has to be manualy catered for, but it shaves about 400ms from the startup time on mono and 2s on NET.
+        // It has to be manualy catered for, but it shaves about 2s from the startup time.
         private static readonly string[] assemblyBlacklist = new []
         {
             "AntShell.dll",
@@ -290,8 +291,6 @@ namespace Antmicro.Renode.Utilities
             "IronPython.Wpf.dll",
             "K4os.Compression.LZ4.dll",
             "libtftp.dll",
-            "LZ4.dll",
-            "mcs.dll",
             "Microsoft.Dynamic.dll",
             "Microsoft.Scripting.dll",
             "Microsoft.Scripting.Metadata.dll",
@@ -320,6 +319,7 @@ namespace Antmicro.Renode.Utilities
             "Xwt.Gtk.dll",
             "Xwt.Gtk3.dll",
             "Xwt.WPF.dll",
+            "RenodeWPF.dll",
             // Exclude from analysis all "Microsoft" and "System" assemblies.
             "Microsoft.",
             "System.",
@@ -383,11 +383,7 @@ namespace Antmicro.Renode.Utilities
 
         private bool IsAutoLoadType(TypeDefinition type)
         {
-#if NET
             var isAutoLoad = type.Interfaces.Select(x => x.InterfaceType.GetFullNameOfMember()).Contains(typeof(IAutoLoadType).FullName);
-#else
-            var isAutoLoad = type.Interfaces.Select(x => x.GetFullNameOfMember()).Contains(typeof(IAutoLoadType).FullName);
-#endif
             if(isAutoLoad)
             {
                 return true;
@@ -411,25 +407,23 @@ namespace Antmicro.Renode.Utilities
             else
             {
                 var methodDescriptions = extensionMethodsTraceFromTypeFullName[fullName];
-                var result = new MethodInfo[methodDescriptions.Count];
-                var i = -1;
-                foreach(var methodDescription in methodDescriptions)
-                {
-                    i++;
-                    var describedType = GetTypeByName(methodDescription.TypeFullName);
-                    if(!methodDescription.IsOverloaded)
+                methodInfos = methodDescriptions
+                    .Select((methodDescription) =>
                     {
-                        // method's name is unique
-                        result[i] = describedType.GetMethod(methodDescription.Name);
-                    }
-                    else
-                    {
-                        var methodsInClass = describedType.GetMethods();
-                        var matchedMethod = methodsInClass.Single(x => x.Name == methodDescription.Name && GetMethodSignature(x) == methodDescription.Signature);
-                        result[i] = matchedMethod;
-                    }
-                }
-                methodInfos = result;
+                        var describedType = GetTypeByName(methodDescription.TypeFullName);
+                        if(!methodDescription.IsOverloaded)
+                        {
+                            // method's name is unique
+                            return describedType.GetMethod(methodDescription.Name);
+                        }
+                        else
+                        {
+                            var methodsInClass = describedType.GetMethods();
+                            var matchedMethod = methodsInClass.Single(x => x.Name == methodDescription.Name && GetMethodSignature(x) == methodDescription.Signature);
+                            return matchedMethod;
+                        }
+                    })
+                    .Where(method => method.IsRIDSupported());
             }
             // we also obtain EM for base type and interfaces
             if(type.BaseType != null)
@@ -523,11 +517,7 @@ namespace Antmicro.Renode.Utilities
 
             foreach(var type in types)
             {
-#if NET
                 if(type.Interfaces.Any(i => ResolveInner(i.InterfaceType)?.GetFullNameOfMember() == typeof(IPeripheral).FullName))
-#else
-                if(type.Interfaces.Any(i => ResolveInner(i)?.GetFullNameOfMember() == typeof(IPeripheral).FullName))
-#endif
                 {
                     Logger.LogAs(this, LogLevel.Noisy, "Peripheral type {0} found.", type.Resolve().GetFullNameOfMember());
                     foundPeripherals.Add(type);
@@ -747,11 +737,7 @@ namespace Antmicro.Renode.Utilities
                 return true;
             }
 
-#if NET
             return (type.BaseType != null && ImplementsInterface(ResolveInner(type.BaseType), @interface)) || type.Interfaces.Any(i => ImplementsInterface(ResolveInner(i.InterfaceType), @interface));
-#else
-            return (type.BaseType != null && ImplementsInterface(ResolveInner(type.BaseType), @interface)) || type.Interfaces.Any(i => ImplementsInterface(ResolveInner(i), @interface));
-#endif
         }
 
         private void ProcessExtractedExtensionMethods(Dictionary<string, HashSet<MethodDescription>> methodsToStore)

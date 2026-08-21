@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -15,7 +15,7 @@ using Antmicro.Renode.Peripherals.Bus;
 
 namespace Antmicro.Renode.Peripherals.DMA
 {
-    public class STM32G0DMA : IDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput
+    public class STM32G0DMA : IDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput, IDMA
     {
         public STM32G0DMA(IMachine machine, int numberOfChannels)
         {
@@ -110,6 +110,11 @@ namespace Antmicro.Renode.Peripherals.DMA
         public void Reset()
         {
             registers.Reset();
+            foreach(var channel in channels)
+            {
+                channel.Reset();
+            }
+            Update();
         }
 
         public uint ReadDoubleWord(long offset)
@@ -148,22 +153,40 @@ namespace Antmicro.Renode.Peripherals.DMA
                 return;
             }
 
-            if(!value)
+            var channel = channels[number - 1];
+
+            channel.TransferRequested = value;
+            if(channel.TransferInProgress)
             {
                 return;
             }
 
-            this.Log(LogLevel.Debug, "DMA peripheral request on channel {0}", number);
-            if(!channels[number - 1].TryTriggerTransfer())
+            channel.TransferInProgress = true;
+
+            while(channel.TransferRequested)
+            {
+                channel.TransferRequested = false;
+                RequestTransfer(number);
+            }
+
+            channel.TransferInProgress = false;
+        }
+
+        public void RequestTransfer(int channel)
+        {
+            this.Log(LogLevel.Debug, "DMA peripheral request on channel {0}", channel);
+            if(!channels[channel - 1].TryTriggerTransfer())
             {
                 this.Log(LogLevel.Warning, "DMA peripheral request on channel {0} ignored - channel is disabled "
-                    + "or has data count set to 0", number);
+                    + "or has data count set to 0", channel);
             }
         }
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
 
         public long Size => 0x100;
+
+        public int NumberOfChannels => numberOfChannels;
 
         private bool TryGetChannelNumberBasedOnOffset(long offset, out int channel)
         {
@@ -267,6 +290,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                 registers.Reset();
                 TransferComplete = false;
                 HalfTransfer = false;
+                TransferRequested = false;
+                TransferInProgress = false;
             }
 
             public bool TryTriggerTransfer()
@@ -308,6 +333,10 @@ namespace Antmicro.Renode.Peripherals.DMA
             public bool HalfTransferInterruptEnable => halfTransferInterruptEnable.Value;
 
             public bool TransferCompleteInterruptEnable => transferCompleteInterruptEnable.Value;
+
+            public bool TransferRequested { get; set; }
+
+            public bool TransferInProgress { get; set; }
 
             private void DoTransfer()
             {

@@ -12,6 +12,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.I2C;
 using Antmicro.Renode.Peripherals.Sensor;
 using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Time;
@@ -20,7 +21,7 @@ using Antmicro.Renode.Utilities.RESD;
 
 namespace Antmicro.Renode.Peripherals.Sensors
 {
-    public class LSM6DSO_IMU : BasicBytePeripheral, ISPIPeripheral, IProvidesRegisterCollection<ByteRegisterCollection>, ITemperatureSensor, IUnderstandRESD
+    public class LSM6DSO_IMU : BasicBytePeripheral, ISPIPeripheral, II2CPeripheral, IProvidesRegisterCollection<ByteRegisterCollection>, ITemperatureSensor, IUnderstandRESD
     {
         public LSM6DSO_IMU(IMachine machine) : base(machine)
         {
@@ -47,7 +48,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             accelerometerResdStream = this.CreateRESDStream<AccelerationSample>(path, channel, sampleOffsetType, sampleOffsetTime);
             accelerometerFeederThread?.Stop();
             accelerometerFeederThread = accelerometerResdStream.StartSampleFeedThread(this,
-                DataRateToFrequency(accelerometerFifoBatchingDataRateSelection.Value),
+                DataRateToFrequency(AccelerometerODR),
                 startTime: startTime
             );
         }
@@ -66,7 +67,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             gyroResdStream = this.CreateRESDStream<AngularRateSample>(path, channel, sampleOffsetType, sampleOffsetTime);
             gyroFeederThread?.Stop();
             gyroFeederThread = gyroResdStream.StartSampleFeedThread(this,
-                DataRateToFrequency(gyroscopeFifoBatchingDataRateSelection.Value),
+                DataRateToFrequency(GyroscopeODR),
                 startTime: startTime
             );
         }
@@ -115,19 +116,42 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 this.Log(LogLevel.Noisy, "Received 0x{0:X2}; setting commandInProgress to {1} and address to 0x{2:X2}", data, commandInProgress, address);
                 break;
             case CommandTypes.Read:
-                value = ReadByte(address);
-                this.Log(LogLevel.Noisy, "Read from 0x{0:X2} ({1}): returning 0x{2:X2}", address, (Registers)address, value);
-                TryIncrementAddress();
+                value = PerformRead(address);
                 break;
             case CommandTypes.Write:
-                this.Log(LogLevel.Noisy, "Write to 0x{0:X2} ({1}): 0x{2:X2}", address, (Registers)address, data);
-                WriteByte(address, data);
-                TryIncrementAddress();
+                PerformWrite(address, data);
                 break;
             default:
                 throw new ArgumentException($"Invalid commandInProgress: {commandInProgress}");
             }
             return value;
+        }
+
+        public void Write(byte[] data)
+        {
+            var byteIdx = 0;
+            if(commandInProgress == CommandTypes.None)
+            {
+                address = data[0];
+                byteIdx++;
+                commandInProgress = CommandTypes.ReceivedAddress;
+            }
+
+            for(var i = byteIdx; i < data.Length; i++)
+            {
+                PerformWrite(address, data[i]);
+            }
+        }
+
+        public byte[] Read(int count = 1)
+        {
+            var bytes = new byte[count];
+
+            for(var i = 0; i < count; i++)
+            {
+                bytes[i] = PerformRead(address);
+            }
+            return bytes;
         }
 
         public bool FifoOverrunStatus => commonFifo.OverrunOccurred;
@@ -184,6 +208,11 @@ namespace Antmicro.Renode.Peripherals.Sensors
 
         protected override void DefineRegisters()
         {
+            Registers.RegistersAccessConfiguration.Define(this)
+                .WithReservedBits(0, 6)
+                .WithEnumField(6, 2, out selectedRegisterBank, name: "SHUB_REG_FUNC_CFG_ACCESS")
+                ;
+
             Registers.PinControl.Define(this)
                 // These bits are always set.
                 .WithValueField(0, 6, FieldMode.Read, valueProviderCallback: _ => 0x3F)
@@ -223,6 +252,39 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 .WithTaggedFlag("BOOT", 7)
                 ;
 
+            Registers.Control5.Define(this)
+                .WithTaggedFlag("ST0_XL", 0)
+                .WithTaggedFlag("ST1_XL", 1)
+                .WithTaggedFlag("ST0_G", 2)
+                .WithTaggedFlag("ST1_G", 3)
+                .WithReservedBits(4, 1)
+                .WithTaggedFlag("ROUNDING0", 5)
+                .WithTaggedFlag("ROUNDING1", 6)
+                .WithTaggedFlag("XL_ULP_EN", 7)
+                ;
+
+            Registers.Control6.Define(this)
+                .WithTaggedFlag("FTYPE_0", 0)
+                .WithTaggedFlag("FTYPE_1", 1)
+                .WithTaggedFlag("FTYPE_2", 2)
+                .WithTaggedFlag("USR_OFF_W", 3)
+                .WithTaggedFlag("XL_HM_MODE", 4)
+                .WithTaggedFlag("LVL2_EN", 5)
+                .WithTaggedFlag("LVL1_EN", 6)
+                .WithTaggedFlag("TRIG_EN", 7)
+                ;
+
+            Registers.Control7_Gyroscope.Define(this)
+                .WithTaggedFlag("OIS_ON", 0)
+                .WithTaggedFlag("USR_OFF_ON_OUT", 1)
+                .WithTaggedFlag("OIS_ON_EN", 2)
+                .WithReservedBits(3, 1)
+                .WithTaggedFlag("HPM_G_1", 4)
+                .WithTaggedFlag("HPM_G_2", 5)
+                .WithTaggedFlag("HP_EN_G", 6)
+                .WithTaggedFlag("G_HM_MODE", 7)
+                ;
+
             Registers.Control8_Accelerometer.Define(this)
                 .WithTaggedFlag("LOW_PASS_ON_6D", 0)
                 .WithFlag(1, out accelerationFullScaleMode, name: "XL_FS_MODE: Accelerometer full-scale management between UI chain and OIS chain",
@@ -231,6 +293,17 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 .WithTaggedFlag("FASTSETTL_MODE_XL", 3)
                 .WithTaggedFlag("HP_REF_MODE_XL", 4)
                 .WithTag("HPCF_XL", 5, 3)
+                ;
+
+            Registers.Control9_Accelerometer.Define(this, resetValue: 0b11100000)
+                .WithReservedBits(0, 1)
+                .WithTaggedFlag("I3C_disable", 1)
+                .WithTaggedFlag("DEN_LH", 2)
+                .WithTaggedFlag("DEN_XL_EN", 3)
+                .WithTaggedFlag("DEN_XL_G", 4)
+                .WithTaggedFlag("DEN_Z", 5)
+                .WithTaggedFlag("DEN_Y", 6)
+                .WithTaggedFlag("DEN_X", 7)
                 ;
 
             Registers.TemperatureLow.Define(this)
@@ -334,31 +407,39 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 .WithTaggedFlag("DEN_DRDY", 7)
                 .WithWriteCallback((_, __) => UpdateInterrupts())
                 ;
+
+            Registers.I3CBusAvailable.Define(this)
+                .WithTaggedFlag("PD_DIS_INT1", 0)
+                .WithReservedBits(1, 2)
+                .WithTaggedFlag("I3C_Bus_Avb_Sel0", 3)
+                .WithTaggedFlag("I3C_Bus_Avb_Sel1", 4)
+                .WithReservedBits(5, 3)
+                ;
         }
 
         private IManagedThread CreateAccelerationDefaultSampleFeeder()
         {
-            if(accelerometerFifoBatchingDataRateSelection.Value == DataRates.Disabled)
+            if(AccelerometerODR == DataRates.Disabled)
             {
                 return null;
             }
 
             return CreateDefaultSampleFeeder(
                 () => commonFifo.FeedAccelerationSample(DefaultAccelerationX, DefaultAccelerationY, DefaultAccelerationZ),
-                DataRateToFrequency(accelerometerFifoBatchingDataRateSelection.Value),
+                DataRateToFrequency(AccelerometerODR),
                 "acceleration");
         }
 
         private IManagedThread CreateAngularRateDefaultSampleFeeder()
         {
-            if(gyroscopeFifoBatchingDataRateSelection.Value == DataRates.Disabled)
+            if(GyroscopeODR == DataRates.Disabled)
             {
                 return null;
             }
 
             return CreateDefaultSampleFeeder(
                 () => commonFifo.FeedAngularRateSample(DefaultAngularRateX, DefaultAngularRateY, DefaultAngularRateZ),
-                DataRateToFrequency(gyroscopeFifoBatchingDataRateSelection.Value),
+                DataRateToFrequency(GyroscopeODR),
                 "gyro");
         }
 
@@ -378,9 +459,9 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 return;
             }
 
-            if(accelerometerFifoBatchingDataRateSelection.Value != DataRates.Disabled)
+            if(AccelerometerODR != DataRates.Disabled)
             {
-                var freq = DataRateToFrequency(accelerometerFifoBatchingDataRateSelection.Value);
+                var freq = DataRateToFrequency(AccelerometerODR);
                 accelerometerFeederThread.Frequency = freq;
                 accelerometerFeederThread.Start();
             }
@@ -397,9 +478,9 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 return;
             }
 
-            if(gyroscopeFifoBatchingDataRateSelection.Value != DataRates.Disabled)
+            if(GyroscopeODR != DataRates.Disabled)
             {
-                var freq = DataRateToFrequency(gyroscopeFifoBatchingDataRateSelection.Value);
+                var freq = DataRateToFrequency(GyroscopeODR);
                 gyroFeederThread.Frequency = freq;
                 gyroFeederThread.Start();
             }
@@ -704,6 +785,55 @@ namespace Antmicro.Renode.Peripherals.Sensors
             }
         }
 
+        private byte PerformRead(long address)
+        {
+            if(commandInProgress == CommandTypes.ReceivedAddress)
+            {
+                commandInProgress = CommandTypes.Read;
+            }
+            if(commandInProgress != CommandTypes.Read)
+            {
+                this.Log(LogLevel.Warning, "Tried to read in invalid state: {0}", commandInProgress);
+                return 0;
+            }
+            if(address != (long)Registers.RegistersAccessConfiguration && selectedRegisterBank.Value != RegisterBank.Default)
+            {
+                this.Log(LogLevel.Warning, "Unhandled read from 0x{0:X2}: unsupported {1} bank", address, selectedRegisterBank.Value);
+                return 0;
+            }
+
+            var value = ReadByte(address);
+            this.Log(LogLevel.Noisy, "Read from 0x{0:X2} ({1}): returning 0x{2:X2}", address, (Registers)address, value);
+            TryIncrementAddress();
+            return value;
+        }
+
+        private void PerformWrite(long address, byte value)
+        {
+            if(commandInProgress == CommandTypes.ReceivedAddress)
+            {
+                commandInProgress = CommandTypes.Write;
+            }
+            if(commandInProgress != CommandTypes.Write)
+            {
+                this.Log(LogLevel.Warning, "Tried to write in invalid state: {0}", commandInProgress);
+                return;
+            }
+            if(address != (long)Registers.RegistersAccessConfiguration && selectedRegisterBank.Value != RegisterBank.Default)
+            {
+                this.Log(LogLevel.Warning, "Unhandled write to offset 0x{0:X2}. value 0x{1:X2}: unsupported {2} bank", address, value, selectedRegisterBank.Value);
+                return;
+            }
+
+            WriteByte(address, value);
+            this.Log(LogLevel.Noisy, "Write to 0x{0:X2} ({1}): 0x{2:X2}", address, (Registers)address, value);
+            TryIncrementAddress();
+        }
+
+        private DataRates AccelerometerODR => IsAccelerometerDataBatchedInFifo ? accelerometerFifoBatchingDataRateSelection.Value : accelerometerOutputDataRateSelection.Value;
+
+        private DataRates GyroscopeODR => IsGyroscopeDataBatchedInFifo ? gyroscopeFifoBatchingDataRateSelection.Value : gyroscopeOutputDataRateSelection.Value;
+
         private decimal defaultAccelerationX;
         private decimal defaultAccelerationY;
         private decimal defaultAccelerationZ;
@@ -735,7 +865,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private IEnumRegisterField<DataRates> gyroscopeFifoBatchingDataRateSelection;
         private IEnumRegisterField<DataRates> gyroscopeOutputDataRateSelection;
         private IFlagRegisterField interrupt1EnableFifoOverrun;
-
+        private IEnumRegisterField<RegisterBank> selectedRegisterBank;
         private readonly LSM6DSO_FIFO commonFifo;
 
         private const int IOTypeFlagPosition = 7;
@@ -1060,6 +1190,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
         {
             Write = 0,
             Read = 1,
+            ReceivedAddress,
             None,
         }
 
@@ -1111,6 +1242,14 @@ namespace Antmicro.Renode.Peripherals.Sensors
             SensorHubSlave3 = 0x11,
             StepCounter = 0x12,
             SensorHubNack = 0x19
+        }
+
+        private enum RegisterBank : byte
+        {
+            Default            = 0b00,
+            SensorHubRegisters = 0b01,
+            EmbeddedFunctions  = 0b10,
+            Illegal            = 0b11
         }
 
         private enum Registers : byte

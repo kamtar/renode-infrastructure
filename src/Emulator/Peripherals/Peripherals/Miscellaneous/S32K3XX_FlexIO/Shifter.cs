@@ -38,11 +38,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.S32K3XX_FlexIOModel
             receiveBuffer.Clear();
         }
 
-        public void OnDataReceive(uint data)
+        public void OnDataReceive(uint data, bool setStatus = true)
         {
             if(mode.Value != ShifterMode.Receive)
             {
-                owner.Log(LogLevel.Warning, "Trying to receive data (0x{0:X}) using the shifter with ID {1} that isn't in the receive mode", data, Identifier);
+                owner.Log(LogLevel.Warning, "Trying to receive data (0x{0:X}) using the shifter with ID {1} that is in {2} mode instead of the {3} mode", data, Identifier, mode.Value, nameof(ShifterMode.Receive));
                 return;
             }
 
@@ -51,7 +51,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.S32K3XX_FlexIOModel
             {
                 // Trigger an interrupt when there was no data in the buffer before.
                 buffer.Value = data;
-                Status.SetFlag(true);
+                if(setStatus)
+                {
+                    Status.SetFlag(true);
+                }
             }
         }
 
@@ -195,6 +198,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.S32K3XX_FlexIOModel
             {
                 owner.DebugLog("Shifter {0}: Setting DMA to true", Identifier);
                 dmaPerformedTransfer = false;
+                if(DMA.IsSet)
+                {
+                    DMA.Unset();
+                }
                 DMA.Set();
                 if(!dmaPerformedTransfer)
                 {
@@ -227,7 +234,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.S32K3XX_FlexIOModel
         {
             if(mode.Value != ShifterMode.Transmit)
             {
-                owner.Log(LogLevel.Warning, "Writing data (0x{0:X}) to the buffer of the shifter with ID {1} that isn't in the transmit mode", data, Identifier);
+                owner.Log(LogLevel.Warning, "Writing data (0x{0:X}) to the buffer of the shifter with ID {1} that is in {2} mode instead of the {3} mode", data, Identifier, mode.Value, nameof(ShifterMode.Transmit));
                 return;
             }
             dmaPerformedTransfer = dmaInProgress;
@@ -240,7 +247,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.S32K3XX_FlexIOModel
         {
             if(mode.Value != ShifterMode.Receive)
             {
-                owner.Log(LogLevel.Warning, "Reading data from the buffer of the shifter with ID {0} that isn't in the receive mode", Identifier);
+                owner.Log(LogLevel.Warning, "Reading data from the buffer of the shifter with ID {0} that is in {1} mode instead of the {2} mode", Identifier, mode.Value, nameof(ShifterMode.Receive));
                 return;
             }
             dmaPerformedTransfer = dmaInProgress;

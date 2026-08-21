@@ -1,16 +1,19 @@
 //
 // Copyright (c) 2010-2026 Antmicro
-// Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
-using System.IO;
-using System.CodeDom.Compiler;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+
 using Antmicro.Renode.Exceptions;
+
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Text;
 
 namespace Antmicro.Renode.Utilities
 {
@@ -18,57 +21,49 @@ namespace Antmicro.Renode.Utilities
     {
         public string Compile(string[] sourcePaths)
         {
-            var outputFileName = TemporaryFilesManager.Instance.GetTemporaryFile();
-            var parameters = new List<string>();
+            var tempFilePath = TemporaryFilesManager.Instance.GetTemporaryFile();
+            // With .NET Core and above, one must explicitly specify a .dll extension for output assembly
+            var outputFilePath = Path.ChangeExtension(tempFilePath, ".dll");
+            var outputFileName = Path.GetFileName(outputFilePath);
+            var options = CSharpParseOptions.Default
+                .WithLanguageVersion(LanguageVersion.CSharp12);
 
-            if(AssemblyHelper.BundledAssembliesCount > 0)
+            var parsedSyntaxTrees = new List<SyntaxTree> { };
+
+            var references = new List<MetadataReference>
             {
-                // portable already has all the libs included
-                parameters.Add("/nostdlib+");
+                MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+            };
+
+            foreach(string sourcePath in sourcePaths)
+            {
+                var sourceCode = File.ReadAllText(sourcePath);
+                var codeString = SourceText.From(sourceCode);
+
+                parsedSyntaxTrees.Add(SyntaxFactory.ParseSyntaxTree(codeString, options, sourcePath));
             }
 
-            if(Environment.OSVersion.Platform == PlatformID.Unix)
+            AssemblyHelper.GetAssembliesLocations().ToList()
+                .ForEach(location => references.Add(MetadataReference.CreateFromFile(location)));
+
+            var result = CSharpCompilation.Create(outputFileName,
+                syntaxTrees: parsedSyntaxTrees,
+                references: references,
+                options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                    optimizationLevel: OptimizationLevel.Release,
+                    allowUnsafe: true,
+                    assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default)).Emit(outputFilePath);
+
+            if(!result.Success)
             {
-                parameters.Add("/langversion:experimental");
+                // Access diagnostic informations
+                var failures = result.Diagnostics.Where(diagnostic => diagnostic.IsWarningAsError || diagnostic.Severity == DiagnosticSeverity.Error);
+                var diagnosticString = string.Join(Environment.NewLine, failures);
+                var sourcesString = string.Join(", ", sourcePaths);
+                throw new RecoverableException($"Could not compile assembly from: {sourcesString}\n{diagnosticString}");
             }
 
-            var locations = AssemblyHelper.GetAssembliesLocations();
-            foreach(var location in locations)
-            {
-                parameters.Add($"/r:{location}");
-            }
-
-            parameters.Add("/target:library");
-            parameters.Add("/debug-");
-            parameters.Add("/optimize+");
-            parameters.Add("/unsafe+");
-            parameters.Add($"/out:{outputFileName}");
-            parameters.Add("/noconfig");
-
-            parameters.Add("--");
-            foreach (var sourcePath in sourcePaths)
-            {
-                parameters.Add(sourcePath);
-            }
-
-            var result = false;
-            var errorOutput = new StringWriter();
-            try
-            {
-                result = Mono.CSharp.CompilerCallableEntryPoint.InvokeCompiler(parameters.ToArray(), errorOutput);
-            }
-            catch(Exception e)
-            {
-                throw new RecoverableException($"Could not compile assembly: {e.Message}");
-            }
-
-            if(!result)
-            {
-                throw new RecoverableException($"There were compilation errors:\n{(errorOutput.ToString())}");
-            }
-
-            return outputFileName;
+            return outputFilePath;
         }
     }
 }
-

@@ -227,7 +227,7 @@ namespace Antmicro.Renode.Core
                         }
                         catch(InvalidOperationException e)
                         {
-                            var message = string.Format("Error encountered during saving: {0}", e.Message);
+                            var message = "Error encountered during saving.";
                             if(e is NonSerializableTypeException && serializer.Settings.SerializationMethod == Migrant.Customization.Method.Generated)
                             {
                                 message += "\nHint: Set 'serialization-mode = Reflection' in the Renode config file for detailed information.";
@@ -251,7 +251,7 @@ namespace Antmicro.Renode.Core
                                 }
                             }
 
-                            throw new RecoverableException(message);
+                            throw new RecoverableException(message, e);
                         }
                     }
                 }
@@ -266,6 +266,10 @@ namespace Antmicro.Renode.Core
         public void LoadLatestSnapshot(bool autoStart = false)
         {
             var currentTimeStamp = CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
+            if(currentTimeStamp == TimeInterval.FromTicks(0))
+            {
+                throw new RecoverableException("There are no snapshots taken before this timestamp.");
+            }
             LoadLatestSnapshot(currentTimeStamp - TimeInterval.FromTicks(1), autoStart);
         }
 
@@ -313,7 +317,6 @@ namespace Antmicro.Renode.Core
                 var entryAssembly = Assembly.GetEntryAssembly();
                 if(entryAssembly == null)
                 {
-                    // When running from NUnit in MonoDevelop entryAssembly is null, but we don't care
                     return string.Empty;
                 }
 

@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Utilities;
 
 using AntShell.Helpers;
@@ -24,12 +25,13 @@ namespace Antmicro.Renode.UI
             {
                 Console.TreatControlCAsInput = true;
             }
-#if !PLATFORM_WINDOWS && NET
-            winchRegistration = PosixSignalRegistration.Create(
-                PosixSignal.SIGWINCH,
-                _ => Resized()
-            );
-#endif
+            if(!RuntimeInfo.IsWindows())
+            {
+                winchRegistration = PosixSignalRegistration.Create(
+                    PosixSignal.SIGWINCH,
+                    _ => Resized()
+                );
+            }
 
             checker = new UTF8Checker();
 
@@ -44,9 +46,7 @@ namespace Antmicro.Renode.UI
 
         public void Dispose()
         {
-#if !PLATFORM_WINDOWS && NET
-            winchRegistration.Dispose();
-#endif
+            winchRegistration?.Dispose();
         }
 
         public void Flush()
@@ -82,7 +82,21 @@ namespace Antmicro.Renode.UI
 
         public bool IsAnythingAttached => (ByteRead != null);
 
-        public Position Size => new Position(Console.WindowWidth, Console.WindowHeight);
+        public Position Size
+        {
+            get
+            {
+                try
+                {
+                    return new Position(Math.Max(Console.WindowWidth, 0), Math.Max(Console.WindowHeight, 0));
+                }
+                // The window size accessors throw on Windows if all standard FDs aren't consoles
+                catch
+                {
+                    return new Position(0, 0);
+                }
+            }
+        }
 
         public event Action<int> ByteRead;
 
@@ -181,9 +195,7 @@ namespace Antmicro.Renode.UI
             }
         }
 
-#if !PLATFORM_WINDOWS && NET
         private readonly PosixSignalRegistration winchRegistration;
-#endif
 
         private readonly UTF8Checker checker;
         private readonly bool isInputRedirected;

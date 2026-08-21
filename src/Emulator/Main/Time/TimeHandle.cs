@@ -1,10 +1,11 @@
 ﻿//
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 using Antmicro.Migrant;
@@ -112,13 +113,22 @@ namespace Antmicro.Renode.Time
             // we should not assign this handle to TimeSink as the source might not be configured properly yet
             TimeSink = timeSink;
 
+            monitorConditions = new();
+
+            activeHandleCondition = CreateMonitorConditionObject(() => !DetachRequested && !Enabled && !interrupt);
+            previousUnlatchCondition = CreateMonitorConditionObject(() => deferredUnlatch && SourceSideActive && !interrupt);
+            unblockedCondition = CreateMonitorConditionObject(() => waitsToBeUnblocked && SourceSideActive && !interrupt);
+            timeGrantCondition = CreateMonitorConditionObject(() => !grantPending && Enabled && SourceSideActive && !interrupt);
+            timeIsUsedCondition = CreateMonitorConditionObject(() => sinkSideInProgress || (SinkSideActive && grantPending));
+            unlatchCondition = CreateMonitorConditionObject(() => latchLevel > 0);
+
             Reset();
             this.Trace();
         }
 
         public void Reset()
         {
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(TimeSource.ElapsedVirtualTime >= TotalElapsedTime, $"Trying to move time handle back in time from: {TotalElapsedTime} to {TimeSource.ElapsedVirtualTime}");
                 TotalElapsedTime = TimeSource.ElapsedVirtualTime;
@@ -135,7 +145,7 @@ namespace Antmicro.Renode.Time
         public void GrantTimeInterval(TimeInterval interval)
         {
             this.Trace($"{interval.Ticks}");
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(IsReadyForNewTimeGrant, "Interval granted, but the handle is not ready for a new one.");
                 sourceSideInProgress = true;
@@ -147,7 +157,7 @@ namespace Antmicro.Renode.Time
                 {
                     this.Trace();
                     grantPending = true;
-                    Monitor.PulseAll(innerLock);
+                    NotifyStateChanged();
                 }
                 else
                 {
@@ -172,7 +182,7 @@ namespace Antmicro.Renode.Time
         public bool UnblockHandle()
         {
             this.Trace();
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(isBlocking || !enabled, "This handle should be blocking or disabled");
 
@@ -184,7 +194,7 @@ namespace Antmicro.Renode.Time
                 waitsToBeUnblocked = false;
                 grantPending = true;
 
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
                 return true;
             }
         }
@@ -193,8 +203,9 @@ namespace Antmicro.Renode.Time
         /// Used by the slave to requests a new time interval from the source.
         /// This method blocks current thread until the time interval is granted.
         /// </summary>
+        /// <param name="blockWhileDisabled">Controls wheter this method should return immediately when the handle is disabled or wait for it to reenable.</param>
         /// <remarks>
-        /// This method will return immediately when the handle is disabled or detached.
+        /// This method will return immediately when the handle is disabled (unless <paramref name="blockWhileDisabled"/> is set to true) or detached.
         /// It is illegal to call this method twice in a row if the first call was successful (returned true). It must always be followed by calling <see cref="ReportBackAndContinue"> or <see cref="ReportBackAndBreak">.
         /// </remarks>
         /// <returns>
@@ -202,14 +213,18 @@ namespace Antmicro.Renode.Time
         /// If it returned true, <paramref name="interval"> contains the amount of virtual time to be used by the sink. It is the sum of time interval granted by the source (using <see cref="GrantInterval">) and a time left reported previously by <see cref="ReportBackAndContinue"> or <see cref="ReportBackAndBreak">.
         /// If it returned false, the time interval is not granted and it is illegal to report anything back using <see cref="ReportBackAndContinue"> or <see cref="ReportBackAndBreak">.
         /// </returns>
-        public bool RequestTimeInterval(out TimeInterval interval)
+        public bool RequestTimeInterval(out TimeInterval interval, bool blockWhileDisabled = false)
         {
             this.Trace();
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(!sinkSideInProgress, "Requested a new time interval, but the previous one is still processed.");
 
                 var result = true;
+                if(blockWhileDisabled)
+                {
+                    activeHandleCondition.Wait("Waiting for the handle to become active");
+                }
                 if(!Enabled || interrupt)
                 {
                     result = false;
@@ -234,7 +249,7 @@ namespace Antmicro.Renode.Time
                         DebugHelper.Assert(!waitsToBeUnblocked, "Should not wait to be unblocked");
 
                         // we cannot latch again when deferredUnlatch is still on as we could overwrite it and never unlatch again
-                        innerLock.WaitWhile(() => deferredUnlatch && SourceSideActive && !interrupt, "Waiting for previous unlatch");
+                        previousUnlatchCondition.Wait("Waiting for previous unlatch");
                         if(!SourceSideActive || interrupt)
                         {
                             result = false;
@@ -246,10 +261,10 @@ namespace Antmicro.Renode.Time
                             Latch();
 
                             waitsToBeUnblocked = true;
-                            innerLock.WaitWhile(() => waitsToBeUnblocked && SourceSideActive && !interrupt, "Waiting to be unblocked");
+                            unblockedCondition.Wait("Waiting to be unblocked");
                             if(!SourceSideActive || interrupt)
                             {
-                                DebugHelper.Assert(waitsToBeUnblocked, "Expected only one condition to change");
+                                DebugHelper.Assert(waitsToBeUnblocked || interrupt, "Expected only one condition to change unless interrupted");
 
                                 Unlatch();
                                 waitsToBeUnblocked = false;
@@ -274,7 +289,7 @@ namespace Antmicro.Renode.Time
                 else if(!grantPending)
                 {
                     // wait until a new time interval is granted or this handle is disabled/deactivated
-                    innerLock.WaitWhile(() => !grantPending && Enabled && SourceSideActive && !interrupt, "Waiting for a time grant");
+                    timeGrantCondition.Wait("Waiting for a time grant");
                     result = grantPending && !delayGrant && !interrupt;
                     delayGrant = false;
                 }
@@ -307,8 +322,8 @@ namespace Antmicro.Renode.Time
                 return;
             }
 
-            UpdateElapsedTime(progress);
-            TimeSource.ReportTimeProgress();
+            UpdateElapsedTime(progress, out var previous);
+            TimeSource.ReportTimeProgress(previous);
         }
 
         /// <summary>
@@ -322,7 +337,7 @@ namespace Antmicro.Renode.Time
         public void ReportBackAndContinue(TimeInterval timeLeft)
         {
             this.Trace($"{timeLeft.Ticks}");
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 if(DetachRequested)
                 {
@@ -339,7 +354,7 @@ namespace Antmicro.Renode.Time
 
                 reportPending = true;
 
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
                 this.Trace();
             }
             ReportedBack?.Invoke();
@@ -357,7 +372,7 @@ namespace Antmicro.Renode.Time
         public void ReportBackAndBreak(TimeInterval timeLeft)
         {
             this.Trace($"{timeLeft.Ticks}");
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 if(DetachRequested)
                 {
@@ -373,7 +388,7 @@ namespace Antmicro.Renode.Time
 
                 reportPending = true;
 
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
                 this.Trace();
             }
             ReportedBack?.Invoke();
@@ -387,7 +402,7 @@ namespace Antmicro.Renode.Time
         /// </remarks>
         public bool TrySkipToSyncPoint(out TimeInterval intervalSkipped)
         {
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 if(!RequestTimeInterval(out intervalSkipped))
                 {
@@ -404,7 +419,7 @@ namespace Antmicro.Renode.Time
         public void Dispose()
         {
             this.Trace();
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 SinkSideActive = false;
                 SourceSideActive = false;
@@ -418,7 +433,7 @@ namespace Antmicro.Renode.Time
                 sourceSideInProgress = false;
                 reportPending = false;
                 intervalToReport = intervalGranted;
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
 
                 PauseRequested = null;
                 StartRequested = null;
@@ -439,11 +454,13 @@ namespace Antmicro.Renode.Time
         {
             this.Trace();
             WaitResult result;
-            lock(innerLock)
+            var previousElapsedTicks = 0ul;
+
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 Debugging.DebugHelper.Assert(sourceSideInProgress, "About to wait until time is used, but it seems none has recently been granted.");
 
-                innerLock.WaitWhile(() => sinkSideInProgress || (SinkSideActive && grantPending), "Waiting until time is used.");
+                timeIsUsedCondition.Wait("Waiting until time is used.");
 
                 intervalUsed = enabled ? intervalToReport : intervalGranted;
                 intervalToReport = TimeInterval.Empty;
@@ -468,14 +485,14 @@ namespace Antmicro.Renode.Time
                     isDone = false;
                     // intervalGranted does not change
 
-                    Monitor.PulseAll(innerLock);
+                    NotifyStateChanged();
                     this.Trace();
                 }
 
                 Debugging.DebugHelper.Assert(reportedSoFar <= intervalUsed);
                 // here we report the remaining part of granted time
                 reportedTimeResiduum = TimeInterval.Empty;
-                UpdateElapsedTime(intervalUsed - reportedSoFar);
+                UpdateElapsedTime(intervalUsed - reportedSoFar, out previousElapsedTicks);
                 reportedSoFar = TimeInterval.Empty;
 
                 reportPending = false;
@@ -493,12 +510,12 @@ namespace Antmicro.Renode.Time
                     Unlatch();
                 }
 
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
 
                 this.Trace($"Reporting {intervalUsed.Ticks} ticks used. Local elapsed virtual time is {TotalElapsedTime.Ticks} ticks.");
                 this.Trace(result.ToString());
             }
-            TimeSource.ReportTimeProgress();
+            TimeSource.ReportTimeProgress(previousElapsedTicks);
             return result;
         }
 
@@ -511,7 +528,7 @@ namespace Antmicro.Renode.Time
         public void Latch()
         {
             this.Trace();
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 latchLevel++;
                 this.Trace($"Time handle latched; current level is {latchLevel}");
@@ -528,13 +545,13 @@ namespace Antmicro.Renode.Time
         public void Unlatch()
         {
             this.Trace();
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(latchLevel > 0, "Tried to unlatch not latched handle");
                 latchLevel--;
                 this.Trace($"Time handle unlatched; current level is {latchLevel}");
                 // since there is one place when we wait for latch to be equal to 1, we have to pulse more often than only when latchLevel is 0
-                Monitor.PulseAll(innerLock);
+                NotifyStateChanged();
 
                 if(latchLevel == 0)
                 {
@@ -571,21 +588,12 @@ namespace Antmicro.Renode.Time
         {
             var timeout = TimeSpan.FromMilliseconds(millisecondsTimeout);
 
-            try
+            using(MonitorSmartLock.TryLock(innerLock, timeout, ref success))
             {
-                Monitor.TryEnter(innerLock, timeout, ref success);
                 if(success)
                 {
                     interrupt = true;
-                    Monitor.PulseAll(innerLock);
-                }
-            }
-            finally
-            {
-                // Ensure that the lock is released.
-                if(success)
-                {
-                    Monitor.Exit(innerLock);
+                    NotifyStateChanged();
                 }
             }
         }
@@ -608,7 +616,7 @@ namespace Antmicro.Renode.Time
 
             set
             {
-                lock(innerLock)
+                using(MonitorSmartLock.Lock(innerLock))
                 {
                     if(enabled == value)
                     {
@@ -617,7 +625,7 @@ namespace Antmicro.Renode.Time
 
                     changingEnabled = true;
                     this.Trace("About to wait for unlatching the time handle");
-                    innerLock.WaitWhile(() => latchLevel > 0, "Waiting for unlatching the time handle");
+                    unlatchCondition.Wait("Waiting for unlatching the time handle");
 
                     this.Trace($"Enabled value changed: {enabled} -> {value}");
                     enabled = value;
@@ -625,7 +633,7 @@ namespace Antmicro.Renode.Time
                     changingEnabled = false;
                     if(!enabled)
                     {
-                        Monitor.PulseAll(innerLock);
+                        NotifyStateChanged();
 
                         // we have just disabled the handle - it needs to be reset it to a state like after `ReportBackAndContinue` with not time left
                         if(isBlocking)
@@ -636,7 +644,7 @@ namespace Antmicro.Renode.Time
                             reportPending = true;
                             isBlocking = false;
 
-                            Monitor.PulseAll(innerLock);
+                            NotifyStateChanged();
                             this.Trace();
                         }
                     }
@@ -661,14 +669,14 @@ namespace Antmicro.Renode.Time
 
             set
             {
-                lock(innerLock)
+                using(MonitorSmartLock.Lock(innerLock))
                 {
                     this.Trace($"{value}");
                     sourceSideActive = value;
                     if(!sourceSideActive)
                     {
                         // there is a code that waits for a change of `SourceSideActive` value using `WaitWhile`, so we must call `PulseAll` here
-                        Monitor.PulseAll(innerLock);
+                        NotifyStateChanged();
                     }
                 }
             }
@@ -689,7 +697,7 @@ namespace Antmicro.Renode.Time
 
             set
             {
-                lock(innerLock)
+                using(MonitorSmartLock.Lock(innerLock))
                 {
                     DebugHelper.Assert(!sinkSideInProgress, "Should not change sink side active state when sink is in progress");
 
@@ -697,7 +705,7 @@ namespace Antmicro.Renode.Time
                     sinkSideActive = value;
                     if(!sinkSideActive)
                     {
-                        Monitor.PulseAll(innerLock);
+                        NotifyStateChanged();
                     }
                     else
                     {
@@ -720,7 +728,7 @@ namespace Antmicro.Renode.Time
         {
             get
             {
-                lock(innerLock)
+                using(MonitorSmartLock.Lock(innerLock))
                 {
                     var res = !sourceSideInProgress && !DetachRequested;
                     this.Trace($"Reading IsReadyForNewTimeGrant: {res}; sourceSideInProgress={sourceSideInProgress}, DetachRequested={DetachRequested}");
@@ -771,7 +779,7 @@ namespace Antmicro.Renode.Time
 
             set
             {
-                lock(innerLock)
+                using(MonitorSmartLock.Lock(innerLock))
                 {
                     delayGrant = value;
                 }
@@ -814,14 +822,16 @@ namespace Antmicro.Renode.Time
         /// </summary>
         public event Action ReportedBack;
 
-        private void UpdateElapsedTime(TimeInterval progress)
+        private void UpdateElapsedTime(TimeInterval progress, out ulong previousElapsedTicks)
         {
+            previousElapsedTicks = TotalElapsedTime.Ticks;
+
             if(progress.Ticks == 0)
             {
                 return;
             }
 
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 // reportedTimeResiduum represents time that
                 // has been reported, but not yet used;
@@ -846,10 +856,25 @@ namespace Antmicro.Renode.Time
         [Antmicro.Migrant.Hooks.PreSerialization]
         private void VerifyStateBeforeSerialization()
         {
-            lock(innerLock)
+            using(MonitorSmartLock.Lock(innerLock))
             {
                 DebugHelper.Assert(!sinkSideInProgress, "Trying to save a time handle that processes a time grant");
             }
+        }
+
+        private void NotifyStateChanged()
+        {
+            foreach(var monitorCondition in monitorConditions)
+            {
+                monitorCondition.TryPulseAll();
+            }
+        }
+
+        private MonitorCondition CreateMonitorConditionObject(Func<bool> condition)
+        {
+            var instance = new MonitorCondition(innerLock, condition);
+            monitorConditions.Add(instance);
+            return instance;
         }
 
         /// <summary>
@@ -904,6 +929,15 @@ namespace Antmicro.Renode.Time
         private volatile bool isDone;
 
         private readonly object innerLock;
+
+        private readonly MonitorCondition activeHandleCondition;
+        private readonly MonitorCondition previousUnlatchCondition;
+        private readonly MonitorCondition unblockedCondition;
+        private readonly MonitorCondition timeGrantCondition;
+        private readonly MonitorCondition timeIsUsedCondition;
+        private readonly MonitorCondition unlatchCondition;
+
+        private readonly List<MonitorCondition> monitorConditions;
 
         public struct WaitResult
         {

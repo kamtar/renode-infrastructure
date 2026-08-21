@@ -47,6 +47,7 @@ namespace Antmicro.Renode.UserInterface
         public void ClearCache()
         {
             cache.ClearCache();
+            CacheCleared?.Invoke();
         }
 
         public object ConvertValueOrThrowRecoverable(object value, Type type)
@@ -111,7 +112,7 @@ namespace Antmicro.Renode.UserInterface
                     List<object> parameters;
                     if(TryPrepareParameters(parameterArray, methodParameters, out parameters))
                     {
-                        return InvokeMethod(device, foundMethod, parameters);
+                        return DeviceHelper.InvokeMethod(device, foundMethod, parameters);
                     }
                 }
                 if(!foundExts.Any())
@@ -128,7 +129,7 @@ namespace Antmicro.Renode.UserInterface
                     List<object> parameters;
                     if(TryPrepareParameters(parameterArray, extensionParameters, out parameters))
                     {
-                        return InvokeExtensionMethod(device, foundExt, parameters);
+                        return DeviceHelper.InvokeExtensionMethod(device, foundExt, parameters);
                     }
                 }
                 throw new ParametersMismatchException(type, commandValue, name);
@@ -143,7 +144,7 @@ namespace Antmicro.Renode.UserInterface
                 //if setValue is a LiteralToken that does not name a variable, treat it as the next command to process in recursive call
                 if(CanTypeBeChained(foundField.FieldType) && setValue?.FirstOrDefault() is LiteralToken lt && GetDevice(lt.Value) == null)
                 {
-                    var currentObject = InvokeGet(device, foundField);
+                    var currentObject = DeviceHelper.InvokeGet(device, foundField);
                     var objectFullName = $"{name} {commandValue}";
                     return RecursiveExecuteDeviceAction(objectFullName, currentObject, p, 1);
                 }
@@ -153,12 +154,12 @@ namespace Antmicro.Renode.UserInterface
                     {
                         throw new RecoverableException($"Could not convert {setValue} to {foundField.FieldType}");
                     }
-                    InvokeSet(device, foundField, value);
+                    DeviceHelper.InvokeSet(device, foundField, value);
                     return null;
                 }
                 else
                 {
-                    return InvokeGet(device, foundField);
+                    return DeviceHelper.InvokeGet(device, foundField);
                 }
             }
             else if(foundProp != null)
@@ -171,7 +172,7 @@ namespace Antmicro.Renode.UserInterface
                 //if setValue is a LiteralToken that does not name a variable, treat it as the next command to process in recursive call
                 if(CanTypeBeChained(foundProp.PropertyType) && setValue?.FirstOrDefault() is LiteralToken lt && GetDevice(lt.Value) == null)
                 {
-                    var currentObject = InvokeGet(device, foundProp);
+                    var currentObject = DeviceHelper.InvokeGet(device, foundProp);
                     var objectFullName = $"{name} {commandValue}";
                     return RecursiveExecuteDeviceAction(objectFullName, currentObject, p, 1);
                 }
@@ -181,12 +182,12 @@ namespace Antmicro.Renode.UserInterface
                     {
                         throw new RecoverableException($"Could not convert {setValue} to {foundProp.PropertyType}");
                     }
-                    InvokeSet(device, foundProp, value);
+                    DeviceHelper.InvokeSet(device, foundProp, value);
                     return null;
                 }
                 else if(foundProp.IsCurrentlyGettable(CurrentBindingFlags))
                 {
-                    return InvokeGet(device, foundProp);
+                    return DeviceHelper.InvokeGet(device, foundProp);
                 }
                 else
                 {
@@ -223,12 +224,12 @@ namespace Antmicro.Renode.UserInterface
                                 throw new RecoverableException($"Could not convert {value} to {foundIndexer.PropertyType}");
                             }
 
-                            InvokeSetIndex(device, foundIndexer, parameters.Concat(new[] { convertedValue }).ToList());
+                            DeviceHelper.InvokeSetIndex(device, foundIndexer, parameters.Concat(new[] { convertedValue }).ToList());
                             return null;
                         }
                         else
                         {
-                            return InvokeGetIndex(device, foundIndexer, parameters);
+                            return DeviceHelper.InvokeGetIndex(device, foundIndexer, parameters);
                         }
                     }
                 }
@@ -254,11 +255,11 @@ namespace Antmicro.Renode.UserInterface
 
             if(foundProp?.GetMethod != null)
             {
-                return InvokeGet(node, foundProp);
+                return DeviceHelper.InvokeGet(node, foundProp);
             }
             if(foundField != null)
             {
-                return InvokeGet(node, foundField);
+                return DeviceHelper.InvokeGet(node, foundField);
             }
 
             return null;
@@ -306,11 +307,62 @@ namespace Antmicro.Renode.UserInterface
             return info;
         }
 
+        public bool TryFindPeripheralTypeByName(string name, out Type type, out string longestMatch, out string actualName)
+        {
+            type = null;
+            if(TryFindPeripheralByName(name, out var peripheral, out longestMatch, out actualName))
+            {
+                type = peripheral.GetType();
+                return true;
+            }
+            return false;
+        }
+
+        public bool TryFindPeripheralByName(string name, out IPeripheral peripheral, out string longestMatch)
+        {
+            return TryFindPeripheralByName(name, out peripheral, out longestMatch, out var _);
+        }
+
+        public bool TryFindPeripheralByName(string name, out IPeripheral peripheral, out string longestMatch, out string actualName)
+        {
+            actualName = name;
+            if(CurrentMachine == null)
+            {
+                longestMatch = string.Empty;
+                peripheral = null;
+                return false;
+            }
+
+            var longestPrefix = string.Empty;
+            var ret = CurrentMachine.TryGetByName(name, out peripheral, out var longestMatching);
+            if(!ret)
+            {
+                foreach(var prefix in usings)
+                {
+                    ret = CurrentMachine.TryGetByName(prefix + name, out peripheral, out var currentMatch);
+                    if(longestMatching.Split('.').Length < currentMatch.Split('.').Length - prefix.Split('.').Length)
+                    {
+                        longestMatching = currentMatch;
+                        longestPrefix = prefix;
+                    }
+                    if(ret)
+                    {
+                        actualName = prefix + name;
+                        break;
+                    }
+                }
+            }
+            longestMatch = longestPrefix + longestMatching;
+            return ret;
+        }
+
         public NumberModes CurrentNumberFormat { get; set; }
 
         public BindingFlags CurrentBindingFlags { get; set; }
 
         public event Action Quitted;
+
+        public event Action CacheCleared;
 
         private static string GetPossibleEnumValues(Type type)
         {
@@ -433,65 +485,37 @@ namespace Antmicro.Renode.UserInterface
             {
                 return genericArguments.Select(x => TypePrettyName(x) + "?").First();
             }
-            var typeDefeninition = type.Name;
-            var unmangledName = typeDefeninition.Substring(0, typeDefeninition.IndexOf("`", StringComparison.Ordinal));
+            var backtickIndex = type.Name.IndexOf("`", StringComparison.Ordinal);
+            var unmangledName = backtickIndex > 0 ? type.Name.Substring(0, backtickIndex) : type.Name;
             return unmangledName + "<" + String.Join(",", genericArguments.Select(TypePrettyName)) + ">";
         }
 
-        /// <summary>
-        /// Creates the invocation context.
-        /// </summary>
-        /// <returns>The invokation context or null, if can't be handled by Dynamitey.</returns>
-        /// <param name="device">Target device.</param>
-        /// <param name="info">Field, property or method info.</param>
-        private static InvokeContext CreateInvocationContext(object device, MemberInfo info)
+        private IEnumerable<PropertyInfo> GetAvailableIndexers(Type objectType)
         {
-            if(info.IsStatic())
+            var properties = new List<PropertyInfo>();
+            var type = objectType;
+            while(type != null && type != typeof(object))
             {
-                if(info is FieldInfo || info is PropertyInfo)
-                {
-                    //FieldInfo not supported in Dynamitey
-                    return null;
-                }
-                return InvokeContext.CreateStatic(device.GetType());
+                properties.AddRange(type.GetProperties(CurrentBindingFlags)
+                                    .Where(x => x.IsCallableIndexer())
+                );
+                type = type.BaseType;
             }
-            var propertyInfo = info as PropertyInfo;
-            if(propertyInfo != null)
-            {
-                //private properties not supported in Dynamitey
-                if((propertyInfo.CanRead && propertyInfo.GetGetMethod(true).IsPrivate)
-                   || (propertyInfo.CanWrite && propertyInfo.GetSetMethod(true).IsPrivate))
-                {
-                    return null;
-                }
-            }
-            return InvokeContext.CreateContext(device, info.ReflectedType);
+            return properties.DistinctBy(x => x.ToString()); //Look @ GetAvailableMethods for explanation.
         }
 
-        private object InvokeGetIndex(object device, PropertyInfo property, List<object> parameters)
+        private IEnumerable<PropertyInfo> GetAvailableProperties(Type objectType)
         {
-            var context = CreateInvocationContext(device, property);
-            if(context != null)
+            var properties = new List<PropertyInfo>();
+            var type = objectType;
+            while(type != null && type != typeof(object))
             {
-                return Dynamic.InvokeGetIndex(context, parameters.ToArray());
+                properties.AddRange(type.GetProperties(CurrentBindingFlags)
+                                    .Where(x => x.IsCallable())
+                );
+                type = type.BaseType;
             }
-            else
-            {
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeGetIndex", property.Name));
-            }
-        }
-
-        private object InvokeWithContext(InvokeContext context, MethodInfo method, object[] parameters)
-        {
-            if(method.ReturnType == typeof(void))
-            {
-                Dynamic.InvokeMemberAction(context, method.Name, parameters);
-                return null;
-            }
-            else
-            {
-                return Dynamic.InvokeMember(context, method.Name, parameters);
-            }
+            return properties.DistinctBy(x => x.ToString()); //Look @ GetAvailableMethods for explanation.
         }
 
         private bool TryParseTokenForParamType(Token token, Type type, out object result)
@@ -511,7 +535,7 @@ namespace Antmicro.Renode.UserInterface
 
         private bool FitArgumentType(TokenList tokens, Type paramType, out object result)
         {
-            result = default;
+            result = default(object);
             Type elemType;
             var isGenericList = typeof(IList).IsAssignableFrom(paramType) && paramType.IsGenericType;
             if(isGenericList)
@@ -572,19 +596,6 @@ namespace Antmicro.Renode.UserInterface
             }
 
             throw new InvalidOperationException($"Unhandled parameter type {paramType}");
-        }
-
-        private void InvokeSetIndex(object device, PropertyInfo property, List<object> parameters)
-        {
-            var context = CreateInvocationContext(device, property);
-            if(context != null)
-            {
-                Dynamic.InvokeSetIndex(context, parameters.ToArray());
-            }
-            else
-            {
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeSetIndex", property.Name));
-            }
         }
 
         private bool TryPrepareParameters(IList<Token> values, IList<ParameterInfo> parameters, out List<object> result)
@@ -760,6 +771,7 @@ namespace Antmicro.Renode.UserInterface
                 && !x.IsAbstract
                 && !x.IsConstructor
                 && !x.IsGenericMethod
+                && x.IsRIDSupported()
                 && x.IsCallable()
                 )
                 );
@@ -781,19 +793,6 @@ namespace Antmicro.Renode.UserInterface
             IEmulationElement external;
             Emulation.ExternalsManager.TryGetByName(name, out external);
             return external;
-        }
-
-        private object InvokeMethod(object device, MethodInfo method, List<object> parameters)
-        {
-            var context = CreateInvocationContext(device, method);
-            if(context != null)
-            {
-                return InvokeWithContext(context, method, parameters.ToArray());
-            }
-            else
-            {
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeMethod", method.Name));
-            }
         }
 
         private object ConvertValue(object value, Type type)
@@ -883,31 +882,6 @@ namespace Antmicro.Renode.UserInterface
                 return ConvertValue(value, underlyingType);
             }
             return Dynamic.InvokeConvert(value, type, true);
-        }
-
-        private void InvokeSet(object device, MemberInfo info, object parameter)
-        {
-            var context = CreateInvocationContext(device, info);
-            if(context != null)
-            {
-                Dynamic.InvokeSet(context, info.Name, parameter);
-            }
-            else
-            {
-                var propInfo = info as PropertyInfo;
-                var fieldInfo = info as FieldInfo;
-                if(fieldInfo != null)
-                {
-                    fieldInfo.SetValue(null, parameter);
-                    return;
-                }
-                if(propInfo != null)
-                {
-                    propInfo.SetValue(!propInfo.IsStatic() ? device : null, parameter, null);
-                    return;
-                }
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeSet", info.Name));
-            }
         }
 
         private bool RunCommand(ICommandInteraction writer, Command command, IList<Token> parameters)
@@ -1114,6 +1088,102 @@ namespace Antmicro.Renode.UserInterface
             return null;
         }
 
+        private object HandleDeviceChain(string name, out string chainedName, object device, IEnumerable<Token> tokens, out IEnumerable<Token> tail)
+        {
+            chainedName = name;
+            tail = tokens;
+            string commandValue;
+            var command = tokens.FirstOrDefault();
+            if(command is LiteralToken)
+            {
+                commandValue = command.GetObjectValue() as string;
+            }
+            else
+            {
+                return device;
+            }
+
+            if(device == null)
+            {
+                return null;
+            }
+            var type = device.GetType();
+
+            var fields = cache.Get(type, GetAvailableFields);
+            var found = (MemberInfo)fields.FirstOrDefault(x => x.Name == commandValue);
+            Type foundType;
+            if(found == null)
+            {
+                var properties = cache.Get(type, GetAvailableProperties);
+                found = properties.FirstOrDefault(x => x.Name == commandValue);
+                if(found == null)
+                {
+                    return device;
+                }
+                foundType = (found as PropertyInfo).PropertyType;
+            }
+            else
+            {
+                foundType = (found as FieldInfo).FieldType;
+            }
+
+            var parameterArray = tokens.Skip(1).ToArray();
+            if(!ParseOptionalArgument(parameterArray, out var setValue))
+            {
+                throw new RecoverableException($"Failed to parse argument: {Misc.PrettyPrintCollection(parameterArray)}");
+            }
+            //if setValue is a LiteralToken that does not name a variable, treat it as the next command to process in recursive call
+            if(CanTypeBeChained(foundType) && setValue?.FirstOrDefault() is LiteralToken lt && GetDevice(lt.Value) == null)
+            {
+                var currentObject = DeviceHelper.InvokeGet(device, found);
+                var objectFullName = $"{name} {commandValue}";
+                return HandleDeviceChain(objectFullName, out chainedName, currentObject, tokens.Skip(1), out tail);
+            }
+            return device;
+        }
+
+        private MemberInfo GetAccessor(object device, string member, bool? assertSetter = null, bool? assertGetter = null)
+        {
+            var type = device.GetType();
+            MemberInfo memberInfo = null;
+            var invalidGetter = false;
+            var invalidSetter = false;
+
+            var fields = cache.Get(type, GetAvailableFields);
+            var foundField = fields.FirstOrDefault(x => x.Name == member);
+            if(foundField != null)
+            {
+                invalidGetter = assertGetter == false;
+                invalidSetter = assertSetter.HasValue && assertSetter != (!foundField.IsLiteral && !foundField.IsInitOnly);
+                memberInfo = foundField;
+            }
+            else
+            {
+                var properties = cache.Get(type, GetAvailableProperties);
+                var foundProp = properties.FirstOrDefault(x => x.Name == member);
+                if(foundProp != null)
+                {
+                    invalidSetter = assertSetter != foundProp.IsCurrentlySettable(CurrentBindingFlags);
+                    invalidGetter = assertGetter != foundProp.IsCurrentlyGettable(CurrentBindingFlags);
+                    memberInfo = foundProp;
+                }
+            }
+
+            if(invalidGetter || invalidSetter)
+            {
+                var setterInfo = invalidSetter
+                    ? (assertSetter.Value ? "doesn't have setter" : "does have setter")
+                    : "";
+                var getterInfo = invalidGetter
+                    ? (assertGetter.Value ? "doesn't have getter" : "does have getter")
+                    : "";
+                var glue = invalidSetter && invalidGetter ? " and " : "";
+                throw new RecoverableException($"'{member}' {setterInfo}{glue}{getterInfo}");
+            }
+
+            return memberInfo;
+        }
+
         private string GetResultFormat(object result, int num, int? width = null)
         {
             string format;
@@ -1136,19 +1206,6 @@ namespace Antmicro.Renode.UserInterface
         private string GetNumberFormat(NumberModes mode, int width)
         {
             return NumberFormats[mode].Replace("X", "X" + width);
-        }
-
-        private object InvokeExtensionMethod(object device, MethodInfo method, List<object> parameters)
-        {
-            var context = InvokeContext.CreateStatic(method.ReflectedType);
-            if(context != null)
-            {
-                return InvokeWithContext(context, method, (new[] { device }.Concat(parameters)).ToArray());
-            }
-            else
-            {
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeExtensionMethod", method.Name));
-            }
         }
 
         private void PrintActionResult(object result, ICommandInteraction writer, bool withNewLine = true)
@@ -1245,79 +1302,6 @@ namespace Antmicro.Renode.UserInterface
                     throw new RecoverableException(String.Format("Could not find device {0}.", name));
                 }
             }
-        }
-
-        private bool TryFindPeripheralTypeByName(string name, out Type type, out string longestMatch, out string actualName)
-        {
-            IPeripheral peripheral;
-            type = null;
-            longestMatch = string.Empty;
-            actualName = name;
-            string longestMatching;
-            string currentMatch;
-            string longestPrefix = string.Empty;
-            var ret = CurrentMachine.TryGetByName(name, out peripheral, out longestMatching);
-            longestMatch = longestMatching;
-
-            if(!ret)
-            {
-                foreach(var prefix in usings)
-                {
-                    ret = CurrentMachine.TryGetByName(prefix + name, out peripheral, out currentMatch);
-                    if(longestMatching.Split('.').Length < currentMatch.Split('.').Length - prefix.Split('.').Length)
-                    {
-                        longestMatching = currentMatch;
-                        longestPrefix = prefix;
-                    }
-                    if(ret)
-                    {
-                        actualName = prefix + name;
-                        break;
-                    }
-                }
-            }
-            longestMatch = longestPrefix + longestMatching;
-            if(ret)
-            {
-                type = peripheral.GetType();
-            }
-            return ret;
-        }
-
-        private bool TryFindPeripheralByName(string name, out IPeripheral peripheral, out string longestMatch)
-        {
-            longestMatch = string.Empty;
-
-            if(CurrentMachine == null)
-            {
-                peripheral = null;
-                return false;
-            }
-
-            string longestMatching;
-            string currentMatch;
-            string longestPrefix = string.Empty;
-            var ret = CurrentMachine.TryGetByName(name, out peripheral, out longestMatching);
-            longestMatch = longestMatching;
-
-            if(!ret)
-            {
-                foreach(var prefix in usings)
-                {
-                    ret = CurrentMachine.TryGetByName(prefix + name, out peripheral, out currentMatch);
-                    if(longestMatching.Split('.').Length < currentMatch.Split('.').Length - prefix.Split('.').Length)
-                    {
-                        longestMatching = currentMatch;
-                        longestPrefix = prefix;
-                    }
-                    if(ret)
-                    {
-                        break;
-                    }
-                }
-            }
-            longestMatch = longestPrefix + longestMatching;
-            return ret;
         }
 
         private void PrintMonitorInfo(string name, MonitorInfo info, ICommandInteraction writer, string lookup = null)
@@ -1515,29 +1499,6 @@ namespace Antmicro.Renode.UserInterface
             return device;
         }
 
-        private object InvokeGet(object device, MemberInfo info)
-        {
-            var context = CreateInvocationContext(device, info);
-            if(context != null)
-            {
-                return Dynamic.InvokeGet(context, info.Name);
-            }
-            else
-            {
-                var propInfo = info as PropertyInfo;
-                var fieldInfo = info as FieldInfo;
-                if(fieldInfo != null)
-                {
-                    return fieldInfo.GetValue(null);
-                }
-                if(propInfo != null)
-                {
-                    return propInfo.GetValue(!propInfo.IsStatic() ? device : null, null);
-                }
-                throw new NotImplementedException(String.Format("Unsupported field {0} in InvokeGet", info.Name));
-            }
-        }
-
         private void ProcessDeviceAction(Type deviceType, string name, IEnumerable<Token> p, ICommandInteraction writer)
         {
             var devInfo = GetMonitorInfo(deviceType);
@@ -1609,49 +1570,7 @@ namespace Antmicro.Renode.UserInterface
         private const string SelectCommand = "Select";
         private const string ForEachCommand = "ForEach";
 
-        public enum NumberModes
-        {
-            Hexadecimal,
-            Decimal,
-            Both
-        }
-
-        private class MachineWithWasPaused
-        {
-            public Machine Machine { get; set; }
-
-            public bool WasPaused { get; set; }
-        }
-
-        IEnumerable<PropertyInfo> GetAvailableIndexers(Type objectType)
-        {
-            var properties = new List<PropertyInfo>();
-            var type = objectType;
-            while(type != null && type != typeof(object))
-            {
-                properties.AddRange(type.GetProperties(CurrentBindingFlags)
-                                    .Where(x => x.IsCallableIndexer())
-                );
-                type = type.BaseType;
-            }
-            return properties.DistinctBy(x => x.ToString()); //Look @ GetAvailableMethods for explanation.
-        }
-
-        IEnumerable<PropertyInfo> GetAvailableProperties(Type objectType)
-        {
-            var properties = new List<PropertyInfo>();
-            var type = objectType;
-            while(type != null && type != typeof(object))
-            {
-                properties.AddRange(type.GetProperties(CurrentBindingFlags)
-                                    .Where(x => x.IsCallable())
-                );
-                type = type.BaseType;
-            }
-            return properties.DistinctBy(x => x.ToString()); //Look @ GetAvailableMethods for explanation.
-        }
-
-        private class TokenList : IEnumerable<Token>
+        public class TokenList : IEnumerable<Token>
         {
             public static TokenList Single(Token token)
             {
@@ -1682,6 +1601,20 @@ namespace Antmicro.Renode.UserInterface
 
             public readonly List<Token> Tokens = new List<Token>();
             public readonly bool IsArray;
+        }
+
+        public enum NumberModes
+        {
+            Hexadecimal,
+            Decimal,
+            Both,
+        }
+
+        private class MachineWithWasPaused
+        {
+            public Machine Machine { get; set; }
+
+            public bool WasPaused { get; set; }
         }
     }
 }

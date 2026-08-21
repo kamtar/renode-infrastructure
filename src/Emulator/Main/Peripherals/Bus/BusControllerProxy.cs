@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -25,6 +25,11 @@ namespace Antmicro.Renode.Peripherals.Bus
         public BusControllerProxy(IBusController parentController)
         {
             ParentController = parentController;
+        }
+
+        public void UnmapMemory(Range range, ICPU context = null)
+        {
+            ParentController.UnmapMemory(range, context);
         }
 
         public void Reset()
@@ -149,18 +154,18 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public virtual void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null)
+        public virtual void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             if(ValidateOperation(ref address, BusAccessPrivileges.Read, context))
             {
-                ParentController.ReadBytes(address, count, destination, startIndex, onlyMemory, context);
+                ParentController.ReadBytes(address, count, destination, startIndex, onlyMemory, context, cpuState);
             }
         }
 
-        public virtual byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null)
+        public virtual byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             var result = new byte[count];
-            ReadBytes(address, count, result, 0, onlyMemory, context);
+            ReadBytes(address, count, result, 0, onlyMemory, context, cpuState);
             return result;
         }
 
@@ -169,22 +174,32 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ReadBytes((ulong)offset, count, context: context);
         }
 
-        public virtual void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null)
+        public virtual ulong[] FindBytes(byte[] pattern, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
         {
-            WriteBytes(bytes, address, bytes.Length, onlyMemory, context);
+            return ParentController.FindBytes(pattern, startAddress, endAddress, context);
         }
 
-        public virtual void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null)
+        public virtual ulong[] FindBytes(string hexString, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
+        {
+            return ParentController.FindBytes(hexString, startAddress, endAddress, context);
+        }
+
+        public virtual void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
+        {
+            WriteBytes(bytes, address, bytes.Length, onlyMemory, context, cpuState);
+        }
+
+        public virtual void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             if(ValidateOperation(ref address, BusAccessPrivileges.Write, context))
             {
-                ParentController.WriteBytes(bytes, address, startingIndex, count, onlyMemory, context);
+                ParentController.WriteBytes(bytes, address, startingIndex, count, onlyMemory, context, cpuState);
             }
         }
 
-        public virtual void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null)
+        public virtual void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
-            WriteBytes(bytes, address, 0, count, onlyMemory, context);
+            WriteBytes(bytes, address, 0, count, onlyMemory, context, cpuState);
         }
 
         public virtual void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context = null)
@@ -208,10 +223,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.WhatIsAt(address, context);
         }
 
-        public virtual IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null)
+        public virtual IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null, ulong? initiatorState = null)
         {
             ValidateOperation(ref address, BusAccessPrivileges.Other, context);
-            return ParentController.WhatPeripheralIsAt(address, context);
+            return ParentController.WhatPeripheralIsAt(address, context, initiatorState);
         }
 
         public virtual IEnumerable<ICPU> GetCPUs()
@@ -523,6 +538,8 @@ namespace Antmicro.Renode.Peripherals.Bus
         public virtual IBusController ParentController { get; protected set; }
 
         public virtual Endianess Endianess => ParentController.Endianess;
+
+        public UnhandledAccessBehaviour UnhandledAccessBehaviour { get => ParentController.UnhandledAccessBehaviour; set => ParentController.UnhandledAccessBehaviour = value; }
 
         protected virtual bool ValidateOperation(ref ulong address, BusAccessPrivileges accessType, IPeripheral context = null)
         {

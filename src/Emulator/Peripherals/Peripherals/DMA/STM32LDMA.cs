@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -14,12 +14,12 @@ using Antmicro.Renode.Peripherals.Bus;
 
 namespace Antmicro.Renode.Peripherals.DMA
 {
-    public sealed class STM32LDMA : IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
+    public sealed class STM32LDMA : IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput, IDMA, IGPIOReceiver
     {
         public STM32LDMA(IMachine machine)
         {
             engine = new DmaEngine(machine.GetSystemBus(this));
-            channels = new Channel[8];
+            channels = new Channel[this.NumberOfChannels];
             for(var i = 0; i < channels.Length; i++)
             {
                 channels[i] = new Channel(this, i);
@@ -28,7 +28,20 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         public void Reset()
         {
-            // TODO
+            for(var i = 0; i < channels.Length; i++)
+            {
+                channels[i].Reset();
+            }
+        }
+
+        public void OnGPIO(int number, bool value)
+        {
+            if(number < 0 || number >= channels.Length)
+            {
+                this.WarningLog("Attempted to signal DMA channel {0}. Maximum value is {1}", number, channels.Length - 1);
+                return;
+            }
+            channels[number].OnGPIO(value);
         }
 
         public uint ReadDoubleWord(long offset)
@@ -65,6 +78,18 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
+        public void RequestTransfer(int channel)
+        {
+            if(channel > 0 && channel <= channels.Length)
+            {
+                channels[channel - 1].DoTransfer();
+            }
+            else
+            {
+                this.Log(LogLevel.Warning, "Invalid channel {0}, no transfer performed.");
+            }
+        }
+
         public IReadOnlyDictionary<int, IGPIO> Connections { get { var i = 0; return channels.ToDictionary(x => i++, y => (IGPIO)y.IRQ); } }
 
         public long Size
@@ -75,12 +100,16 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
+        public int NumberOfChannels { get => 8; }
+
         private uint HandleInterruptStatusRead()
         {
             var returnValue = 0u;
             for(var i = 0; i < channels.Length; i++)
             {
-                returnValue |= channels[i].IRQ.IsSet ? (3u << i * 4) : 0u;
+                returnValue |= channels[i].IRQ.IsSet ? (1u << i * 4) : 0u;
+                returnValue |= channels[i].TransferComplete ? (1u << (i * 4 + 1)) : 0u;
+                returnValue |= channels[i].HalfTransfer ? (1u << (i * 4 + 2)) : 0u;
             }
             return returnValue;
         }
@@ -89,11 +118,20 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             for(var i = 0; i < channels.Length; i++)
             {
-                var ourBit1 = 4 * i;
-                var ourBit2 = ourBit1 + 1;
-                if((value & (1 << ourBit1)) != 0 || (value & (1 << ourBit2)) != 0)
+                var ourClearGlobal = 4 * i;
+                var ourClearTransferComplete = ourClearGlobal + 1;
+                var ourClearHalfTransfer = ourClearTransferComplete + 1;
+                if((value & (1 << ourClearGlobal)) != 0)
                 {
                     channels[i].ClearInterrupt();
+                }
+                if((value & (1 << ourClearTransferComplete)) != 0)
+                {
+                    channels[i].TransferComplete = false;
+                }
+                if((value & (1 << ourClearHalfTransfer)) != 0)
+                {
+                    channels[i].HalfTransfer = false;
                 }
             }
         }
@@ -119,7 +157,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                 case Offset.Configuration:
                     return HandleConfigurationRead();
                 case Offset.NumberOfData:
-                    return (uint)numberOfData;
+                    return numberOfData;
                 case Offset.PeripheralAddress:
                     return peripheralAddress;
                 case Offset.MemoryAddress:
@@ -138,7 +176,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                     HandleConfigurationWrite(value);
                     break;
                 case Offset.NumberOfData:
-                    numberOfData = (int)value;
+                    numberOfData = value;
+                    initialNumberOfData = numberOfData;
                     break;
                 case Offset.PeripheralAddress:
                     peripheralAddress = value;
@@ -154,12 +193,12 @@ namespace Antmicro.Renode.Peripherals.DMA
 
             public void ClearInterrupt()
             {
-                IRQ.Unset();
+                TransferComplete = false;
+                HalfTransfer = false;
             }
 
             public void Reset()
             {
-                IRQ.Unset();
                 peripheralIncrement = false;
                 peripheralAddress = 0u;
                 memoryAddress = 0u;
@@ -169,49 +208,41 @@ namespace Antmicro.Renode.Peripherals.DMA
                 completeInterruptEnabled = false;
                 transferErrorInterruptEnabled = false;
                 numberOfData = 0;
+                initialNumberOfData = 0;
                 priority = 0;
                 direction = 0;
+                circularMode = false;
+                halfTransferInterruptEnabled = false;
+
+                TransferComplete = false;
+                HalfTransfer = false;
+                enabled = false;
+                transferInProgress = false;
+                triggerRequested = false;
             }
 
-            public GPIO IRQ { get; private set; }
-
-            private uint HandleConfigurationRead()
-            {
-                var returnValue = 0u;
-                returnValue |= completeInterruptEnabled ? (1u << 1) : 0u;
-                returnValue |= transferErrorInterruptEnabled ? (1u << 3) : 0u;
-                returnValue |= ((uint)direction) << 4;
-                returnValue |= peripheralIncrement ? (1u << 6) : 0u;
-                returnValue |= memoryIncrement ? (1u << 7) : 0u;
-                returnValue |= (uint)(priority << 12);
-                return returnValue;
-            }
-
-            private void HandleConfigurationWrite(uint value)
-            {
-                completeInterruptEnabled = (value & (1 << 1)) != 0;
-                transferErrorInterruptEnabled = (value & (1 << 3)) != 0;
-                direction = (Direction)((value >> 4) & 1);
-                peripheralIncrement = (value & (1 << 6)) != 0;
-                memoryIncrement = (value & (1 << 7)) != 0;
-                priority = (byte)((value >> 12) & 3);
-
-                if((value & ~0x30DB) != 0)
-                {
-                    parent.Log(LogLevel.Warning, "Channel {0}: some unhandled bits were written to configuration register. Value is 0x{1:X}.", channelNo, value);
-                }
-
-                if((value & 1) != 0)
-                {
-                    DoTransfer();
-                }
-            }
-
-            private void DoTransfer()
+            public void DoTransfer()
             {
                 uint sourceAddress, destinationAddress;
                 bool incrementSourceAddress, incrementDestinationAddress;
                 TransferType sourceTransferType, destinationTransferType;
+
+                if(numberOfData == 0)
+                {
+                    parent.Log(LogLevel.Debug, "Channel {0}: 0 bytes of data left, transfer stopped.", channelNo);
+                    return;
+                }
+                if(!enabled)
+                {
+                    /* This log is a debug log because there is a legitimate case where this could
+                     * happen: some models defer there signal to the DMA (OnGPIO -> DoTransfer) to
+                     * avoid recursive calls. This deferred signal may arrive when the software is
+                     * reconfiguring the channel for a next transfer. During the configuration, the
+                     * channel is disabled and the numberOfData may have already been set.
+                     */
+                    parent.Log(LogLevel.Debug, "Channel {0}: Cannot transfer on disabled channel", channelNo);
+                    return;
+                }
 
                 if(direction == Direction.ReadFromMemory)
                 {
@@ -232,21 +263,164 @@ namespace Antmicro.Renode.Peripherals.DMA
                     destinationTransferType = memoryTransferType;
                 }
 
-                var request = new Request(sourceAddress, destinationAddress, numberOfData, sourceTransferType, destinationTransferType,
+                if(incrementSourceAddress)
+                {
+                    sourceAddress += (uint)sourceTransferType * (initialNumberOfData - numberOfData);
+                }
+                if(incrementDestinationAddress)
+                {
+                    destinationAddress += (uint)sourceTransferType * (initialNumberOfData - numberOfData);
+                }
+
+                var request = new Request(sourceAddress, destinationAddress, (int)sourceTransferType, sourceTransferType, destinationTransferType,
                                   incrementSourceAddress, incrementDestinationAddress);
                 parent.engine.IssueCopy(request);
-                IRQ.Set();
+
+                numberOfData--;
+                if(numberOfData == 0)
+                {
+                    TransferComplete = true;
+                    if(circularMode)
+                    {
+                        numberOfData = initialNumberOfData;
+                    }
+                }
+                else if(numberOfData == initialNumberOfData / 2)
+                {
+                    HalfTransfer = true;
+                }
             }
+
+            public void OnGPIO(bool value)
+            {
+                triggerRequested = value;
+
+                if(transferInProgress)
+                {
+                    return;
+                }
+
+                transferInProgress = true;
+                while(triggerRequested)
+                {
+                    triggerRequested = false;
+                    DoTransfer();
+                }
+                transferInProgress = false;
+            }
+
+            public GPIO IRQ { get; private set; }
+
+            public bool TransferComplete
+            {
+                get => transferComplete;
+                set
+                {
+                    transferComplete = value;
+                    UpdateInterrupts();
+                }
+            }
+
+            public bool HalfTransfer
+            {
+                get => halfTransfer;
+                set
+                {
+                    halfTransfer = value;
+                    UpdateInterrupts();
+                }
+            }
+
+            private uint HandleConfigurationRead()
+            {
+                var returnValue = 0u;
+                returnValue = enabled ? 1u : 0u;
+                returnValue |= completeInterruptEnabled ? (1u << 1) : 0u;
+                returnValue |= halfTransferInterruptEnabled ? (1u << 2) : 0u;
+                returnValue |= transferErrorInterruptEnabled ? (1u << 3) : 0u;
+                returnValue |= ((uint)direction) << 4;
+                returnValue |= circularMode ? (1u << 5) : 0u;
+                returnValue |= peripheralIncrement ? (1u << 6) : 0u;
+                returnValue |= memoryIncrement ? (1u << 7) : 0u;
+                returnValue |= ((uint)peripheralTransferType >> 1) << 8;
+                returnValue |= ((uint)memoryTransferType >> 1) << 10;
+                returnValue |= (uint)(priority << 12);
+                return returnValue;
+            }
+
+            private void HandleConfigurationWrite(uint value)
+            {
+                enabled = (value & 1) != 0;
+                completeInterruptEnabled = (value & (1 << 1)) != 0;
+                halfTransferInterruptEnabled = (value & (1 << 2)) != 0;
+                transferErrorInterruptEnabled = (value & (1 << 3)) != 0;
+                direction = (Direction)((value >> 4) & 1);
+                circularMode = (value & (1 << 5)) != 0;
+                peripheralIncrement = (value & (1 << 6)) != 0;
+                memoryIncrement = (value & (1 << 7)) != 0;
+                HandleConfigureWriteSizes(value);
+                priority = (byte)((value >> 12) & 3);
+
+                if((value & ~0x3FFF) != 0)
+                {
+                    parent.Log(LogLevel.Warning, "Channel {0}: some unhandled bits were written to configuration register. Value is 0x{1:X}.", channelNo, value);
+                }
+            }
+
+            private void HandleConfigureWriteSizes(uint value)
+            {
+                if((value & 1) == 0) // MSIZE and PSIZE are read-only if EN=1
+                {
+                    int size = 0;
+                    if(DecodeConfigurationSize(value, 8, out size))
+                    {
+                        peripheralTransferType = (TransferType)(1 << size);
+                    }
+                    if(DecodeConfigurationSize(value, 10, out size))
+                    {
+                        memoryTransferType = (TransferType)(1 << size);
+                    }
+                }
+            }
+
+            private bool DecodeConfigurationSize(uint value, int offset, out int size)
+            {
+                size = (int)(value >> offset) & 3;
+                if(size == 3)
+                {
+                    parent.Log(LogLevel.Warning, "Channel {0}: Invalid reserved value for size", channelNo);
+                }
+                return size < 3;
+            }
+
+            private void UpdateInterrupts()
+            {
+                var transferCompleteInterrupt = TransferComplete && completeInterruptEnabled;
+                var halfTransferInterrupt = HalfTransfer && halfTransferInterruptEnabled;
+
+                IRQ.Set(transferCompleteInterrupt || halfTransferInterrupt);
+            }
+
+            private bool transferInProgress;
+            private bool triggerRequested;
 
             private Direction direction;
             private byte priority;
-            private int numberOfData;
-            private bool transferErrorInterruptEnabled;
-            private bool completeInterruptEnabled;
+            private uint numberOfData;
+            private uint initialNumberOfData;
             private TransferType memoryTransferType;
             private uint memoryAddress;
             private uint peripheralAddress;
             private bool peripheralIncrement;
+            private bool circularMode;
+            private bool enabled;
+
+            // Status & IRQs
+            private bool transferComplete;
+            private bool completeInterruptEnabled;
+            private bool transferErrorInterruptEnabled;
+            private bool halfTransfer;
+            private bool halfTransferInterruptEnabled;
 
             private bool memoryIncrement;
             private TransferType peripheralTransferType;

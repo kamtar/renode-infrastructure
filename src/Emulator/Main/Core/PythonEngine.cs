@@ -7,6 +7,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 using Antmicro.Migrant;
@@ -26,7 +27,7 @@ namespace Antmicro.Renode.Core
     {
         #region Python Engine
 
-        private static readonly ScriptEngine _Engine = Python.CreateEngine();
+        private static readonly ScriptEngine _Engine = CreateEngine();
 
         #endregion
 
@@ -113,6 +114,32 @@ namespace Antmicro.Renode.Core
         [Transient]
         protected ScriptScope Scope;
 
+        private static ScriptEngine CreateEngine()
+        {
+            var engine = Python.CreateEngine();
+            var assemblyDirectory = Path.GetDirectoryName(typeof(PythonEngine).Assembly.Location);
+            if(string.IsNullOrEmpty(assemblyDirectory))
+            {
+                return engine;
+            }
+
+            // IronPython derives the standard library path from the location of the entry assembly, but
+            // when Renode is hosted in a native process, Assembly.GetEntryAssembly() returns null, so
+            // we need to add the standard library path manually.
+            // See https://github.com/IronLanguages/ironpython2/blob/7955030af80f7316c4daaef2ce1da0df9b3bf8a8/Src/IronPython/Runtime/PythonContext.cs#L270-L277
+            var standardLibraryPath = Path.Combine(assemblyDirectory, "Lib");
+            if(Directory.Exists(standardLibraryPath))
+            {
+                var searchPaths = engine.GetSearchPaths().ToList();
+                if(!searchPaths.Contains(standardLibraryPath))
+                {
+                    searchPaths.Add(standardLibraryPath);
+                    engine.SetSearchPaths(searchPaths);
+                }
+            }
+            return engine;
+        }
+
         private void InnerInit()
         {
             Scope = Engine.CreateScope();
@@ -176,11 +203,7 @@ namespace Antmicro.Renode.Core
             "import clr",
             "clr.AddReference('Infrastructure')",
             "clr.AddReference('Renode')",
-        #if NET
-            "clr.AddReference('System.Console')", // It was moved to separate assembly on .NET Core.
-        #else
-            "clr.AddReference('IronPython.StdLib')", // It is referenced by default on NET Core, but not on mono.
-        #endif
+            "clr.AddReference('System.Console')",
             "import Antmicro.Renode",
             "import System",
             "import time",

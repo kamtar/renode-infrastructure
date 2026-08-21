@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -12,9 +12,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
-#pragma warning disable IDE0005
-using Antmicro.Renode.Utilities;
-#pragma warning restore IDE0005
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 
 namespace Antmicro.Renode.Peripherals.UART
 {
@@ -49,26 +47,26 @@ namespace Antmicro.Renode.Peripherals.UART
             UpdateInterrupts();
         }
 
-        [ConnectionRegionAttribute("interruptEnable")]
+        [ConnectionRegion("interruptEnable")]
         public void WriteByteToInterruptEnable(long offset, byte value)
         {
             InterruptEnableRegister.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("interruptEnable")]
+        [ConnectionRegion("interruptEnable")]
         public byte ReadByteFromInterruptEnable(long _)
         {
             return InterruptEnableRegister.Read();
         }
 
-        [ConnectionRegionAttribute("interruptStatus")]
+        [ConnectionRegion("interruptStatus")]
         public void WriteByteToInterruptStatus(long offset, byte value)
         {
             InterruptStatusRegister.Write(offset, value);
             UpdateInterrupts();
         }
 
-        [ConnectionRegionAttribute("interruptStatus")]
+        [ConnectionRegion("interruptStatus")]
         public byte ReadByteFromInterruptStatus(long _)
         {
             return InterruptStatusRegister.Read();
@@ -220,6 +218,7 @@ namespace Antmicro.Renode.Peripherals.UART
             I2C,
         }
 
+        [RegistersDescription]
         public enum Registers
         {
             AutoBaud,

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -43,6 +43,29 @@ namespace Antmicro.Renode.UnitTests
         {
             var read = sysbus.ReadByte(0xABCD1234);
             Assert.AreEqual(0, read);
+        }
+
+        [Test]
+        public void ShouldThrowBusAccessExceptionAtNonExistingDeviceWhenConfigured()
+        {
+            sysbus.UnhandledAccessBehaviour = UnhandledAccessBehaviour.ThrowException;
+
+            var readException = Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0xABCD1234));
+            var writeException = Assert.Throws<BusAccessException>(() => sysbus.WriteByte(0xABCD1234, 0));
+
+            Assert.AreEqual(BusAccessError.AddressError, readException.Error);
+            Assert.AreEqual(BusAccessError.AddressError, writeException.Error);
+        }
+
+        [Test]
+        public void ShouldPropagateBusAccessExceptionFromPeripheral()
+        {
+            var expectedException = new BusAccessException(BusAccessError.CommandError);
+            var peripheral = new Mock<IDoubleWordPeripheral>();
+            peripheral.Setup(x => x.ReadDoubleWord(0)).Throws(expectedException);
+            sysbus.Register(peripheral.Object, 0x1000.By(0x100));
+
+            Assert.AreSame(expectedException, Assert.Throws<BusAccessException>(() => sysbus.ReadDoubleWord(0x1000)));
         }
 
         [Test]
@@ -405,6 +428,26 @@ namespace Antmicro.Renode.UnitTests
             Assert.Throws(typeof(RegistrationException), () => machine.SystemBus.Register(cpu, null));
         }
 
+        [Test]
+        public void ShouldFindBytePattern()
+        {
+            // FindBytes internal buffer size
+            const ulong bufferSize = 1 << 20;
+
+            // Register 2 separate memories to test pattern spanning 2 memories
+            var memory1 = new MappedMemory(sysbus.Machine, (long)bufferSize);
+            sysbus.Register(memory1, 0);
+            var memory2 = new MappedMemory(sysbus.Machine, (long)bufferSize);
+            sysbus.Register(memory2, bufferSize.By(bufferSize));
+
+            // Write the pattern at 2 locations, including buffer boundary
+            sysbus.WriteBytes(bytes, 0);
+            sysbus.WriteBytes(bytes, bufferSize - 4);
+
+            var addresses = sysbus.FindBytes(bytes);
+            Assert.AreEqual(new ulong[] { 0x0, bufferSize - 4 }, addresses);
+        }
+
         private void CreateMachineAndExecute(Action<IBusController> action)
         {
             using(var machine = new Machine())
@@ -579,11 +622,6 @@ namespace Antmicro.Renode.UnitTests
                     {
                         parent.ByteWritten = true;
                     };
-                }
-
-                public override void RegisterForEachContext(Action<BusParametrizedRegistration> register)
-                {
-                    RegisterForEachContextInner(register, _ => new Registration(Range.StartAddress, Range.Size));
                 }
             }
         }

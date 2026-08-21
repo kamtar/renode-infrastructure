@@ -437,8 +437,7 @@ namespace Antmicro.Renode.UserInterface
                     // Load dynamically compiled assembly to memory. It presents an advantage that next
                     // ad-hoc compiled assembly can reference types from this one without any extra steps.
                     // Therefore "EnsureTypeIsLoaded" call is no necessary as dependencies are already loaded.
-                    // Assembly.LoadFrom is used for a compatibility with Mono/.NET Framework,
-                    // but once we move fully to .NET, consider AssemblyLoadContext.LoadFromAssemblyPath.
+                    // XXX: Consider AssemblyLoadContext.LoadFromAssemblyPath.
                     Assembly.LoadFrom(compiledCode);
                     EmulationManager.Instance.CompiledFilesCache.StoreEntryWithSha(sha, compiledCode);
                 }
@@ -855,11 +854,8 @@ namespace Antmicro.Renode.UserInterface
                     directory = Path.GetDirectoryName(lastElement) ?? lastElement;
                     file = Path.GetFileName(lastElement);
                 }
-#if PLATFORM_WINDOWS
-                var rootIndicator = "^[a-zA-Z]:/";
-#else
-                var rootIndicator = "^/";
-#endif
+                var rootIndicator = RuntimeInfo.IsWindows() ? "^[a-zA-Z]:/" : "^/";
+
                 if(Regex.Match(lastElement, rootIndicator).Success)
                 {
                     try
@@ -876,14 +872,7 @@ namespace Antmicro.Renode.UserInterface
                         {
                             continue;
                         }
-                        try
-                        {
-                            suggestions.AddRange(SuggestFiles(allButLast, pathEntry, directory, file));
-                        }
-                        catch(Exception)
-                        {
-                            Logger.LogAs(this, LogLevel.Debug, "Bug in mono on Directory.GetFiles!");
-                        }
+                        suggestions.AddRange(SuggestFiles(allButLast, pathEntry, directory, file));
                     }
                 }
             }
@@ -993,7 +982,7 @@ namespace Antmicro.Renode.UserInterface
 
         private void PrintException(string commandName, Exception e, ICommandInteraction writer)
         {
-            writer.WriteError(string.Format("There was an error executing command '{0}'", commandName));
+            writer.WriteError(string.Format("There was an error executing command '{0}': ", commandName));
             PrintExceptionDetails(e, writer);
         }
 
@@ -1052,6 +1041,7 @@ namespace Antmicro.Renode.UserInterface
             Commands.Add(new UsingCommand(this, () => usings));
             Commands.Add(new QuitCommand(this, x => CurrentMachine = x, () => Quitted));
             Commands.Add(new PeripheralsCommand(this, () => CurrentMachine));
+            Commands.Add(new TagsCommand(this, () => CurrentMachine));
             Commands.Add(new MonitorPathCommand(this, monitorPath));
             Commands.Add(new StartCommand(this, includeCommand));
             Commands.Add(new SetCommand(this, "set", "VARIABLE", (x, y) => SetVariable(x, y, variables), (x, y) => EnableStringEater(x, y, VariableType.Variable),
@@ -1066,6 +1056,7 @@ namespace Antmicro.Renode.UserInterface
             Commands.Add(new MachCommand(this, () => CurrentMachine, x => CurrentMachine = x));
             Commands.Add(new ResdCommand(this));
             Commands.Add(new VerboseCommand(this, x => verboseMode = x));
+            Commands.Add(new SetAndRevertAfterCommand(this, new DeviceHandlingHelpers(this)));
         }
 
         private void DisableStringEater()
@@ -1337,6 +1328,34 @@ namespace Antmicro.Renode.UserInterface
         private const string OriginVariable = GlobalVariablePrefix + "ORIGIN";
 
         private const string CurrentDirectoryVariable = GlobalVariablePrefix + "CWD";
+
+        public class DeviceHandlingHelpers
+        {
+            public DeviceHandlingHelpers(Monitor monitor)
+            {
+                this.monitor = monitor;
+            }
+
+            public bool IsNameAvailable(string name)
+                => monitor.IsNameAvailable(name);
+
+            public object IdentifyDevice(string name)
+                => monitor.IdentifyDevice(name);
+
+            public object HandleDeviceChain(string name, out string chainedName, object device, IEnumerable<Token> tokens, out IEnumerable<Token> tail)
+                => monitor.HandleDeviceChain(name, out chainedName, device, tokens, out tail);
+
+            public bool ParseArgument(IList<Token> tokens, ref int i, out TokenList arg)
+                => Monitor.ParseArgument(tokens, ref i, out arg);
+
+            public bool FitArgumentType(TokenList tokens, Type paramType, out object result)
+                => monitor.FitArgumentType(tokens, paramType, out result);
+
+            public MemberInfo GetAccessor(object device, string member, bool? assertSetter = null, bool? assertGetter = null)
+                => monitor.GetAccessor(device, member, assertSetter, assertGetter);
+
+            private readonly Monitor monitor;
+        }
 
         private enum VariableType
         {

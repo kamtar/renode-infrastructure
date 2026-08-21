@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2019 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -12,6 +12,7 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SPI
@@ -117,7 +118,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             return registersCollection.Read(offset);
         }
 
-        [ConnectionRegionAttribute("xip")]
+        [ConnectionRegion("xip")]
         public uint XipReadDoubleWord(long offset)
         {
             if(!memioEnable.Value)
@@ -134,7 +135,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             registersCollection.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("xip")]
+        [ConnectionRegion("xip")]
         public void XipWriteDoubleWord(long offset, uint value)
         {
             this.Log(LogLevel.Warning, "Trying to write 0x{0:X} to XIP region at offset 0x{1:x}. Direct writing is not supported", value, offset);
@@ -149,6 +150,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private readonly IFlagRegisterField memioEnable;
         private readonly IFlagRegisterField qspiEnable;
 
+        [RegistersDescription]
         private enum Registers
         {
             Config1 = 0x0,

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Utilities.RESD
@@ -292,6 +293,15 @@ namespace Antmicro.Renode.Utilities.RESD
 
                 while(StartTime + wrappedSample.Timestamp <= timestamp)
                 {
+                    /* currentWrappedSample becomes synchronized with samplesData.GetCurrentSample
+                     * only after a TryGetNextSample call. It is assumed that that a sample was
+                     * received only if it was a result of TryGetNextSample. */
+                    var skippingSample = currentWrappedSample != wrappedSample;
+                    if(skippingSample)
+                    {
+                        Logger.Log(LogLevel.Warning, "RESD: Skipping sample: {0}", wrappedSample);
+                    }
+
                     if(!samplesData.Move(1))
                     {
                         // past the current block
@@ -337,9 +347,9 @@ namespace Antmicro.Renode.Utilities.RESD
 
         public override ulong StartTime { get; }
 
-        public override T CurrentSample => currentWrappedSample.Sample;
+        public override T CurrentSample => currentWrappedSample?.Sample ?? samplesData.GetCurrentSample().Sample;
 
-        public override ulong CurrentTimestamp => StartTime + currentWrappedSample.Timestamp;
+        public override ulong CurrentTimestamp => StartTime + (currentWrappedSample?.Timestamp ?? 0);
 
         public override ulong SamplesCount => samplesCount.Value;
 
@@ -379,7 +389,8 @@ namespace Antmicro.Renode.Utilities.RESD
             this.samplesData = new SamplesData<TimestampedRESDSample>(reader);
 
             StartTime = startTime;
-            currentWrappedSample = samplesData.GetCurrentSample();
+            // At this point no sample has been delivered thus there is no current sample
+            currentWrappedSample = null;
 
             var packets = 0UL;
             var lastTimestamp = 0UL;

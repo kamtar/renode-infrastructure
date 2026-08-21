@@ -28,7 +28,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, IRegisterablePeripheral<ExternalPMPBase, NullRegistrationPoint>, ICPUWithPostGprAccessHooks, ICPUWithNMI
+    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, IRegisterablePeripheral<ExternalPMPBase, NullRegistrationPoint>, ICPUWithPostGprAccessHooks, ICPUWithNMI, ICPUWithDirtyAdressesSharing
     {
         public void Register(ICFU cfu, NumberRegistrationPoint<int> registrationPoint)
         {
@@ -284,6 +284,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             SetPCFromResetVector();
             TlibSetPmpaddrBits(PMPNumberOfAddrBits);
             TlibSetNapotGrain(MinimalPMPNapotInBytes);
+            TlibSetPmpEntryCount(PMPEntryCount);
         }
 
         public void Register(ExternalPMPBase externalPMP, NullRegistrationPoint registrationPoint)
@@ -452,6 +453,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public uint PMPNumberOfAddrBits { get; private set; }
 
+        public uint PMPEntryCount { get; }
+
         public IEnumerable<InstructionSet> ArchitectureSets => architectureDecoder.InstructionSets;
 
         public override Endianess DisassemblyHexFormatting => Endianess.LittleEndian;
@@ -490,10 +493,15 @@ namespace Antmicro.Renode.Peripherals.CPU
             uint minimalPmpNapotInBytes = 8,
             uint pmpNumberOfAddrBits = 32,
             PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineSupervisorUser,
-            bool useMachineAtomicState = true
+            bool useMachineAtomicState = true,
+            uint pmpEntryCount = 64
         )
             : base(hartId, cpuType, machine, endianness, bitness, useMachineAtomicState)
         {
+            if(pmpEntryCount != 0 && pmpEntryCount != 16 && pmpEntryCount != 64)
+            {
+                throw new ConstructionException($"Invalid PMP entry count ({pmpEntryCount}), only 0, 16, and 64 are allowed");
+            }
             HartId = hartId;
             this.timeProvider = timeProvider;
             this.privilegedArchitecture = privilegedArchitecture;
@@ -533,6 +541,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibSetPmpaddrBits(pmpNumberOfAddrBits);
             MinimalPMPNapotInBytes = minimalPmpNapotInBytes;
             TlibSetNapotGrain(minimalPmpNapotInBytes);
+            PMPEntryCount = pmpEntryCount;
+            TlibSetPmpEntryCount(PMPEntryCount);
 
             RegisterCSR((ushort)StandardCSR.Miselect, () => miselectValue, s => miselectValue = (uint)s, "miselect");
             for(ushort i = 0; i < 6; ++i)
@@ -846,17 +856,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             foreach(var @set in architectureDecoder.InstructionSets)
             {
-                if(set == InstructionSet.G)
-                {
-                    //G is a wildcard denoting multiple instruction sets
-                    foreach(var gSet in new[] { InstructionSet.I, InstructionSet.M, InstructionSet.F, InstructionSet.D, InstructionSet.A })
-                    {
-                        TlibAllowFeature((uint)gSet);
-                    }
-                    TlibAllowAdditionalFeature((uint)StandardInstructionSetExtensions.ICSR);
-                    TlibAllowAdditionalFeature((uint)StandardInstructionSetExtensions.IFENCEI);
-                }
-                else if(set == InstructionSet.B)
+                if(set == InstructionSet.B)
                 {
                     //B is a wildcard denoting all bit manipulation instruction subsets
                     foreach(var gSet in new[] { StandardInstructionSetExtensions.BA, StandardInstructionSetExtensions.BB, StandardInstructionSetExtensions.BC, StandardInstructionSetExtensions.BS })
@@ -1200,6 +1200,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint> TlibSetNapotGrain;
 
         [Import]
+        private readonly Action<uint> TlibSetPmpEntryCount;
+
+        [Import]
         private readonly Action<uint> TlibSetPmpaddrBits;
 
         [Import]
@@ -1338,7 +1341,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             U = 'U' - 'A',
             V = 'V' - 'A',
             B = 'B' - 'A',
-            G = 'G' - 'A',
         }
 
         public enum StandardInstructionSetExtensions
@@ -1359,9 +1361,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             ZVE64D = 13,
             ZACAS = 14,
             SSCOFPMF = 15,
-            ZCB = 16,
-            ZCMP = 17,
-            ZCMT = 18,
+            BKB = 16,
+            ZCB = 17,
+            ZCMP = 18,
+            ZCMT = 19,
         }
 
         public enum InterruptMode
@@ -1429,8 +1432,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 this.parent = parent;
                 this.machine = machine;
-                instructionSets = new List<InstructionSet>();
-                standardExtensions = new List<StandardInstructionSetExtensions>();
+                instructionSets = new HashSet<InstructionSet>();
+                standardExtensions = new HashSet<StandardInstructionSetExtensions>();
 
                 Decode(architectureString);
                 DecodePrivilegeLevels(privilegeLevels);
@@ -1531,8 +1534,16 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case 'B':
                     instructionSets.Add(InstructionSet.B);
                     break;
-                case 'G':
-                    instructionSets.Add(InstructionSet.G);
+                case 'G': // Shorthand for IMAFD_Zicsr_Zifencei
+                    foreach(var x in "IMAFD")
+                    {
+                        if(!TryHandleSingleCharInstructionSetName(x))
+                        {
+                            throw new ConstructionException($"Failed to enable instruction set '{x}' as part of G extension");
+                        }
+                    }
+                    HandleLongInstructionSetName("ZICSR");
+                    HandleLongInstructionSetName("ZIFENCEI");
                     break;
                 case 'U':
                     parent.WarningLog("Enabling privilege level extension '{0}' using 'cpuType' is not supported. " +
@@ -1562,6 +1573,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case "ZBB": standardExtensions.Add(StandardInstructionSetExtensions.BB); break;
                 case "ZBC": standardExtensions.Add(StandardInstructionSetExtensions.BC); break;
                 case "ZBS": standardExtensions.Add(StandardInstructionSetExtensions.BS); break;
+                case "ZBKB": standardExtensions.Add(StandardInstructionSetExtensions.BKB); break;
                 case "ZICSR": standardExtensions.Add(StandardInstructionSetExtensions.ICSR); break;
                 case "ZIFENCEI": standardExtensions.Add(StandardInstructionSetExtensions.IFENCEI); break;
                 case "ZFH": standardExtensions.Add(StandardInstructionSetExtensions.ZFH); break;
@@ -1633,8 +1645,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
             }
 
-            private readonly IList<StandardInstructionSetExtensions> standardExtensions;
-            private readonly IList<InstructionSet> instructionSets;
+            private readonly ISet<StandardInstructionSetExtensions> standardExtensions;
+            private readonly ISet<InstructionSet> instructionSets;
             private readonly BaseRiscV parent;
             private readonly IMachine machine;
         }

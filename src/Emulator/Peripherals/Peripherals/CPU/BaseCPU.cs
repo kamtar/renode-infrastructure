@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -177,7 +177,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public bool DebuggerConnected { get; set; }
 
-        public bool IsPaused => isPaused;
+        public bool IsPaused => isPausedRequested;
 
         public virtual ExecutionMode ExecutionMode
         {
@@ -266,24 +266,14 @@ namespace Antmicro.Renode.Peripherals.CPU
                 {
                     this.Trace();
                     isHaltedRequested = value;
-                    UpdateHaltedState();
 
                     if(value)
                     {
-                        if(started && !isPaused)
-                        {
-                            wasRunningWhenHalted = true;
-                            Pause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
-                        }
+                        DoPause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
                     }
                     else
                     {
-                        if(EmulationState == EmulationCPUState.InReset)
-                        {
-                            EmulationState = EmulationCPUState.Running;
-                        }
-
-                        if(wasRunningWhenHalted)
+                        if(!isPausedRequested)
                         {
                             Resume();
                         }
@@ -374,9 +364,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             Clustered = new BaseCPU[] { this };
         }
 
-        protected virtual bool UpdateHaltedState(bool ignoreExecutionMode = false)
+        protected override bool UpdateHaltedState(bool ignoreExecutionMode = false, bool fromPausedState = false)
         {
-            var shouldBeHalted = isHaltedRequested || (IsSingleStepMode && !IsSingleStepBlocking && !ignoreExecutionMode);
+            var shouldBeHalted = !isPausedRequested && (isHaltedRequested || (IsSingleStepMode && !IsSingleStepBlocking && !ignoreExecutionMode));
 
             if(shouldBeHalted == currentHaltedState)
             {
@@ -468,6 +458,20 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected virtual void Pause(HaltArguments haltArgs, bool checkPauseGuard)
         {
+            lock(pauseLock)
+            {
+                if(isPausedRequested)
+                {
+                    return;
+                }
+                isPausedRequested = true;
+                DoPause(haltArgs, checkPauseGuard);
+            }
+        }
+
+        protected virtual void DoPause(HaltArguments haltArgs, bool checkPauseGuard)
+        {
+            UpdateHaltedState();
             if(isAborted || isPaused)
             {
                 // cpu is already paused or aborted
@@ -518,7 +522,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected override void OnResume()
         {
-            if(EmulationState == EmulationCPUState.InReset && !currentHaltedState)
+            if(EmulationState == EmulationCPUState.InReset)
             {
                 EmulationState = EmulationCPUState.Running;
             }
@@ -553,6 +557,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             started = false;
             Pause(new HaltArguments(HaltReason.Abort, this), checkPauseGuard: false);
             singleStepSynchronizer.Enabled = false;
+            // Interrupt any blocking operations on the CPU's TimeHandle to
+            // prevent deadlocks when joining the CPU thread.
+            var success = false;
+            timeHandle?.Interrupt(ref success);
             cpuThreadCopy?.Join();
             EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged -= UpdateHaltedState;
         }
@@ -716,7 +724,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected CpuResult CpuThreadBodyInner(bool singleStep, bool skipThisRound = false)
         {
-            if(!TimeHandle.RequestTimeInterval(out var interval))
+            // If the TimeHandle of this CPU is disabled the CPU thread will spin on this function
+            // untill the handle becomes active again. To reduce the strain on the host CPU block
+            // inside RequestTimeInterval and wait for the handle to become active before proceeding further.
+            if(!TimeHandle.RequestTimeInterval(out var interval, blockWhileDisabled: true))
             {
                 this.Trace();
                 return CpuResult.NothingExecuted;
@@ -1015,7 +1026,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         private EmulationCPUState state = EmulationCPUState.InReset;
         private TimeHandle timeHandle;
 
-        private bool wasRunningWhenHalted;
         private ulong executedResiduum;
         private ulong instructionsLeftThisRound;
         private ulong instructionsExecutedThisRound;

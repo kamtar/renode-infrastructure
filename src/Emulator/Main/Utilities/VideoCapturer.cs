@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2021 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -7,6 +7,7 @@
 using System;
 using System.Runtime.InteropServices;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Debugging;
 #pragma warning disable IDE0005
 using Antmicro.Renode.Exceptions;
@@ -16,13 +17,16 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode
 {
+    [SupportedRID("linux")]
     public static class VideoCapturer
     {
+        [SupportedRID("linux")]
         public static bool Start(string device, IEmulationElement loggingParent)
         {
-#if !PLATFORM_LINUX
-            throw new RecoverableException("Video capture is supported on Linux only!");
-#else
+            if(!RuntimeInfo.IsLinux())
+            {
+                throw new RecoverableException("Video capture is supported on Linux only!");
+            }
 
             // stop any previous capturer
             Stop();
@@ -47,28 +51,30 @@ namespace Antmicro.Renode
 
             started = true;
             return RequestBuffer();
-#endif
         }
 
+        [SupportedRID("linux")]
         public static void Stop()
         {
-#if !PLATFORM_LINUX
-            throw new RecoverableException("Video capture is supported on Linux only!");
-#else
+            if(!RuntimeInfo.IsLinux())
+            {
+                throw new RecoverableException("Video capture is supported on Linux only!");
+            }
             if(started)
             {
                 started = false;
                 FreeBuffer();
                 LibCWrapper.Close(fd);
             }
-#endif
         }
 
+        [SupportedRID("linux")]
         public static byte[] GrabSingleFrame()
         {
-#if !PLATFORM_LINUX
-            throw new RecoverableException("Video capture is supported on Linux only!");
-#else
+            if(!RuntimeInfo.IsLinux())
+            {
+                throw new RecoverableException("Video capture is supported on Linux only!");
+            }
             loggingParent.Log(LogLevel.Debug, "Grabbing a frame...");
 
             var framebuffer = Marshal.AllocHGlobal(FRAME_BUFFER_SIZE);
@@ -105,14 +111,15 @@ namespace Antmicro.Renode
             Marshal.FreeHGlobal(framebuffer);
 
             return frame;
-#endif
         }
 
+        [SupportedRID("linux")]
         public static Tuple<int, int> SetImageSize(int width, int height)
         {
-#if !PLATFORM_LINUX
-            throw new RecoverableException("Video capture is supported on Linux only!");
-#else
+            if(!RuntimeInfo.IsLinux())
+            {
+                throw new RecoverableException("Video capture is supported on Linux only!");
+            }
             if(!FreeBuffer())
             {
                 return null;
@@ -149,7 +156,6 @@ namespace Antmicro.Renode
             }
 
             return Tuple.Create(finalWidth, finalHeight);
-#endif
         }
 
         private static bool CheckImageFormat()

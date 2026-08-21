@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -8,6 +8,7 @@
 using System;
 using System.Linq;
 
+using Antmicro.Renode.Time;
 using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.UserInterface.Tokenizer;
 
@@ -156,17 +157,26 @@ namespace Antmicro.Renode.MonitorTests
             AssertTokenizationTypes(result, typeof(BooleanToken));
             AssertTokenizationValues(result, true);
 
-            result = tokenizer.Tokenize("TrUe");
+            result = tokenizer.Tokenize("True");
             AssertTokenizationTypes(result, typeof(BooleanToken));
             AssertTokenizationValues(result, true);
-
-            result = tokenizer.Tokenize("FalSE");
-            AssertTokenizationTypes(result, typeof(BooleanToken));
-            AssertTokenizationValues(result, false);
 
             result = tokenizer.Tokenize("false");
             AssertTokenizationTypes(result, typeof(BooleanToken));
             AssertTokenizationValues(result, false);
+
+            result = tokenizer.Tokenize("False");
+            AssertTokenizationTypes(result, typeof(BooleanToken));
+            AssertTokenizationValues(result, false);
+
+            // Improperly cased boolean values will be parsed as literal tokens
+            result = tokenizer.Tokenize("TRUE");
+            AssertTokenizationTypes(result, typeof(LiteralToken));
+            AssertTokenizationValues(result, "TRUE");
+
+            result = tokenizer.Tokenize("FaLse");
+            AssertTokenizationTypes(result, typeof(LiteralToken));
+            AssertTokenizationValues(result, "FaLse");
         }
 
         [Test]
@@ -180,17 +190,19 @@ namespace Antmicro.Renode.MonitorTests
         [Test]
         public void IntegerTest()
         {
-            var result = tokenizer.Tokenize("123465 -213245 +132432");
-            AssertTokenizationTypes(result, typeof(DecimalIntegerToken), typeof(DecimalIntegerToken), typeof(DecimalIntegerToken));
-            AssertTokenizationValues(result, 123465, -213245, 132432);
+            var result = tokenizer.Tokenize("123465 -213245 +132432 1e5 -3e2 1e+3");
+            AssertTokenizationTypes(result, typeof(DecimalIntegerToken), typeof(DecimalIntegerToken), typeof(DecimalIntegerToken),
+                                    typeof(DecimalIntegerToken), typeof(DecimalIntegerToken), typeof(DecimalIntegerToken));
+            AssertTokenizationValues(result, 123465, -213245, 132432, 100000, -300, 1000);
         }
 
         [Test]
         public void FloatTest()
         {
-            var result = tokenizer.Tokenize("145.5 -0.43 +45.");
-            AssertTokenizationTypes(result, typeof(FloatToken), typeof(FloatToken), typeof(FloatToken));
-            AssertTokenizationValues(result, 145.5f, -0.43f, 45.0f);
+            var result = tokenizer.Tokenize("145.5 -0.43 +45. 1.5e2 1.5e-2 -4.2e+3");
+            AssertTokenizationTypes(result, typeof(FloatToken), typeof(FloatToken), typeof(FloatToken),
+                                    typeof(FloatToken), typeof(FloatToken), typeof(FloatToken));
+            AssertTokenizationValues(result, 145.5f, -0.43f, 45.0f, 150.0f, 0.015f, -4200f);
         }
 
         [Test]
@@ -205,11 +217,51 @@ namespace Antmicro.Renode.MonitorTests
             AssertTokenizationValues(result, 0, "xgfd", 123, "bcd");
         }
 
+        [Test]
         public void LiteralTest()
         {
             var result = tokenizer.Tokenize(".Some.Literal-With?Extra:SignsIn.It:");
             AssertTokenizationTypes(result, typeof(LiteralToken));
             AssertTokenizationValues(result, ".Some.Literal-With?Extra:SignsIn.It:");
+        }
+
+        [Test]
+        public void TimeIntervalTest()
+        {
+            var result = tokenizer.Tokenize("1 1. 1.2 1:2 1:2.3 1:2:3 0:1:2.3 1:2:3.4");
+            AssertTokenizationTypes(result, typeof(DecimalIntegerToken), typeof(FloatToken), typeof(FloatToken),
+                typeof(TimeIntervalToken), typeof(TimeIntervalToken), typeof(TimeIntervalToken),
+                typeof(TimeIntervalToken), typeof(TimeIntervalToken)
+            );
+
+            var recastTokens = result.Tokens.Select(t =>
+            {
+                if(t is DecimalIntegerToken decimalIntegerToken)
+                {
+                    return (Token)(TimeIntervalToken)decimalIntegerToken;
+                }
+                if(t is FloatToken floatToken)
+                {
+                    return (Token)(TimeIntervalToken)floatToken;
+                }
+                return t;
+            });
+            var recastResults = new TokenizationResult(result.UnmatchedCharactersLeft, recastTokens, null);
+            AssertTokenizationTypes(recastResults,
+                typeof(TimeIntervalToken), typeof(TimeIntervalToken), typeof(TimeIntervalToken), typeof(TimeIntervalToken),
+                typeof(TimeIntervalToken), typeof(TimeIntervalToken), typeof(TimeIntervalToken), typeof(TimeIntervalToken)
+            );
+
+            AssertTokenizationValues(recastResults,
+                TimeInterval.FromSeconds(1),
+                TimeInterval.FromSeconds(1),
+                TimeInterval.FromSeconds(1.2),
+                TimeInterval.FromSeconds(1 * 60 + 2),
+                TimeInterval.FromSeconds(1 * 60 + 2.3),
+                TimeInterval.FromSeconds((1 * 60 + 2) * 60 + 3),
+                TimeInterval.FromSeconds(1 * 60 + 2.3),
+                TimeInterval.FromSeconds((1 * 60 + 2) * 60 + 3.4)
+            );
         }
 
         [SetUp]

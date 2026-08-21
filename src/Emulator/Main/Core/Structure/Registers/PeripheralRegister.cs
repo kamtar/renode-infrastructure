@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -18,6 +18,20 @@ namespace Antmicro.Renode.Core.Structure.Registers
 {
     public abstract class PeripheralRegister<T> : PeripheralRegister, IPeripheralRegister<T>
     {
+        /// <summary>
+        /// Defines the callback that is invoked once before each register read, regardless of the number of defined register fields.
+        /// Note that it will also be called for unreadable registers.
+        /// After this callback completes, the <c>valueProviderCallback</c> of each register field is executed.
+        /// </summary>
+        /// <param name="beforeReadCallback">
+        /// The callback invoked whenever this register is read, before any field's <c>valueProviderCallback</c>.
+        /// The parameter contains the current value of the register before the read operation.
+        /// </param>
+        public void DefineBeforeReadCallback(Action<T> beforeReadCallback)
+        {
+            beforeReadCallbacks.Add(beforeReadCallback);
+        }
+
         /// <summary>
         /// Defines the read callback that is called once on each read, regardles of the number of defined register fields.
         /// Note that it will also be called for unreadable registers.
@@ -83,6 +97,11 @@ namespace Antmicro.Renode.Core.Structure.Registers
             CallHandlers(changeCallbacks, FromUlong(oldValue), FromUlong(newValue));
         }
 
+        protected override void CallBeforeReadHandlers(ulong oldValue)
+        {
+            CallHandlers(beforeReadCallbacks, FromUlong(oldValue));
+        }
+
         protected override void CallReadHandlers(ulong oldValue, ulong newValue)
         {
             CallHandlers(readCallbacks, FromUlong(oldValue), FromUlong(newValue));
@@ -102,6 +121,7 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         protected abstract ulong ToUlong(T value);
 
+        private readonly List<Action<T>> beforeReadCallbacks = new List<Action<T>>();
         private readonly List<Action<T, T>> readCallbacks = new List<Action<T, T>>();
         private readonly List<Action<T, T>> writeCallbacks = new List<Action<T, T>>();
         private readonly List<Action<T, T>> changeCallbacks = new List<Action<T, T>>();
@@ -236,7 +256,11 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         void Reset();
 
-        void ShadowReload();
+        void ShadowReloadValue();
+
+        void ShadowReloadCallbacks();
+
+        string[,] Dump(bool allowSideEffects);
     }
 
     /// <summary>
@@ -261,9 +285,10 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// <param name="position">Offset in the register.</param>
         /// <param name="width">Width of field.</param>
         /// <param name="allowedValue">Value allowed to be written.<\param>
-        public void Reserved(int position, int width, ulong? allowedValue = null)
+        /// <param name="silent">Reduces log level of write accesses if default one is too noisy.<\param>
+        public void Reserved(int position, int width, ulong? allowedValue = null, bool silent = false)
         {
-            Tag("RESERVED", position, width, allowedValue);
+            Tag("RESERVED", position, width, allowedValue, silent: silent);
         }
 
         /// <summary>
@@ -273,7 +298,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// <param name="position">Offset in the register.</param>
         /// <param name="width">Width of field.</param>
         /// <param name="allowedValue">Value allowed to be written.<\param>
-        public void Tag(string name, int position, int width, ulong? allowedValue = null)
+        /// <param name="silent">Reduces log level of write accesses if default one is too noisy.<\param>
+        public void Tag(string name, int position, int width, ulong? allowedValue = null, bool isFlag = false, bool silent = false)
         {
             ThrowIfRangeIllegal(position, width, name);
 
@@ -287,8 +313,16 @@ namespace Antmicro.Renode.Core.Structure.Registers
                 Name = name,
                 Position = position,
                 Width = width,
-                AllowedValue = allowedValue
+                AllowedValue = allowedValue,
+                ResetValue = BitHelper.GetValue(this.resetValue, position, width),
+                IsFlag = isFlag,
+                IsSilent = silent,
             });
+        }
+
+        public void TaggedFlag(string name, int position, bool silent = false)
+        {
+            Tag(name, position, 1, isFlag: true, silent: silent);
         }
 
         /// <summary>
@@ -428,16 +462,18 @@ namespace Antmicro.Renode.Core.Structure.Registers
             return field;
         }
 
-        public void ShadowReload()
+        public void ShadowReloadValue()
         {
-            var oldValue = UnderlyingShadowValue;
+            UnderlyingLastShadowValue = UnderlyingShadowValue;
             UnderlyingShadowValue = UnderlyingValue;
-            var newValue = UnderlyingShadowValue;
+        }
 
+        public void ShadowReloadCallbacks()
+        {
             foreach(var field in registerFields)
             {
-                var oldFieldValue = BitHelper.GetValue(oldValue, field.Position, field.Width);
-                var newFieldValue = BitHelper.GetValue(newValue, field.Position, field.Width);
+                var oldFieldValue = BitHelper.GetValue(UnderlyingLastShadowValue, field.Position, field.Width);
+                var newFieldValue = BitHelper.GetValue(UnderlyingShadowValue, field.Position, field.Width);
                 field.CallShadowReloadHandler(oldFieldValue, newFieldValue);
 
                 if(oldFieldValue == newFieldValue)
@@ -447,7 +483,44 @@ namespace Antmicro.Renode.Core.Structure.Registers
                 parent.NoisyLog($"{field.Name}: reloaded shadow from {oldFieldValue:x} to {newFieldValue:x}");
             }
 
-            CallShadowReloadHandlers(oldValue, UnderlyingShadowValue);
+            CallShadowReloadHandlers(UnderlyingLastShadowValue, UnderlyingShadowValue);
+        }
+
+        public string[,] Dump(bool allowSideEffects = false)
+        {
+            var fields = new List<DumpedField>();
+            foreach(var field in registerFields)
+            {
+                var fieldValue = field.DumpValue(allowSideEffects);
+                fields.Add(
+                    new DumpedField
+                    {
+                        Name = field.Name ?? "",
+                        Position = field.Position,
+                        Width = field.Width,
+                        Value = fieldValue.Item1,
+                        ValueIsReliable = fieldValue.Item2
+                    });
+            }
+            foreach(var tag in tags)
+            {
+                fields.Add(
+                    new DumpedField
+                    {
+                        Name = tag.Name ?? "",
+                        Position = tag.Position,
+                        Width = tag.Width,
+                        Value = tag.DumpValue,
+                        ValueIsReliable = true
+                    });
+            }
+            fields.Sort((x, y) => x.Position.CompareTo(y.Position));
+
+            var table = new Table().AddRow("Name", "Bits", "Value", "Reliability");
+            table.AddRows(fields, x => x.Name, x => $"{x.Position}" + (x.Width == 1 ? "" : $"-{x.Position + x.Width - 1}"),
+                          x => x.Value, x => x.ValueIsReliable ? "" : "Not reliable");
+
+            return table.ToArray();
         }
 
         public int RegisterWidth { get; }
@@ -468,6 +541,7 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         protected ulong ReadInner()
         {
+            CallBeforeReadHandlers(UnderlyingValue);
             foreach(var registerField in registerFields)
             {
                 UnderlyingValue = registerField.CallValueProviderHandler(UnderlyingValue);
@@ -608,12 +682,20 @@ namespace Antmicro.Renode.Core.Structure.Registers
             var unhandledWrites = difference & ~definedFieldsMask;
             if(unhandledWrites != 0)
             {
-                parent.Log(LogLevel.Warning, TagLogger(offset, unhandledWrites, value));
+                LogUnhandledWrites(offset, unhandledWrites, value);
             }
 
             if(InvalidTagValues(offset, value, out var invalidValueLog))
             {
                 parent.Log(LogLevel.Error, invalidValueLog);
+            }
+        }
+
+        protected void CallHandlers<T>(List<Action<T>> handlers, T oldValue)
+        {
+            foreach(var handler in handlers)
+            {
+                handler(oldValue);
             }
         }
 
@@ -627,6 +709,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         protected abstract void CallWriteHandlers(ulong oldValue, ulong newValue);
 
+        protected abstract void CallBeforeReadHandlers(ulong oldValue);
+
         protected abstract void CallReadHandlers(ulong oldValue, ulong newValue);
 
         protected abstract void CallChangeHandlers(ulong oldValue, ulong newValue);
@@ -635,7 +719,24 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         protected ulong UnderlyingValue;
 
+        protected ulong UnderlyingLastShadowValue;
+
         protected ulong UnderlyingShadowValue;
+
+        private void LogUnhandledWrites(long offset, ulong unhandledWrites, ulong originalValue)
+        {
+            var warningLogMessage = TagLogger(offset, unhandledWrites, originalValue, matchSilent: false);
+            if(warningLogMessage != "")
+            {
+                parent.Log(LogLevel.Warning, warningLogMessage);
+            }
+
+            var noisyLogMessage = TagLogger(offset, unhandledWrites, originalValue, matchSilent: true);
+            if(noisyLogMessage != "")
+            {
+                parent.Log(LogLevel.Noisy, noisyLogMessage);
+            }
+        }
 
         /// <summary>
         /// Returns information about tag writes. Extracted as a method to allow future lazy evaluation.
@@ -643,16 +744,22 @@ namespace Antmicro.Renode.Core.Structure.Registers
         /// <param name="offset">The offset of the affected register.</param>
         /// <param name="unhandledMask">Unhandled bits mask.</param>
         /// <param name="originalValue">The whole value written to the register.</param>
-        private string TagLogger(long offset, ulong unhandledMask, ulong originalValue)
+        /// <param name="matchSilent">Select silent or non-silent tags.</param>
+        private string TagLogger(long offset, ulong unhandledMask, ulong originalValue, bool matchSilent)
         {
-            var tagsAffected = tags.Where(x => BitHelper.AreAnyBitsSet(unhandledMask, x.Position, x.Width))
+            var tagsAffected = tags.Where(x => matchSilent == x.IsSilent
+                                               && BitHelper.AreAnyBitsSet(unhandledMask, x.Position, x.Width))
                 .Select(x =>  new { x.Name, Value = BitHelper.GetValue(originalValue, x.Position, x.Width) });
-            return "Unhandled write to offset 0x{2:X}. Unhandled bits: [{1}] when writing value 0x{3:X}.{0}"
-                .FormatWith(tagsAffected.Any() ? " Tags: {0}.".FormatWith(
-                    tagsAffected.Select(x => "{0} (0x{1:X})".FormatWith(x.Name, x.Value)).Stringify(", ")) : String.Empty,
-                    BitHelper.GetSetBitsPretty(unhandledMask),
-                    offset,
-                    originalValue);
+            if(tagsAffected.Any())
+            {
+                return "Unhandled write to offset 0x{2:X}. Unhandled bits: [{1}] when writing value 0x{3:X}.{0}"
+                    .FormatWith(tagsAffected.Any() ? " Tags: {0}.".FormatWith(
+                                tagsAffected.Select(x => "{0} (0x{1:X})".FormatWith(x.Name, x.Value)).Stringify(", ")) : String.Empty,
+                            BitHelper.GetSetBitsPretty(unhandledMask),
+                            offset,
+                            originalValue);
+            }
+            return "";
         }
 
         private bool InvalidTagValues(long offset, ulong originalValue, out string log)
@@ -701,13 +808,13 @@ namespace Antmicro.Renode.Core.Structure.Registers
             {
                 throw new ArgumentException("Field {0} does not fit in the register size.".FormatWith(name ?? "at {0} of {1} bits".FormatWith(position, width)));
             }
-            foreach(var field in registerFields.Select(x => new { x.Position, x.Width }).Concat(tags.Select(x => new { Position = x.Position, Width = x.Width })))
+            foreach(var field in registerFields.Select(x => new { x.Position, x.Width, x.Name }).Concat(tags.Select(x => new { Position = x.Position, Width = x.Width, Name = x.Name })))
             {
                 var minEnd = Math.Min(position + width, field.Position + field.Width);
                 var maxStart = Math.Max(position, field.Position);
                 if(minEnd > maxStart)
                 {
-                    throw new ArgumentException("Field {0} intersects with another range.".FormatWith(name ?? "at {0} of {1} bits".FormatWith(position, width)));
+                    throw new ArgumentException($"Field {name ?? "Unnamed"} at {position} of {width} bits intersects with another range {field.Name} at {field.Position} of {field.Width} bits");
                 }
             }
         }
@@ -753,5 +860,14 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         private readonly IPeripheral parent;
         private readonly ulong resetValue;
+
+        private struct DumpedField
+        {
+            public string Name;
+            public int Position;
+            public int Width;
+            public string Value;
+            public bool ValueIsReliable;
+        }
     }
 }

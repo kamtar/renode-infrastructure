@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2023 Western Digital Corporation
 //
 // This file is licensed under the MIT License.
@@ -20,11 +20,11 @@ using Antmicro.Renode.Utilities.GDB;
 
 namespace Antmicro.Renode.Core
 {
-    public interface IMachine : IEmulationElement
+    public interface IMachine : IEmulationElement, IIdentifiable, IHaltable
     {
         void AddUserStateHook(Func<string, bool> predicate, Action<string> hook);
 
-        void AppendDirtyAddresses(ICPU cpu, long[] addresses);
+        void AppendDirtyAddresses(TranslationCPU cpu, long[] addresses);
 
         void AttachGPIO(IPeripheral source, int sourceNumber, IGPIOReceiver destination, int destinationNumber, int? localReceiverNumber = null);
 
@@ -48,7 +48,7 @@ namespace Antmicro.Renode.Core
 
         string GetLocalName(IPeripheral peripheral);
 
-        long[] GetNewDirtyAddressesForCore(ICPU cpu);
+        long[] GetNewDirtyAddressesForCore(TranslationCPU cpu);
 
         IEnumerable<IPeripheral> GetParentPeripherals(IPeripheral peripheral);
 

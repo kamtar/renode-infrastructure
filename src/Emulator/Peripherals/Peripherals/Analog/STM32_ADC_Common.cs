@@ -7,16 +7,17 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.DMA;
-using Antmicro.Renode.Peripherals.Sensors;
+using Antmicro.Renode.Peripherals.Sensor;
+using Antmicro.Renode.Utilities.RESD;
 
 namespace Antmicro.Renode.Peripherals.Analog
 {
@@ -44,20 +45,27 @@ namespace Antmicro.Renode.Peripherals.Analog
     //                          If false, that means the model exposes features like auto-off in one of the configuration registers.
     //    *hasChannelSelect --- Specifies whether this ADC has channel selection register.
     //                          If false, third watchdog threshold configuration register will live under this register's offset.
+    //    *hasOffset ---------- Specifies whether this ADC has offset registers. These registers are tagged but not used by the model.
+    //    *hasDifferentialMode  Specifies whether this has differential mode. The differential mode register is tagged but its
+    //                          value is not used by the model.
+    //    *samplingTime ------- Specifies from the SamplingTime enum how the sampling time registers are defined. These registers
+    //                          are tagged but their value are not used by the model.
+    //    *dualMode ----------- Indicates if there is a secondary ADC that can work in dual mode.
+    //    hasLinearityCalibration - Specifies whether the ADC supports linear calibration procedure.
+    //    *injectedChannels --- Specifies whether injected channels are supported (auto-injection, external trigger, queuing, JQOVF not implemented).
+    //    hasSeparateThresholdRegisters - Specifies whether watchdog threshold values are stored in ADC_AWDnTR registers or ADC_LTRn and ADC_HTRn registers.
+    //    resolutionRange -- Specifies bit resolution range this peripheral supports.
+    //    hasChannelPreselection - Specifies whether ADC requires preselecting channels to be sampled.
+    //    hasScanDirection ---- Specifies whether the ADC supports descending sequence scanning.
     //
     // * - Feature is either partially implemented, or not at all.
-    public abstract class STM32_ADC_Common : IKnownSize, IProvidesRegisterCollection<DoubleWordRegisterCollection>, IDoubleWordPeripheral
+    public abstract class STM32_ADC_Common : IKnownSize, IProvidesRegisterCollection<DoubleWordRegisterCollection>, IDoubleWordPeripheral, IWordPeripheral, IADC
     {
-        public STM32_ADC_Common(IMachine machine, double referenceVoltage, uint externalEventFrequency, int dmaChannel = 0, IDMA dmaPeripheral = null,
-            int? watchdogCount = null, bool? hasCalibration = null, int? channelCount = null, bool? hasPrescaler = null,
-            bool? hasVbatPin = null, bool? hasChannelSequence = null, bool? hasPowerRegister = null, bool? hasChannelSelect = null)
+        public STM32_ADC_Common(IMachine machine, double referenceVoltage, uint externalEventFrequency, int dmaChannel, IDMA dmaPeripheral,
+            int watchdogCount, bool hasCalibration, int channelCount, bool hasPrescaler,
+            bool hasVbatPin, bool hasChannelSequence, bool hasPowerRegister, bool hasChannelSelect,
+            bool hasOffset, bool hasDifferentialMode, SamplingTime samplingTime, bool dualMode, bool hasLinearityCalibration, bool hasChannelInjection, bool hasSeparateThresholdRegisters, ResolutionRange resolutionRange, bool hasChannelPreselection, bool hasScanDirection)
         {
-            if(!watchdogCount.HasValue || !hasCalibration.HasValue || !channelCount.HasValue || !hasPrescaler.HasValue ||
-                !hasVbatPin.HasValue || !hasChannelSequence.HasValue || !hasPowerRegister.HasValue || !hasChannelSelect.HasValue)
-            {
-                throw new ConstructionException("Missing configuration options");
-            }
-
             if(dmaPeripheral == null)
             {
                 if(dmaChannel != 0)
@@ -69,39 +77,42 @@ namespace Antmicro.Renode.Peripherals.Analog
             {
                 if(dmaChannel <= 0 || dmaChannel > dmaPeripheral.NumberOfChannels)
                 {
-                    throw new ConstructionException($"Invalid 'dmaChannel' argument value: '{dmaChannel}'. Available channels: 1-{dma.NumberOfChannels}");
+                    throw new ConstructionException($"Invalid 'dmaChannel' argument value: '{dmaChannel}'. Available channels: 1-{dmaPeripheral.NumberOfChannels}");
                 }
             }
 
             this.machine = machine;
+            ADCContainer = new SimpleContainerHelper<IRESDSampleSource<VoltageSample>>(machine, this);
 
-            bool calibration = hasCalibration.Value;
-            bool prescaler = hasPrescaler.Value;
-            bool vbatPin = hasVbatPin.Value;
-            bool channelSequence = hasChannelSequence.Value;
-            bool powerRegister = hasPowerRegister.Value;
-            ChannelCount = channelCount.Value;
-            WatchdogCount = watchdogCount.Value;
-            this.hasChannelSelect = hasChannelSelect.Value;
+            ADCChannelCount = channelCount;
+            WatchdogCount = watchdogCount;
+            this.hasChannelSelect = hasChannelSelect;
+            this.hasChannelInjection = hasChannelInjection;
+            this.resolutionRange = resolutionRange;
+            this.hasChannelPreselection = hasChannelPreselection;
 
             if(WatchdogCount < 1 || WatchdogCount > 3)
             {
                 throw new ConstructionException("Invalid watchdog count");
             }
-
-            analogWatchdogFlags = new IFlagRegisterField[WatchdogCount];
-            analogWatchdogHighValues = new IValueRegisterField[WatchdogCount];
-            analogWatchdogLowValues = new IValueRegisterField[WatchdogCount];
-            if(WatchdogCount >= 2)
+            if(hasSeparateThresholdRegisters && watchdogCount == 0)
             {
-                analogWatchdog2SelectedChannels = new IFlagRegisterField[ChannelCount];
-            }
-            if(WatchdogCount == 3)
-            {
-                analogWatchdog3SelectedChannels = new IFlagRegisterField[ChannelCount];
+                throw new ConstructionException("Invalid Watchdog configuration");
             }
 
-            registers = new DoubleWordRegisterCollection(this, BuildRegistersMap(calibration, prescaler, vbatPin, channelSequence, powerRegister));
+            registers = new DoubleWordRegisterCollection(this, BuildRegistersMap(hasCalibration,
+                                                                                 hasPrescaler,
+                                                                                 hasVbatPin,
+                                                                                 hasChannelSequence,
+                                                                                 hasPowerRegister,
+                                                                                 hasOffset,
+                                                                                 hasDifferentialMode,
+                                                                                 samplingTime,
+                                                                                 dualMode,
+                                                                                 hasLinearityCalibration,
+                                                                                 hasChannelInjection,
+                                                                                 hasSeparateThresholdRegisters,
+                                                                                 hasScanDirection));
 
             IRQ = new GPIO();
             this.dmaChannel = dmaChannel;
@@ -110,49 +121,16 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.externalEventFrequency = externalEventFrequency;
 
             samplingThread = machine.ObtainManagedThread(StartSampling, externalEventFrequency);
-            channelSelected = new bool[ChannelCount];
-            sampleProvider = new SensorSamplesFifo<ScalarSample>[ChannelCount];
-            for(var channel = 0; channel < ChannelCount; channel++)
-            {
-                sampleProvider[channel] = new SensorSamplesFifo<ScalarSample>();
-            }
+            channelSelected = new bool[ADCChannelCount];
             Reset();
-        }
 
-        public void FeedVoltageSampleToChannel(int channel, string path)
-        {
-            ValidateChannel(channel);
-            sampleProvider[channel].FeedSamplesFromFile(path);
-        }
-
-        public void FeedVoltageSampleToChannel(int channel, decimal valueInmV, uint repeat)
-        {
-            ValidateChannel(channel);
-            var sample = new ScalarSample(valueInmV);
-            for(var i = 0; i < repeat; i++)
-            {
-                sampleProvider[channel].FeedSample(sample);
-            }
-        }
-
-        public void SetDefaultValue(decimal valueInmV, int? channel = null)
-        {
-            if(channel != null)
-            {
-                ValidateChannel(channel.Value);
-                sampleProvider[channel.Value].DefaultSample.Value = valueInmV;
-                return;
-            }
-            for(var i = 0; i < ChannelCount; i++)
-            {
-                sampleProvider[i].DefaultSample.Value = valueInmV;
-            }
+            this.RegisterDefaultChildren(machine);
         }
 
         public void Reset()
         {
             RegistersCollection.Reset();
-            for(var i = 0; i < ChannelCount; i++)
+            for(var i = 0; i < ADCChannelCount; i++)
             {
                 channelSelected[i] = false;
             }
@@ -175,32 +153,73 @@ namespace Antmicro.Renode.Peripherals.Analog
             RegistersCollection.Write(offset, value);
         }
 
+        public ushort ReadWord(long offset)
+        {
+            return (ushort)RegistersCollection.Read(offset);
+        }
+
+        public void WriteWord(long offset, ushort value)
+        {
+            RegistersCollection.Write(offset, value);
+        }
+
         public DoubleWordRegisterCollection RegistersCollection { get => registers; }
 
         public long Size => 0x400;
 
         public GPIO IRQ { get; }
 
-        private void ValidateChannel(int channel)
+        public int ADCChannelCount { get; }
+
+        public SimpleContainerHelper<IRESDSampleSource<VoltageSample>> ADCContainer { get; }
+
+        private void WarnOnTooBigValue(int channel, double mv)
         {
-            if(channel >= ChannelCount || channel < 0)
+            var maxValue = (1 << data.Width) - 1;
+
+            if(MillivoltsToSample(mv, Resolution.Min) > maxValue)
             {
-                throw new RecoverableException($"Invalid argument value: {channel}. This peripheral implements only channels in range 0-{ChannelCount - 1}");
+                this.Log(LogLevel.Warning, "Channel {0}: {1}mV is too big in any ADC configuration", channel, mv);
+            }
+            else if(MillivoltsToSample(mv) > maxValue)
+            {
+                this.Log(LogLevel.Warning, "Channel {0}: {1}mV is too big for current ADC resolution", channel, mv);
+            }
+            else if(MillivoltsToSample(mv, Resolution.Max) > maxValue)
+            {
+                this.Log(LogLevel.Debug,
+                         "Channel {0}: {1}mV will be too big for some ADC resolution other than the current one",
+                         channel, mv);
+            }
+        }
+
+        private void WarnOnCurrentChannelNotPreselected()
+        {
+            if(hasChannelPreselection && !preselectedChannels[currentChannel].Value)
+            {
+                this.Log(LogLevel.Warning, "Channel {0} is not preselected", currentChannel);
             }
         }
 
         private void UpdateInterrupts()
         {
-            var adcReady = adcReadyFlag.Value && adcReadyInterruptEnable.Value;
-            var analogWatchdog = analogWatchdogsInterruptEnable.Zip(analogWatchdogFlags, (enable, flag) =>
+            var irq = false;
+
+            irq |= adcReadyFlag.Value && adcReadyInterruptEnable.Value;
+            irq |= analogWatchdogsInterruptEnable.Zip(analogWatchdogFlags, (enable, flag) =>
             {
                 return enable.Value && flag.Value;
             }).Any(flag => flag);
-            var endOfSampling = endOfSamplingFlag.Value && endOfSamplingInterruptEnable.Value;
-            var endOfConversion = endOfConversionFlag.Value && endOfConversionInterruptEnable.Value;
-            var endOfSequence = endOfSequenceFlag.Value && endOfSequenceInterruptEnable.Value;
-
-            IRQ.Set(adcReady || analogWatchdog || endOfSampling || endOfConversion || endOfSequence);
+            irq |= endOfSamplingFlag.Value && endOfSamplingInterruptEnable.Value;
+            irq |= endOfConversionFlag.Value && endOfConversionInterruptEnable.Value;
+            irq |= endOfSequenceFlag.Value && endOfSequenceInterruptEnable.Value;
+            irq |= adcOverrunFlag.Value && adcOverrunInterruptEnable.Value;
+            if(hasChannelInjection)
+            {
+                irq |= endOfConversionInjectedFlag.Value && endOfConversionInjectedInterruptEnable.Value;
+                irq |= endOfSequenceInjectedFlag.Value && endOfSequenceInjectedInterruptEnable.Value;
+            }
+            IRQ.Set(irq);
         }
 
         private void StartSampling()
@@ -215,18 +234,28 @@ namespace Antmicro.Renode.Peripherals.Analog
                 this.Log(LogLevel.Warning, "Issued a start event before the last sequence finished");
                 return;
             }
+
+            sequenceInProgress = true;
+            startFlag.Value = true;
+
             if(hasChannelSelect)
             {
-                currentChannel = (scanDirection.Value == ScanDirection.Ascending) ? 0 : ChannelCount - 1;
+                // NOTE: We set current channel out of bounds to switch to first active channel
+                currentChannel = (scanDirection == ScanDirection.Ascending) ? -1 : ADCChannelCount;
+                SwitchToNextActiveChannel();
             }
             else
             {
-                sequenceCounter = (scanDirection.Value == ScanDirection.Ascending) ? 0 : (int)regularSequenceLength.Value;
+                sequenceCounter = (scanDirection == ScanDirection.Ascending) ? 0 : (int)regularSequenceLength.Value;
                 currentChannel = (int)regularSequence[sequenceCounter].Value;
             }
-            sequenceInProgress = true;
-            startFlag.Value = true;
             SampleNextChannel();
+        }
+
+        private void StartInjectedSampling()
+        {
+            injectedSequenceCounter = 0;
+            SampleNextInjectedChannel();
         }
 
         private void SendDmaRequest()
@@ -249,12 +278,24 @@ namespace Antmicro.Renode.Peripherals.Analog
                 var enabledOnAll = !analogWatchdogSingleChannel.Value;
                 var enabledOnCurrent = enabledOnAll || (int)analogWatchdogChannel.Value == currentChannel;
                 return analogWatchdogEnable.Value && enabledOnCurrent;
-            case 1:
-                return analogWatchdog2SelectedChannels[currentChannel].Value;
-            case 2:
-                return analogWatchdog3SelectedChannels[currentChannel].Value;
+            default:
+                return analogWatchdogSelectedChannels[watchdogNumber][currentChannel].Value;
             }
-            throw new UnreachableException("Watchdog count is checked in the constructor");
+        }
+
+        private ulong ClampSample(uint sample, int width)
+        {
+            if(sample < (1u << width))
+            {
+                return sample;
+            }
+            else
+            {
+                var clampedSample = (ulong)(1 << width) - 1;
+                this.Log(LogLevel.Warning, "Sample value {0} is too big for ADC data register, clamping it to {1}",
+                         sample, clampedSample);
+                return clampedSample;
+            }
         }
 
         private void SampleNextChannel()
@@ -268,111 +309,149 @@ namespace Antmicro.Renode.Peripherals.Analog
                 return;
             }
 
-            Func<bool> iterationFinished = null;
-            if(hasChannelSelect)
+            if(sequenceInProgress)
             {
-                iterationFinished = () => currentChannel >= ChannelCount;
-            }
-            else
-            {
-                iterationFinished = () => sequenceCounter > (int)regularSequenceLength.Value;
-            }
-
-            while(!iterationFinished() && currentChannel >= 0)
-            {
-                if(hasChannelSelect && !channelSelected[currentChannel])
+                uint sample = GetSampleFromChannel(currentChannel);
+                WarnOnTooBigValue(currentChannel, (double)sample / 1e3); // µV to mV
+                if(!adcOverrunFlag.Value || overrunMode.Value)
                 {
-                    SwitchToNextChannel();
-                    continue;
+                    data.Value = ClampSample(sample, data.Width);
                 }
-                else
-                {
-                    data.Value = GetSampleFromChannel(currentChannel);
-                    if(dmaEnabled.Value)
-                    {
-                        SendDmaRequest();
-                    }
-                    endOfSamplingFlag.Value = true;
+                endOfSamplingFlag.Value = true;
 
-                    for(int i = 0; i < WatchdogCount; i++)
+                for(int i = 0; i < WatchdogCount; i++)
+                {
+                    if(WatchdogEnabled(i))
                     {
-                        if(WatchdogEnabled(i))
+                        if(sample > analogWatchdogHighValues[i].Value || sample < analogWatchdogLowValues[i].Value)
                         {
-                            if(data.Value > analogWatchdogHighValues[i].Value || data.Value < analogWatchdogLowValues[i].Value)
-                            {
-                                analogWatchdogFlags[i].Value = true;
-                                this.Log(LogLevel.Debug, "Analog watchdog {0} flag raised for value {1} on channel {2}", i, data.Value, currentChannel);
-                            }
+                            analogWatchdogFlags[i].Value = true;
+                            this.Log(LogLevel.Debug, "Analog watchdog {0} flag raised for value {1} on channel {2}", i, data.Value, currentChannel);
                         }
                     }
-                    endOfConversionFlag.Value = true;
-                    UpdateInterrupts();
-                    this.Log(LogLevel.Debug, "Sampled channel {0}", currentChannel);
-                    SwitchToNextChannel();
-                    return;
                 }
+                if(endOfConversionFlag.Value)
+                {
+                    adcOverrunFlag.Value = true;
+                }
+                endOfConversionFlag.Value = true;
+                this.Log(LogLevel.Debug, "Sampled channel {0}", currentChannel);
+                if(dmaEnabled.Value && !adcOverrunFlag.Value)
+                {
+                    SendDmaRequest();
+                }
+                SwitchToNextActiveChannel();
             }
-            this.Log(LogLevel.Debug, "No more channels enabled");
-            endOfSequenceFlag.Value = true;
-            sequenceInProgress = false;
-            sequenceCounter = 0;
-            UpdateInterrupts();
-            startFlag.Value = false;
 
-            if(awaitingConversion)
+            if(!sequenceInProgress && awaitingConversion)
             {
                 awaitingConversion = false;
                 StartSampling();
             }
+            UpdateInterrupts();
         }
 
-        private void SwitchToNextChannel()
+        private void SampleNextInjectedChannel()
+        {
+            // Exit when peripheral is not enabled
+            if(!enabled)
+            {
+                injectedSequenceCounter = 0;
+                return;
+            }
+
+            Func<bool> iterationFinished = () => injectedSequenceCounter > (int)injectedSequenceLength.Value;
+
+            if(!iterationFinished())
+            {
+                int currentInjectedChannel = (int)injectedSequence[injectedSequenceCounter].Value;
+
+                uint sample = GetSampleFromChannel(currentInjectedChannel);
+                if(!adcOverrunFlag.Value || overrunMode.Value)
+                {
+                    var register = injectedData[injectedSequenceCounter];
+                    register.Value = ClampSample(sample, register.Width);
+                }
+
+                endOfConversionInjectedFlag.Value = true;
+                this.Log(LogLevel.Debug, "Sampled injected channel {0}", currentInjectedChannel);
+                injectedSequenceCounter++;
+            }
+
+            if(iterationFinished())
+            {
+                this.Log(LogLevel.Debug, "No more injected channels enabled");
+                startInjectionFlag.Value = false;
+                endOfSequenceInjectedFlag.Value = true;
+            }
+            UpdateInterrupts();
+        }
+
+        private void SwitchToNextActiveChannel()
+        {
+            if(!sequenceInProgress)
+            {
+                WarnOnCurrentChannelNotPreselected();
+                return;
+            }
+
+            var iterationFinished = false;
+            do
+            {
+                iterationFinished = SwitchToNextChannel();
+            }
+            while(!iterationFinished && hasChannelSelect && !channelSelected[currentChannel]);
+
+            if(iterationFinished)
+            {
+                this.Log(LogLevel.Debug, "No more channels enabled");
+                endOfSequenceFlag.Value = true;
+                sequenceCounter = 0;
+                startFlag.Value = false;
+                sequenceInProgress = false;
+            }
+        }
+
+        private bool SwitchToNextChannel()
         {
             if(hasChannelSelect)
             {
-                currentChannel = (scanDirection.Value == ScanDirection.Ascending) ? currentChannel + 1 : currentChannel - 1;
+                currentChannel = (scanDirection == ScanDirection.Ascending) ? currentChannel + 1 : currentChannel - 1;
+                return currentChannel >= ADCChannelCount || currentChannel < 0;
             }
             else
             {
-                sequenceCounter = (scanDirection.Value == ScanDirection.Ascending) ? sequenceCounter + 1 : sequenceCounter - 1;
-                // NOTE: Sequence finishes when `sequenceCounter` is either greater than `regularSequenceLength` or less than `0`.
-                // In both of those cases, we assume that at this point `currentChannel` will contain invalid value.
+                sequenceCounter = (scanDirection == ScanDirection.Ascending) ? sequenceCounter + 1 : sequenceCounter - 1;
                 if(sequenceCounter >= 0 && sequenceCounter <= (int)regularSequenceLength.Value)
                 {
                     currentChannel = (int)regularSequence[sequenceCounter].Value;
                 }
+                return sequenceCounter > (int)regularSequenceLength.Value || sequenceCounter < 0 || currentChannel < 0;
             }
         }
 
         private uint GetSampleFromChannel(int channelNumber)
         {
-            var sample = sampleProvider[channelNumber].Sample;
-            sampleProvider[channelNumber].TryDequeueNewSample();
-            return MilivoltsToSample((double)sample.Value);
+            IRESDSampleSource<VoltageSample> sampleSource;
+            var milliVolts = 0.0;
+
+            if(ADCContainer.TryGetByAddress(channelNumber, out sampleSource))
+            {
+                milliVolts = sampleSource.Sample.Voltage / 1000;
+            }
+            WarnOnCurrentChannelNotPreselected();
+            return MillivoltsToSample(milliVolts);
         }
 
-        private uint MilivoltsToSample(double sampleInMilivolts)
+        private uint MillivoltsToSample(double sampleInMillivolts)
         {
-            ushort resolutionInBits;
-            switch(resolution.Value)
-            {
-            case Resolution.Bits6:
-                resolutionInBits = 6;
-                break;
-            case Resolution.Bits8:
-                resolutionInBits = 8;
-                break;
-            case Resolution.Bits10:
-                resolutionInBits = 10;
-                break;
-            case Resolution.Bits12:
-                resolutionInBits = 12;
-                break;
-            default:
-                throw new UnreachableException();
-            }
+            return MillivoltsToSample(sampleInMillivolts, resolution.Value);
+        }
 
-            uint referencedValue = (uint)Math.Round((sampleInMilivolts / (referenceVoltage * 1000)) * ((1 << resolutionInBits) - 1));
+        private uint MillivoltsToSample(double sampleInMillivolts, Resolution sampleResolution)
+        {
+            ushort resolutionInBits = ResolutionToBits(sampleResolution);
+            uint referencedValue = (uint)Math.Round((sampleInMillivolts / (referenceVoltage * 1000)) * ((1 << resolutionInBits) - 1));
             if(align.Value == Align.Left)
             {
                 referencedValue = referencedValue << (16 - resolutionInBits);
@@ -380,14 +459,14 @@ namespace Antmicro.Renode.Peripherals.Analog
             return referencedValue;
         }
 
-        private Dictionary<long, DoubleWordRegister> BuildRegistersMap(bool hasCalibration, bool hasPrescaler, bool hasVbatPin, bool hasChannelSequence, bool hasPowerRegister)
+        private Dictionary<long, DoubleWordRegister> BuildRegistersMap(bool hasCalibration, bool hasPrescaler, bool hasVbatPin, bool hasChannelSequence, bool hasPowerRegister, bool hasOffset, bool hasDifferentialMode, SamplingTime samplingTime, bool dualMode, bool hasLinearityCalibration, bool hasChannelInjection, bool hasSeparateThresholdRegisters, bool hasScanDirection)
         {
             var isrRegister = new DoubleWordRegister(this)
                 .WithFlag(0, out adcReadyFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "ADRDY")
                 .WithFlag(1, out endOfSamplingFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "EOSMP")
                 .WithFlag(2, out endOfConversionFlag, FieldMode.Read | FieldMode.WriteOneToClear,  writeCallback: (_, val) =>
                     {
-                        if(val)
+                        if(val && sequenceInProgress)
                         {
                             // Clearing the End Of Conversion flag triggers next conversion
                             // This function call must be delayed to avoid deadlock on registers access
@@ -396,10 +475,10 @@ namespace Antmicro.Renode.Peripherals.Analog
                     }, name: "EOC")
                 .WithFlag(3, out endOfSequenceFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "EOSEQ")
                 .WithFlag(4, out adcOverrunFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "OVR")
-                .WithReservedBits(5, 2)
                 .WithFlags(7, WatchdogCount, out analogWatchdogFlags, FieldMode.Read | FieldMode.WriteOneToClear, name: "AWD")
-                .WithReservedBits(7 + WatchdogCount, 4 - WatchdogCount)
-                .WithReservedBits(13, 19);
+                .WithReservedBits(7 + WatchdogCount, 3 - WatchdogCount)
+                .WithReservedBits(13, 19)
+                .WithWriteCallback((_, __) => UpdateInterrupts());
 
             var interruptEnableRegister = new DoubleWordRegister(this)
                 .WithFlag(0, out adcReadyInterruptEnable, name: "ADRDYIE")
@@ -407,9 +486,8 @@ namespace Antmicro.Renode.Peripherals.Analog
                 .WithFlag(2, out endOfConversionInterruptEnable, name: "EOCIE")
                 .WithFlag(3, out endOfSequenceInterruptEnable, name: "EOSEQIE")
                 .WithFlag(4, out adcOverrunInterruptEnable, name: "OVRIE")
-                .WithReservedBits(5, 2)
                 .WithFlags(7, WatchdogCount, out analogWatchdogsInterruptEnable, name: "AWDIE")
-                .WithReservedBits(7 + WatchdogCount, 4 - WatchdogCount)
+                .WithReservedBits(7 + WatchdogCount, 3 - WatchdogCount)
                 .WithReservedBits(13, 19)
                 .WithWriteCallback((_, __) => UpdateInterrupts());
 
@@ -431,11 +509,45 @@ namespace Antmicro.Renode.Peripherals.Analog
                     .WithReservedBits(11, 2);
             }
 
+            if(hasChannelInjection)
+            {
+                isrRegister
+                    .WithFlag(5, out endOfConversionInjectedFlag, FieldMode.Read | FieldMode.WriteOneToClear, writeCallback: (_, val) =>
+                        {
+                            if(val && startInjectionFlag.Value)
+                            {
+                                machine.LocalTimeSource.ExecuteInNearestSyncedState((___) => SampleNextInjectedChannel());
+                            }
+                        },
+                        name: "JEOC")
+                    .WithFlag(6, out endOfSequenceInjectedFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "JEOS")
+                    .WithTaggedFlag("JQOVF", 10);
+
+                interruptEnableRegister
+                    .WithFlag(5, out endOfConversionInjectedInterruptEnable, name: "JEOCIE")
+                    .WithFlag(6, out endOfSequenceInjectedInterruptEnable, name: "JEOSIE")
+                    .WithTaggedFlag("JQOVFIE", 10);
+            }
+            else
+            {
+                isrRegister
+                    .WithReservedBits(5, 2)
+                    .WithReservedBits(10, 1);
+                interruptEnableRegister
+                    .WithReservedBits(5, 2)
+                    .WithReservedBits(10, 1);
+            }
+
             var configurationRegister1 = new DoubleWordRegister(this)
                 .WithFlag(0, out dmaEnabled, name: "DMAEN")
-                .WithTaggedFlag("DMACFG", 1)
+                .WithFlag(1, writeCallback: (_, val) =>
+                    {
+                        if(!val && dmaEnabled.Value)
+                        {
+                            this.Log(LogLevel.Warning, "DMA One Shot mode not supported");
+                        }
+                    }, name: "DMACFG")
                 // When fully configurable channel sequencer is available, the SCANDIR and RES fields are swapped
-                .WithEnumField<DoubleWordRegister, ScanDirection>(hasChannelSequence ? 4 : 2, 1, out scanDirection, name: "SCANDIR")
                 .WithEnumField<DoubleWordRegister, Resolution>(hasChannelSequence ? 2 : 3, 2, out resolution, name: "RES")
                 .WithEnumField<DoubleWordRegister, Align>(5, 1, out align, name: "ALIGN")
                 .WithTag("EXTSEL", 6, 2)
@@ -446,16 +558,43 @@ namespace Antmicro.Renode.Peripherals.Analog
                         // This Peripheral mocks external trigger using `externalEventFrequency`, so we only distinguish between manual/external trigger
                         externalTrigger = (val > 0);
                     }, name: "EXTEN")
-                .WithTaggedFlag("OVRMOD", 12)
-                .WithTaggedFlag("CONT", 13)
+                .WithFlag(12, out overrunMode, name: "OVRMOD")
+                .WithFlag(13, out continuous, writeCallback: (prevVal, val) =>
+                    {
+                        if(!val)
+                        {
+                            samplingThread.Stop();
+                            sequenceInProgress = false;
+                        }
+                        else if(startFlag.Value && !prevVal)
+                        {
+                            this.Log(LogLevel.Warning, "Can set continuous mode only when ADSTART is 0");
+                            continuous.Value = false;
+                        }
+                    }, name: "CONT")
                 .WithFlag(14, out waitFlag, name: "WAIT")
                 .WithTaggedFlag("DISCEN", 16)
-                .WithReservedBits(17, 4)
+                .WithTag("DISCNUM", 17, 3)
                 .WithFlag(22, out analogWatchdogSingleChannel, name: "AWDSGL")
                 .WithFlag(23, out analogWatchdogEnable, name: "AWDEN")
-                .WithReservedBits(24, 2)
-                .WithValueField(26, 5, out analogWatchdogChannel, name: "AWDCH")
-                .WithReservedBits(31, 1);
+                .WithValueField(26, 5, out analogWatchdogChannel, name: "AWDCH");
+
+            if(hasChannelInjection)
+            {
+                configurationRegister1
+                    .WithTaggedFlag("JDISCEN", 20)
+                    .WithTaggedFlag("JQM", 21)
+                    .WithTaggedFlag("JAWD1EN", 24)
+                    .WithTaggedFlag("JAUTO", 25)
+                    .WithTaggedFlag("JQDIS", 31);
+            }
+            else
+            {
+                configurationRegister1
+                    .WithReservedBits(20, 1)
+                    .WithReservedBits(24, 2)
+                    .WithReservedBits(31, 1);
+            }
 
             if(!hasPowerRegister)
             {
@@ -468,37 +607,33 @@ namespace Antmicro.Renode.Peripherals.Analog
                     .WithReservedBits(15, 1);
             }
 
-            var regularSequence1 = new DoubleWordRegister(this);
-
             if(hasChannelSequence)
             {
-                if(hasChannelSelect)
+                if(!hasChannelInjection)
                 {
                     configurationRegister1
                         .WithFlag(21, name: "CHSELRMOD"); // no actual logic, but software expects to read the value back
-                }
-                else
-                {
-                    regularSequence1
-                        .WithValueField(0, 4, out regularSequenceLength)
-                        .WithReservedBits(28, 4);
-
-                    for(var i = 0; i < 4; ++i)
-                    {
-                        var j = i;
-                        regularSequence1
-                            .WithReservedBits(4 + 6 * i, 2)
-                            .WithValueField(6 + 6 * i, 4, out regularSequence[j]);
-                    }
                 }
             }
             else
             {
                 configurationRegister1
                     .WithReservedBits(21, 1);
+            }
 
-                regularSequence1
-                    .WithReservedBits(0, 32);
+            if(hasScanDirection)
+            {
+                // When fully configurable channel sequencer is available, the SCANDIR and RES fields are swapped
+                configurationRegister1
+                    .WithEnumField<DoubleWordRegister, ScanDirection>(hasChannelSequence ? 4 : 2, 1, writeCallback: (_, val) =>
+                        {
+                            scanDirection = val;
+                        }, name: "SCANDIR");
+            }
+            else
+            {
+                scanDirection = ScanDirection.Ascending;
+                configurationRegister1.WithReservedBits(hasChannelSequence ? 4 : 2, 1);
             }
 
             var configurationRegister2 = new DoubleWordRegister(this)
@@ -506,7 +641,8 @@ namespace Antmicro.Renode.Peripherals.Analog
                 .WithTag("CKMODE", 30, 2);
 
             var commonConfigurationRegister = new DoubleWordRegister(this)
-                .WithReservedBits(0, 18)
+                .WithReservedBits(0, 16)
+                .WithValueField(16, 2, name: "CKMODE") // no actual logic, since we do not handle clock in this model
                 .WithTaggedFlag("VREFEN", 22)
                 .WithTaggedFlag("TSEN", 23)
                 .WithReservedBits(25, 7);
@@ -533,11 +669,7 @@ namespace Antmicro.Renode.Peripherals.Analog
                     .WithReservedBits(24, 1);
             }
 
-            var registers = new Dictionary<long, DoubleWordRegister>
-            {
-                {(long)Registers.InterruptAndStatus, isrRegister},
-                {(long)Registers.InterruptEnable, interruptEnableRegister},
-                {(long)Registers.Control, new DoubleWordRegister(this)
+            var controlRegister = new DoubleWordRegister(this)
                     .WithFlag(0, valueProviderCallback: _ => enabled, writeCallback: (_, val) =>
                         {
                             if(val)
@@ -554,7 +686,7 @@ namespace Antmicro.Renode.Peripherals.Analog
                         {
                             if(val)
                             {
-                                if(externalTrigger)
+                                if(externalTrigger || continuous.Value)
                                 {
                                     samplingThread.Start();
                                 }
@@ -564,7 +696,6 @@ namespace Antmicro.Renode.Peripherals.Analog
                                 }
                             }
                         },name: "ADSTART")
-                    .WithReservedBits(3, 1)
                     // Reading one from below field would mean that command is in progress. This is never the case in this model
                     .WithFlag(4, valueProviderCallback: _ => false,  writeCallback: (_, val) =>
                         {
@@ -574,80 +705,112 @@ namespace Antmicro.Renode.Peripherals.Analog
                                 sequenceInProgress = false;
                             }
                         }, name: "ADSTP")
-                    .WithReservedBits(5, 23)
                     .WithFlag(28, out adcRegulatorEnable, name: "ADVREGEN")
                     .WithReservedBits(29, 2)
-                    .WithTaggedFlag("ADCAL", 31)
-                },
+                    .WithTaggedFlag("ADCAL", 31);
+
+            if(hasLinearityCalibration)
+            {
+                controlRegister
+                    .WithReservedBits(6, 2)
+                    .WithFlags(8, 2, name: "BOOST")
+                    .WithReservedBits(10, 6)
+                    .WithFlag(16, name: "ADCALLIN")
+                    .WithFlag(22, valueProviderCallback: _ => true, name: "LINCALRDYW1")
+                    .WithFlag(23, valueProviderCallback: _ => true, name: "LINCALRDYW2")
+                    .WithFlag(24, valueProviderCallback: _ => true, name: "LINCALRDYW3")
+                    .WithFlag(25, valueProviderCallback: _ => true, name: "LINCALRDYW4")
+                    .WithFlag(26, valueProviderCallback: _ => true, name: "LINCALRDYW5")
+                    .WithFlag(27, valueProviderCallback: _ => true, name: "LINCALRDYW6");
+            }
+            else
+            {
+                controlRegister
+                    .WithReservedBits(6, 10)
+                    .WithReservedBits(16, 11);
+            }
+
+            if(hasChannelInjection)
+            {
+                controlRegister
+                    .WithFlag(3, out startInjectionFlag, changeCallback: (_, val) =>
+                        {
+                            if(val)
+                            {
+                                StartInjectedSampling();
+                            }
+                        }, name: "JADSTART")
+                    .WithFlag(5, valueProviderCallback: _ => false, writeCallback: (_, val) =>
+                        {
+                            if(val)
+                            {
+                                startInjectionFlag.Value = false;
+                            }
+                        }, name: "JADSTP");
+            }
+            else
+            {
+                controlRegister
+                    .WithReservedBits(3, 1)
+                    .WithReservedBits(5, 1);
+            }
+
+            var dataRegister = new DoubleWordRegister(this)
+                .WithValueField(0, 16, out data, FieldMode.Read, readCallback: (_, __) =>
+                    {
+                        endOfConversionFlag.Value = false;
+                        // This function call must be delayed to avoid deadlock on registers access
+                        if(sequenceInProgress)
+                        {
+                            machine.LocalTimeSource.ExecuteInNearestSyncedState((___) => SampleNextChannel());
+                        }
+                        UpdateInterrupts();
+                    }, name: "DATA")
+                .WithReservedBits(16, 16);
+
+            var registers = new Dictionary<long, DoubleWordRegister>
+            {
+                {(long)Registers.InterruptAndStatus, isrRegister},
+                {(long)Registers.InterruptEnable, interruptEnableRegister},
+                {(long)Registers.Control, controlRegister},
                 {(long)Registers.Configuration1, configurationRegister1},
                 {(long)Registers.Configuration2, configurationRegister2},
-                {(long)Registers.SamplingTime, new DoubleWordRegister(this)
-                    .WithTag("SMP", 0, 3)
-                    .WithReservedBits(3, 29)
-                },
-                {(long)Registers.RegularSequence1, regularSequence1},
-                {(long)Registers.DataRegister, new DoubleWordRegister(this)
-                    .WithValueField(0, 16, out data, FieldMode.Read, readCallback: (_, __) =>
-                        {
-                            endOfConversionFlag.Value = false;
-                            // This function call must be delayed to avoid deadlock on registers access
-                            if(sequenceInProgress)
-                            {
-                                machine.LocalTimeSource.ExecuteInNearestSyncedState((___) => SampleNextChannel());
-                            }
-                        }, name: "DATA")
-                    .WithReservedBits(16, 16)
-                },
+                {(long)Registers.DataRegister, dataRegister},
                 {(long)Registers.CommonConfiguration, commonConfigurationRegister},
             };
+
+            if(hasChannelSequence)
+            {
+                BuildRegularSequenceRegisters(registers, MaximumSequenceLength);
+            }
+
+            BuildSampingTimeRegisters(registers, samplingTime);
 
             // Optional registers
             if(hasChannelSelect)
             {
                 registers.Add((long)Registers.ChannelSelection, new DoubleWordRegister(this)
-                    .WithFlags(0, ChannelCount,
+                    .WithFlags(0, ADCChannelCount,
                            valueProviderCallback: (id, __) => channelSelected[id],
                            writeCallback: (id, _, val) => { this.Log(LogLevel.Debug, "Channel {0} enable set as {1}", id, val); channelSelected[id] = val; })
-                    .WithReservedBits(ChannelCount, 32 - ChannelCount)
+                    .WithReservedBits(ADCChannelCount, 32 - ADCChannelCount)
                 );
             }
 
-            if(WatchdogCount >= 1)
-            {
-                registers.Add((long)Registers.Watchdog1Threshold, new DoubleWordRegister(this)
-                    .WithValueField(0, 12, out analogWatchdogLowValues[0], name: "LT")
-                    .WithReservedBits(12, 4)
-                    .WithValueField(16, 12, out analogWatchdogHighValues[0], name: "HT")
-                    .WithReservedBits(28, 4));
-            }
-            if(WatchdogCount >= 2)
-            {
-                registers.Add((long)Registers.Watchdog2Threshold, new DoubleWordRegister(this)
-                    .WithValueField(0, 12, out analogWatchdogLowValues[1], name: "LT")
-                    .WithReservedBits(12, 4)
-                    .WithValueField(16, 12, out analogWatchdogHighValues[1], name: "HT")
-                    .WithReservedBits(28, 4));
-                registers.Add((long)Registers.Watchdog2Configuration, new DoubleWordRegister(this)
-                    .WithFlags(0, 14, out analogWatchdog2SelectedChannels, name: "AWD2CH")
-                    .WithReservedBits(14, 18));
-            }
-            if(WatchdogCount == 3)
-            {
-                // NOTE: If given implementation doesn't have channel selection, the third Watchdog Threshold will be under ChannelSelection offset
-                registers.Add(hasChannelSelect ? (long)Registers.Watchdog3Threshold : (long)Registers.ChannelSelection, new DoubleWordRegister(this)
-                    .WithValueField(0, 12, out analogWatchdogLowValues[2], name: "LT")
-                    .WithReservedBits(12, 4)
-                    .WithValueField(16, 12, out analogWatchdogHighValues[2], name: "HT")
-                    .WithReservedBits(28, 4));
-                registers.Add((long)Registers.Watchdog3Configuration, new DoubleWordRegister(this)
-                    .WithFlags(0, 14, out analogWatchdog3SelectedChannels, name: "AWD3CH")
-                    .WithReservedBits(14, 18));
-            }
+            BuildWatchdogRegisters(registers, hasSeparateThresholdRegisters);
 
             if(hasCalibration)
             {
                 registers.Add((long)Registers.CalibrationFactor, new DoubleWordRegister(this)
                     .WithValueField(0, 7, name: "CALFACT")
+                    .WithReservedBits(7, 25));
+            }
+
+            if(hasLinearityCalibration)
+            {
+                // Also present on U5 family, which does not have linearity calibration
+                registers.Add((long)Registers.CalibrationFactor2, new DoubleWordRegister(this)
+                    .WithValueField(0, 7, name: "CALFACT2")
                     .WithReservedBits(7, 25));
             }
 
@@ -659,12 +822,271 @@ namespace Antmicro.Renode.Peripherals.Analog
                     .WithReservedBits(2, 30));
             }
 
+            if(hasChannelInjection)
+            {
+                registers.Add((long)Registers.InjectedSequence, new DoubleWordRegister(this)
+                        .WithValueField(0, 2, out injectedSequenceLength, name: "JL")
+                        .WithTag("JEXTSEL", 2, 4)
+                        .WithTag("JEXTEN", 7, 2)
+                        .WithValueField(9, 4, out injectedSequence[0], name: "JSQ1")
+                        .WithReservedBits(14, 1)
+                        .WithValueField(15, 4, out injectedSequence[1], name: "JSQ2")
+                        .WithReservedBits(20, 1)
+                        .WithValueField(21, 4, out injectedSequence[2], name: "JSQ3")
+                        .WithReservedBits(26, 1)
+                        .WithValueField(27, 4, out injectedSequence[3], name: "JSQ4"));
+
+                registers.Add((long)Registers.InjectedChannel1, new DoubleWordRegister(this)
+                        .WithValueField(0, 32, out injectedData[0], name: "JDATA1"));
+                registers.Add((long)Registers.InjectedChannel2, new DoubleWordRegister(this)
+                        .WithValueField(0, 32, out injectedData[1], name: "JDATA2"));
+                registers.Add((long)Registers.InjectedChannel3, new DoubleWordRegister(this)
+                        .WithValueField(0, 32, out injectedData[2], name: "JDATA3"));
+                registers.Add((long)Registers.InjectedChannel4, new DoubleWordRegister(this)
+                        .WithValueField(0, 32, out injectedData[3], name: "JDATA4"));
+            }
+
+            if(hasOffset)
+            {
+                for(uint i = 0; i < 4; i++)
+                {
+                    registers.Add((long)Registers.OffsetRegister1 + 4 * i, new DoubleWordRegister(this)
+                        .WithTag("OFFSET", 0, 12)
+                        .WithReservedBits(12, 14)
+                        .WithTag("OFFSET_CH", 26, 5)
+                        .WithTaggedFlag("OFFSET_EN", 31)
+                    );
+                }
+            }
+
+            if(hasDifferentialMode)
+            {
+                var register = hasSeparateThresholdRegisters ? Registers.DifferentialMode2 : Registers.DifferentialMode;
+                registers.Add((long)register, new DoubleWordRegister(this)
+                    .WithTag("DIFSEL", 0, 19)
+                    .WithReservedBits(19, 13)
+                );
+            }
+
+            if(dualMode)
+            {
+                /* dualMode is not really supported, let's mock ADEN and ADDIS so software can
+                 * disable the ADC2 and checks that it is disabled.
+                 */
+                registers.Add((long)Registers.Control + 0x100, new DoubleWordRegister(this)
+                    .WithTaggedFlag("ADEN", 0)
+                    .WithFlag(1, valueProviderCallback: _ => false, name: "ADDIS")
+                );
+            }
+
+            if(hasChannelPreselection)
+            {
+                registers.Add((long)Registers.ChannelPreselection, new DoubleWordRegister(this)
+                    .WithFlags(0, ADCChannelCount, out preselectedChannels, name: "PCSELn")
+                );
+            }
+
             return registers;
+        }
+
+        private void BuildWatchdogRegisters(Dictionary<long, DoubleWordRegister> registers, bool hasSeparateThresholdRegisters)
+        {
+            Registers GetLowThresholdRegister(int i) => i switch
+            {
+                0 => Registers.WatchdogLowThreshold1,
+                1 => Registers.WatchdogLowThreshold2,
+                2 => Registers.WatchdogLowThreshold3,
+                _ => throw new ConstructionException($"ADC_LT{i + 1} does not exist")
+            };
+
+            Registers GetHighThresholdRegister(int i) => i switch
+            {
+                0 => Registers.WatchdogHighThreshold1,
+                1 => Registers.WatchdogHighThreshold2,
+                2 => Registers.WatchdogHighThreshold3,
+                _ => throw new ConstructionException($"ADC_HT{i + 1} does not exist")
+            };
+
+            // NOTE: If given implementation doesn't have channel selection, the third Watchdog Threshold will be under ChannelSelection offset
+            Registers GetThresholdRegister(int i) => i switch
+            {
+                0 => Registers.Watchdog1Threshold,
+                1 => Registers.Watchdog2Threshold,
+                2 => hasChannelSelect ? Registers.Watchdog3Threshold : Registers.ChannelSelection,
+                _ => throw new ConstructionException($"ADC_TR{i + 1} does not exist")
+            };
+
+            Registers GetConfigurationRegister(int i) => i switch
+            {
+                1 => Registers.Watchdog2Configuration,
+                2 => Registers.Watchdog3Configuration,
+                _ => throw new ConstructionException($"ADC_AWD{i + 1}CH does not exist")
+            };
+
+            analogWatchdogHighValues = new IValueRegisterField[WatchdogCount];
+            analogWatchdogLowValues = new IValueRegisterField[WatchdogCount];
+            analogWatchdogSelectedChannels = new Dictionary<int, IFlagRegisterField[]>();
+
+            for(var i = 0; i < WatchdogCount; i++)
+            {
+                if(hasSeparateThresholdRegisters)
+                {
+                    registers.Add((long)GetLowThresholdRegister(i), new DoubleWordRegister(this)
+                        .WithValueField(0, 26, out analogWatchdogLowValues[i], name: $"LT{i + 1}")
+                        .WithReservedBits(26, 6));
+
+                    registers.Add((long)GetHighThresholdRegister(i), new DoubleWordRegister(this)
+                        .WithValueField(0, 26, out analogWatchdogHighValues[i], name: $"HT{i + 1}")
+                        .WithReservedBits(26, 6));
+                }
+                else
+                {
+                    registers.Add((long)GetThresholdRegister(i), new DoubleWordRegister(this)
+                        .WithValueField(0, 12, out analogWatchdogLowValues[i], name: $"LT{i + 1}")
+                        .WithReservedBits(12, 4)
+                        .WithValueField(16, 12, out analogWatchdogHighValues[i], name: $"HT{i + 1}")
+                        .WithReservedBits(28, 4));
+                }
+                if(i > 0)
+                {
+                    registers.Add((long)GetConfigurationRegister(i), new DoubleWordRegister(this)
+                        .WithFlags(0, ADCChannelCount, out var selectedChannels, name: $"AWD{i + 1}CH")
+                        .WithReservedBits(ADCChannelCount, 31 - ADCChannelCount));
+                    analogWatchdogSelectedChannels.Add(i, selectedChannels);
+                }
+            }
+        }
+
+        private void BuildRegularSequenceRegisters(Dictionary<long, DoubleWordRegister> registers, int sequenceCount)
+        {
+            DoubleWordRegister BuildRegularSequenceRegister(int offset, int sequenceCount, bool containsSequenceLength)
+            {
+                var register = new DoubleWordRegister(this);
+                var sequenceOffset = 0;
+
+                if(containsSequenceLength)
+                {
+                    register.WithValueField(0, 4, out regularSequenceLength, name: "L")
+                        .WithReservedBits(4, 2);
+                    sequenceOffset = 6;
+                }
+
+                for(var i = 0; i < sequenceCount; i++)
+                {
+                    var sequenceFieldWidth = 5;
+                    var sequenceIndex = offset + i;
+
+                    register
+                        .WithValueField(sequenceOffset, sequenceFieldWidth, out regularSequence[sequenceIndex], name: $"SQ{sequenceIndex + 1}")
+                        .WithReservedBits(sequenceOffset + sequenceFieldWidth, 1);
+                    sequenceOffset += sequenceFieldWidth + 1;
+                }
+                register.WithReservedBits(sequenceOffset, register.RegisterWidth - sequenceOffset);
+                return register;
+            }
+
+            Registers GetSequenceRegister(int i) => i switch
+            {
+                0 => Registers.RegularSequence1,
+                1 => Registers.RegularSequence2,
+                2 => Registers.RegularSequence3,
+                3 => Registers.RegularSequence4,
+                _ => throw new ConstructionException($"ADC_SQR{i} does not exist")
+            };
+
+            var sequenceOffset = 0;
+            for(var i = 0; i < 4; i++)
+            {
+                var sequencesPerRegister = i == 0 ? 4 : 5;
+                var sequencesInRegister = Math.Min(sequencesPerRegister, sequenceCount - sequenceOffset);
+
+                var register = BuildRegularSequenceRegister(sequenceOffset, sequencesInRegister, i == 0);
+
+                registers.Add((long)GetSequenceRegister(i), register);
+                sequenceOffset += sequencesPerRegister;
+            }
+        }
+
+        private void BuildSampingTimeRegisters(Dictionary<long, DoubleWordRegister> registers, SamplingTime samplingTime)
+        {
+            if(samplingTime == SamplingTime.OneForAll)
+            {
+                registers.Add((long)Registers.SamplingTime, new DoubleWordRegister(this)
+                    .WithTag("SMP", 0, 3)
+                    .WithReservedBits(3, 29)
+                );
+            }
+            else if(samplingTime == SamplingTime.TwoSelections)
+            {
+                /* SMP1 and SMP2 defined in 0-2 and 4-6, other bits from 8 to 8 + channelCount are
+                 * to select SMP1 or SMP2.
+                 */
+                var smpr = new DoubleWordRegister(this)
+                    .WithTag("SMP1", 0, 3)
+                    .WithReservedBits(3, 1)
+                    .WithTag("SMP2", 4, 3)
+                    .WithReservedBits(7, 1);
+                for(int i = 0; i < ADCChannelCount; i++)
+                {
+                    smpr.Tag($"SMPSEL{i}", 8 + i, 1);
+                }
+                smpr.Reserved(32 - (24 - ADCChannelCount), 24 - ADCChannelCount);
+                registers.Add((long)Registers.SamplingTime, smpr);
+            }
+            else if(samplingTime == SamplingTime.PerChannel)
+            {
+                /* 3 bits per channel, spread over 2 registers if needed. */
+                var smpr1 = new DoubleWordRegister(this);
+                var smpr2 = new DoubleWordRegister(this);
+
+                for(int i = 0; i < ADCChannelCount && i < 10; i++)
+                {
+                    smpr1.Tag($"SMP{i}", 3 * i, 3);
+                }
+                var reservedBitsEntries = ADCChannelCount > 10 ? 0 : (10 - ADCChannelCount);
+                var reservedBitsWidth = 2 + reservedBitsEntries * 3;
+                smpr1.Reserved(32 - reservedBitsWidth, reservedBitsWidth);
+                registers.Add((long)Registers.SamplingTime, smpr1);
+
+                for(int i = 10; i < ADCChannelCount; i++)
+                {
+                    smpr2.Tag($"SMP{i}", 3 * (i - 10), 3);
+                }
+                reservedBitsEntries = ADCChannelCount > 20 ? 0 : (20 - ADCChannelCount);
+                reservedBitsWidth = 2 + reservedBitsEntries * 3;
+                smpr2.Reserved(32 - reservedBitsWidth, reservedBitsWidth);
+                registers.Add((long)Registers.SamplingTime2, smpr2);
+            }
+        }
+
+        private ushort ResolutionToBits(Resolution resolution)
+        {
+            if(resolutionRange == ResolutionRange.Bits8_16)
+            {
+                switch(resolution)
+                {
+                case Resolution.Bits12_16: return 16;
+                case Resolution.Bits10_14: return 14;
+                case Resolution.Bits8_12: return 12;
+                case Resolution.Bits6_8: return 8;
+                }
+            }
+            else if(resolutionRange == ResolutionRange.Bits6_12)
+            {
+                switch(resolution)
+                {
+                case Resolution.Bits12_16: return 12;
+                case Resolution.Bits10_14: return 10;
+                case Resolution.Bits8_12: return 8;
+                case Resolution.Bits6_8: return 6;
+                }
+            }
+            throw new NotImplementedException($"Missing {resolutionRange} bit support");
         }
 
         private IEnumRegisterField<Align> align;
         // While watchdogs 2 and 3 use bitfields for selecting channels to watch
-        private IFlagRegisterField[] analogWatchdog2SelectedChannels;
+        private IDictionary<int, IFlagRegisterField[]> analogWatchdogSelectedChannels;
         // Watchdog 1 either watches all channels or a single channel
         private IValueRegisterField analogWatchdogChannel;
 
@@ -676,7 +1098,6 @@ namespace Antmicro.Renode.Peripherals.Analog
         private IFlagRegisterField[] analogWatchdogsInterruptEnable;
         private IFlagRegisterField adcReadyInterruptEnable;
         private IFlagRegisterField adcOverrunInterruptEnable;
-        private IFlagRegisterField[] analogWatchdog3SelectedChannels;
         private IFlagRegisterField endOfSequenceFlag;
         private IFlagRegisterField endOfConversionFlag;
         private IFlagRegisterField[] analogWatchdogFlags;
@@ -684,12 +1105,19 @@ namespace Antmicro.Renode.Peripherals.Analog
         private IFlagRegisterField adcRegulatorEnable;
 
         private IFlagRegisterField adcOverrunFlag;
+        private IFlagRegisterField overrunMode;
+        private IFlagRegisterField continuous;
         private IFlagRegisterField waitFlag;
         private IFlagRegisterField startFlag;
         private IFlagRegisterField analogWatchdogEnable;
 
+        private IFlagRegisterField endOfConversionInjectedFlag;
+        private IFlagRegisterField endOfSequenceInjectedFlag;
+        private IFlagRegisterField endOfSequenceInjectedInterruptEnable;
+        private IFlagRegisterField endOfConversionInjectedInterruptEnable;
+
         private IFlagRegisterField dmaEnabled;
-        private IEnumRegisterField<ScanDirection> scanDirection;
+        private ScanDirection scanDirection;
         private IEnumRegisterField<Resolution> resolution;
         private IFlagRegisterField endOfSamplingFlag;
 
@@ -701,32 +1129,54 @@ namespace Antmicro.Renode.Peripherals.Analog
         private bool externalTrigger;
         private bool sequenceInProgress;
         private bool awaitingConversion;
+        private IFlagRegisterField startInjectionFlag;
+        private IValueRegisterField injectedSequenceLength;
+        private int injectedSequenceCounter;
+        private IFlagRegisterField[] preselectedChannels;
+        private IValueRegisterField[] analogWatchdogHighValues;
+        private IValueRegisterField[] analogWatchdogLowValues;
         private readonly bool[] channelSelected;
-        private readonly IValueRegisterField[] analogWatchdogHighValues;
-        private readonly IValueRegisterField[] analogWatchdogLowValues;
         private readonly IValueRegisterField[] regularSequence = new IValueRegisterField[MaximumSequenceLength];
+        private readonly IValueRegisterField[] injectedSequence = new IValueRegisterField[MaximumInjectedSequenceLength];
+        private readonly IValueRegisterField[] injectedData = new IValueRegisterField[MaximumInjectedSequenceLength];
 
         private readonly IDMA dma;
         private readonly int dmaChannel;
         private readonly bool hasChannelSelect;
+        private readonly ResolutionRange resolutionRange;
+        private readonly bool hasChannelPreselection;
         private readonly uint externalEventFrequency;
         private readonly double referenceVoltage;
         private readonly IManagedThread samplingThread;
-        private readonly SensorSamplesFifo<ScalarSample>[] sampleProvider;
         private readonly DoubleWordRegisterCollection registers;
         private readonly IMachine machine;
 
-        private readonly int ChannelCount;
         private readonly int WatchdogCount;
-
+        private readonly bool hasChannelInjection;
         private const int MaximumSequenceLength = 16;
+        private const int MaximumInjectedSequenceLength = 4;
+
+        public enum SamplingTime
+        {
+            OneForAll,
+            TwoSelections,
+            PerChannel,
+        }
+
+        public enum ResolutionRange
+        {
+            Bits8_16,
+            Bits6_12,
+        }
 
         private enum Resolution
         {
-            Bits12 = 0b00,
-            Bits10 = 0b01,
-            Bits8  = 0b10,
-            Bits6  = 0b11,
+            Bits12_16 = 0b00,
+            Max       = 0b00, // Keep alias in second place to display Bits12_16 name when dumping Resolution value
+            Bits10_14 = 0b01,
+            Bits8_12  = 0b10,
+            Bits6_8   = 0b11,
+            Min       = 0b11, // Keep alias in second place to display Bits6_8 name when dumping Resolution value
         }
 
         private enum ScanDirection
@@ -748,22 +1198,45 @@ namespace Antmicro.Renode.Peripherals.Analog
             Control                = 0x08, // ADC_CR
             Configuration1         = 0x0C, // ADC_CFGR1
             Configuration2         = 0x10, // ADC_CFGR2
-            SamplingTime           = 0x14, // ADC_SMPR
-            // Gap intended
+            SamplingTime           = 0x14, // ADC_SMPR/ADC_SMPR1
+            SamplingTime2          = 0x18, // ADC_SMPR2
+            ChannelPreselection    = 0x1C, // ADC_PCSEL
             Watchdog1Threshold     = 0x20, // ADC_AWD1TR
+            WatchdogLowThreshold1  = 0x20, // ADC_LTR1
             Watchdog2Threshold     = 0x24, // ADC_AWD2TR
+            WatchdogHighThreshold1 = 0x24, // ADC_HTR1
             ChannelSelection       = 0x28, // ADC_CHSELR
             Watchdog3Threshold     = 0x2C, // ADC_AWD3TR
             RegularSequence1       = 0x30, // ADC_SQR1
-            // Gap intended
+            RegularSequence2       = 0x34, // ADC_SQR2
+            RegularSequence3       = 0x38, // ADC_SQR3
+            RegularSequence4       = 0x3C, // ADC_SQR4
             DataRegister           = 0x40, // ADC_DR
-            // Gap intended
             Power                  = 0x44, // ADC_PWRR
+            InjectedSequence       = 0x4C, // ADC_JSQR
+            // Gap intended
+            OffsetRegister1        = 0x60, // ADC_OFR1
+            OffsetRegister2        = 0x64, // ADC_OFR2
+            OffsetRegister3        = 0x68, // ADC_OFR3
+            OffsetRegister4        = 0x6C, // ADC_OFR4
+            // Gap intended
+            InjectedChannel1       = 0x80, // ADC_JDR1
+            InjectedChannel2       = 0x84, // ADC_JDR2
+            InjectedChannel3       = 0x88, // ADC_JDR3
+            InjectedChannel4       = 0x8C, // ADC_JDR4
             // Gap intended
             Watchdog2Configuration = 0xA0, // ADC_AWD2CR
             Watchdog3Configuration = 0xA4, // ADC_AWD3CR
             // Gap intended
+            DifferentialMode       = 0xB0, // ADC_DIFSEL
+            WatchdogLowThreshold2  = 0xB0, // ADC_LTR2
+            WatchdogHighThreshold2 = 0xB4, // ADC_HTR2
+            WatchdogLowThreshold3  = 0xB8, // ADC_LTR3
+            WatchdogHighThreshold3 = 0xBC, // ADC_HTR3
+            // Gap intended
+            DifferentialMode2      = 0xC0, // ADC_DIFSEL
             CalibrationFactor      = 0xC4, // ADC_CALFACT
+            CalibrationFactor2     = 0xC8, // ADC_CALFACT2
             // Gap intended
             CommonConfiguration    = 0x308, // ADC_CCR
         }

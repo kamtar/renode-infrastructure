@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
 
@@ -27,25 +28,25 @@ namespace Antmicro.Renode.Peripherals.Network
             Write<RegistersMacAndMmc>(macAndMmcRegisters, "MAC and MMC", offset, value);
         }
 
-        [ConnectionRegionAttribute("mtl")]
+        [ConnectionRegion("mtl")]
         public uint ReadDoubleWordFromMTL(long offset)
         {
             return Read<RegistersMTL>(mtlRegisters, "MTL", offset);
         }
 
-        [ConnectionRegionAttribute("mtl")]
+        [ConnectionRegion("mtl")]
         public void WriteDoubleWordToMTL(long offset, uint value)
         {
             Write<RegistersMTL>(mtlRegisters, "MTL", offset, value);
         }
 
-        [ConnectionRegionAttribute("dma")]
+        [ConnectionRegion("dma")]
         public uint ReadDoubleWordFromDMA(long offset)
         {
             return Read<RegistersDMA>(dmaRegisters, "DMA", offset);
         }
 
-        [ConnectionRegionAttribute("dma")]
+        [ConnectionRegion("dma")]
         public void WriteDoubleWordToDMA(long offset, uint value)
         {
             Write<RegistersDMA>(dmaRegisters, "DMA", offset, value);
@@ -1485,6 +1486,7 @@ namespace Antmicro.Renode.Peripherals.Network
 
         private readonly int NumberOfIpcCounters = Enum.GetNames(typeof(IpcCounter)).Length;
 
+        [RegistersDescription]
         public enum RegistersMacAndMmc : long
         {
             OperatingModeConfiguration = 0x000,
@@ -1624,6 +1626,7 @@ namespace Antmicro.Renode.Peripherals.Network
             LogMessageInterval = 0xBD0,
         }
 
+        [RegistersDescription("mtl")]
         public enum RegistersMTL : long
         {
             OperatingMode = 0x000,
@@ -1637,6 +1640,7 @@ namespace Antmicro.Renode.Peripherals.Network
             RxQueueDebug = 0x138,
         }
 
+        [RegistersDescription("dma")]
         public enum RegistersDMA : long
         {
             DMAMode = 0x000,
@@ -1670,7 +1674,7 @@ namespace Antmicro.Renode.Peripherals.Network
 
         public enum RegisterSourceAddressOperation : byte
         {
-            MACAddressRegisterReserved0 = 0b000,
+            MACAddressFromInputSignals  = 0b000,
             MACAddressRegisterReserved1 = 0b001,
             MACAddressRegister0Insert   = 0b010,
             MACAddressRegister0Replace  = 0b011,

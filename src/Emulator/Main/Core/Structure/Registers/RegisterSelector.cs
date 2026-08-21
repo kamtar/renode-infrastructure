@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -37,11 +37,19 @@ namespace Antmicro.Renode.Core.Structure.Registers
             }
         }
 
-        public void ShadowReload()
+        public void ShadowReloadValue()
         {
             foreach(var c in conditionalRegisters)
             {
-                c.Register.ShadowReload();
+                c.Register.ShadowReloadValue();
+            }
+        }
+
+        public void ShadowReloadCallbacks()
+        {
+            foreach(var c in conditionalRegisters)
+            {
+                c.Register.ShadowReloadCallbacks();
             }
         }
 
@@ -61,6 +69,11 @@ namespace Antmicro.Renode.Core.Structure.Registers
         public bool HasRegister()
         {
             return conditionalRegisters.Count == 1 || conditionalRegisters.Any(c => c.Condition());
+        }
+
+        public string[,] Dump(bool allowSideEffects = false)
+        {
+            return GetRegister().Dump(allowSideEffects);
         }
 
         private IPeripheralRegister<T> GetRegister()

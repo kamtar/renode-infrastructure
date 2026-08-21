@@ -23,10 +23,10 @@ using PacketDotNet;
 
 namespace Antmicro.Renode.Peripherals.Network
 {
-    public partial class SynopsysDWCEthernetQualityOfService : NetworkWithPHY, IMACInterface, IKnownSize
+    public partial class SynopsysDWCEthernetQualityOfService : NetworkWithPHY, IMACInterface, IKnownSize, IHasFrequency
     {
         public SynopsysDWCEthernetQualityOfService(IMachine machine, ulong systemClockFrequency, IPeripheral cpuContext = null, BusWidth? dmaBusWidth = null, ulong? ptpClockFrequency = null,
-            int rxQueueSize = 8192, int txQueueSize = 8192, int dmaChannelCount = 1) : base(machine)
+            int rxQueueSize = 8192, int txQueueSize = 8192, int dmaChannelCount = 1, string externalMacAddress = null) : base(machine)
         {
             if(dmaBusWidth.HasValue)
             {
@@ -41,6 +41,11 @@ namespace Antmicro.Renode.Peripherals.Network
             if(dmaChannelCount < 1 || dmaChannelCount > MaxDMAChannels)
             {
                 throw new ConstructionException($"Invalid DMA channel count {dmaChannelCount}. Expected value between 1 and {MaxDMAChannels}");
+            }
+
+            if(externalMacAddress != null)
+            {
+                this.externalMacAddress = MACAddress.Parse(externalMacAddress);
             }
 
             ValidateQueueSize(rxQueueSize, nameof(rxQueueSize));
@@ -163,6 +168,13 @@ namespace Antmicro.Renode.Peripherals.Network
                 }
                 activePhyValue = value;
             }
+        }
+
+        public ulong Frequency
+        {
+            get => ptpClockFrequency;
+
+            set => ptpClockFrequency = value;
         }
 
         public event Action<EthernetFrame> FrameReady;
@@ -458,8 +470,9 @@ namespace Antmicro.Renode.Peripherals.Network
         private AddressWidth address64Value;
         private PhyInterface activePhyValue;
         private uint timestampSecondTimer;
+        private ulong ptpClockFrequency;
         private readonly LimitTimer timestampSubsecondTimer;
-        private readonly ulong ptpClockFrequency;
+        private readonly MACAddress? externalMacAddress;
 
         private const ulong CounterMaxValue = UInt32.MaxValue;
         private const uint RxWatchdogDivider = 256;

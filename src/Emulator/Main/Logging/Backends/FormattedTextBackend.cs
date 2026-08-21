@@ -7,13 +7,11 @@
 using System;
 using System.Text;
 
-using Antmicro.Renode.Utilities;
-
 namespace Antmicro.Renode.Logging
 {
     public abstract class FormattedTextBackend : TextBackend
     {
-        public override void Log(LogEntry entry)
+        public override void Log(LogEntry entry, Logger.TimestampType timestampType)
         {
             if(!ShouldBeLogged(entry))
             {
@@ -21,7 +19,7 @@ namespace Antmicro.Renode.Logging
             }
 
             var color = entry.Type.Color;
-            var line = FormatLogEntry(entry);
+            var line = FormatLogEntry(entry, timestampType);
             lock(sync)
             {
                 if(!PlainMode && color.HasValue)
@@ -42,7 +40,7 @@ namespace Antmicro.Renode.Logging
 
         public bool LogThreadId { get; set; }
 
-        protected override string FormatLogEntry(LogEntry entry)
+        protected override string FormatLogEntry(LogEntry entry, Logger.TimestampType timestampType)
         {
             var threadString = "";
             if(LogThreadId && entry.ThreadId.HasValue)
@@ -50,7 +48,7 @@ namespace Antmicro.Renode.Logging
                 threadString = $" ({entry.ThreadId})";
             }
 
-            return $"{CustomDateTime.Now:HH:mm:ss.ffff} [{entry.Type}]{threadString} {base.FormatLogEntry(entry)}";
+            return $"{entry.GetTimestampString(timestampType)}[{entry.Type}]{threadString} {base.FormatLogEntry(entry, timestampType)}";
         }
 
         protected abstract void SetColor(ConsoleColor color);

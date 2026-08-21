@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -364,16 +364,7 @@ namespace Antmicro.Renode.Utilities
             strBldr.AppendFormat("Downloading: {0}", uri);
             if(bytesDownloaded.HasValue && totalBytes.HasValue)
             {
-                // A workaround for a bug in Mono misreporting TotalBytesToReceive
-                // https://github.com/mono/mono/issues/9808
-                if(totalBytes == -1)
-                {
-                    strBldr.AppendFormat("\nProgress: {0}B downloaded", Misc.NormalizeBinary(bytesDownloaded.Value));
-                }
-                else
-                {
-                    strBldr.AppendFormat("\nProgress: {0}% ({1}B/{2}B)", progressPercentage, Misc.NormalizeBinary(bytesDownloaded.Value), Misc.NormalizeBinary(totalBytes.Value));
-                }
+                strBldr.AppendFormat("\nProgress: {0}% ({1}B/{2}B)", progressPercentage, Misc.NormalizeBinary(bytesDownloaded.Value), Misc.NormalizeBinary(totalBytes.Value));
             }
             if(speed != null)
             {
@@ -403,7 +394,7 @@ namespace Antmicro.Renode.Utilities
                     return false;
                 }
                 fileName = TemporaryFilesManager.Instance.GetTemporaryFile();
-                FileCopier.Copy(GetBinaryFileName(entry.Index), fileName, true);
+                File.Copy(GetBinaryFileName(entry.Index), fileName, true);
                 return true;
             }
         }
@@ -476,7 +467,7 @@ namespace Antmicro.Renode.Utilities
                     {
                         fileId = entry.Index;
                     }
-                    FileCopier.Copy(withFile, GetBinaryFileName(fileId), true);
+                    File.Copy(withFile, GetBinaryFileName(fileId), true);
 
                     // checksum will be 'null' if the uri pattern does not contain
                     // checksum/size information

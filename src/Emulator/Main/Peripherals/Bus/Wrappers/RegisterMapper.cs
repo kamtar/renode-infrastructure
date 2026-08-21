@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -9,35 +9,52 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Bus.Wrappers
 {
     public class RegisterMapper
     {
-        public RegisterMapper(Type peripheralType)
+        public RegisterMapper(Type type, string tag = null)
         {
-            var types = peripheralType.GetAllNestedTypes();
-            var interestingEnums = new List<Type>();
-
-            var enumsWithAttribute = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute));
-            if(enumsWithAttribute != null)
+            tagString = tag is null ? "" : $" in \"{tag}\"";
+            if(type.IsEnum)
             {
-                interestingEnums.AddRange(enumsWithAttribute);
+                RegisterEnumMapping(type);
+                return;
             }
-            interestingEnums.AddRange(types.Where(t => t.BaseType == typeof(Enum) && t.Name.IndexOf("register", StringComparison.CurrentCultureIgnoreCase) != -1));
 
-            foreach(var type in interestingEnums)
+            var peripheralType = type;
+            var types = peripheralType.GetAllNestedTypes();
+            var interestingEnums = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute attr && attr.Contains(tag))).ToList();
+
+            if(interestingEnums.Count == 0)
             {
-                foreach(var value in type.GetEnumValues())
-                {
-                    var l = Convert.ToInt64(value);
-                    var s = Enum.GetName(type, value);
+                interestingEnums = types.Where(t => t.BaseType == typeof(Enum) && t.Name.Contains("register", StringComparison.CurrentCultureIgnoreCase)).ToList();
+            }
 
-                    if(!map.ContainsKey(l))
-                    {
-                        map.Add(l, s);
-                    }
+            foreach(var interestingEnum in interestingEnums)
+            {
+                RegisterEnumMapping(interestingEnum);
+            }
+        }
+
+        public void RegisterEnumMapping(Type @enum)
+        {
+            if(!@enum.IsEnum)
+            {
+                throw new RecoverableException("@enum parameter must be an enum type");
+            }
+
+            foreach(var value in @enum.GetEnumValues())
+            {
+                var l = Convert.ToInt64(value);
+                var s = Enum.GetName(@enum, value);
+
+                if(!map.ContainsKey(l))
+                {
+                    map.Add(l, s);
                 }
             }
         }
@@ -51,11 +68,11 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
                 if(closestCandidates.Count > 0)
                 {
                     var closest = closestCandidates.Max();
-                    name = $"{map[closest]}+0x{offset - closest:x}";
+                    name = $"{map[closest]}+0x{offset - closest:x}{tagString}";
                 }
                 else
                 {
-                    name = "unknown";
+                    name = $"unknown{tagString}";
                 }
             }
             else
@@ -66,9 +83,7 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
             return name;
         }
 
+        private readonly string tagString;
         private readonly Dictionary<long, string> map = new Dictionary<long, string>();
-
-        [AttributeUsage(AttributeTargets.Enum)]
-        public class RegistersDescriptionAttribute : Attribute { }
     }
 }

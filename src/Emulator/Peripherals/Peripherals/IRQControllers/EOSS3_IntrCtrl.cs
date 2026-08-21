@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2020 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -14,6 +14,7 @@ using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Utilities;
 
@@ -170,26 +171,26 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             registers.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("misc")]
+        [ConnectionRegion("misc")]
         public uint ReadDoubleWordFromMisc(long offset)
         {
             return miscRegisters.Read(offset);
         }
 
-        [ConnectionRegionAttribute("misc")]
+        [ConnectionRegion("misc")]
         public void WriteDoubleWordToMisc(long offset, uint value)
         {
             miscRegisters.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("iomux")]
+        [ConnectionRegion("iomux")]
         public uint ReadDoubleWordFromIOMux(long offset)
         {
             this.Log(LogLevel.Warning, "Read from unsupported iomux, offset 0x{0:X}", offset);
             return 0;
         }
 
-        [ConnectionRegionAttribute("iomux")]
+        [ConnectionRegion("iomux")]
         public void WriteDoubleWordToIOMux(long offset, uint value)
         {
             this.Log(LogLevel.Warning, "Write to unsupported iomux, offset 0x{0:X} value 0x{1:X}", offset, value);
@@ -374,6 +375,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             private readonly int number;
         }
 
+        [RegistersDescription]
         private enum Registers
         {
             GPIOInterrupt = 0x0,
@@ -412,6 +414,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             M4MemoryAlwaysOnInterruptEnable = 0xA4,
         }
 
+        [RegistersDescription("misc")]
         private enum MiscRegisters
         {
             IOInput = 0,

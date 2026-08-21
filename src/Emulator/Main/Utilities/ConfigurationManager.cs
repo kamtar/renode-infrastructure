@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -36,7 +36,16 @@ namespace Antmicro.Renode.Utilities
             T result;
             if(!TryFindInCache(group, name, out result))
             {
-                var config = VerifyValue(group, name, defaultValue);
+                if(!Config.TryGet(group, out var config) || !config.Contains(name))
+                {
+                    if(defaultValue == null)
+                    {
+                        throw new ArgumentException("Default value cannot be null", "defaultValue");
+                    }
+                    Set(group, name, defaultValue);
+                    return defaultValue;
+                }
+
                 try
                 {
                     if(typeof(T) == typeof(int))
@@ -81,7 +90,7 @@ namespace Antmicro.Renode.Utilities
 
         public bool TryGet<T>(string group, string name, out T result)
         {
-            var config = Config.Source.Configs[group];
+            var config = Config.Get(group);
             if(config == null || !config.Contains(name))
             {
                 result = default(T);
@@ -100,9 +109,19 @@ namespace Antmicro.Renode.Utilities
 
         public void Set<T>(string group, string name, T value)
         {
-            var config = VerifyValue(group, name, value);
+            if(!Config.TryGet(group, out var config))
+            {
+                config = Config.Add(group);
+            }
+
             AddToCache(group, name, value);
-            config.Set(name, value);
+            // Note that `Config.Source` takes a LockSource when the file does not exist.
+            // The sequence below is safe, because `TryGetGroup` ensures the file is created.
+            using(var locker = Config.LockSource())
+            {
+                config.Set(name, value);
+                Config.Save();
+            }
         }
 
         public string FilePath => Config.FileName;
@@ -110,26 +129,6 @@ namespace Antmicro.Renode.Utilities
         private ConfigurationManager(string configFile)
         {
             Config = new ConfigSource(configFile);
-        }
-
-        private IConfig VerifyValue(string group, string name, object defaultValue)
-        {
-            var config = VerifyGroup(group);
-            if(!config.Contains(name))
-            {
-                if(defaultValue == null)
-                {
-                    throw new ArgumentException("Default value cannot be null", "defaultValue");
-                }
-                config.Set(name, defaultValue);
-            }
-            return config;
-        }
-
-        private IConfig VerifyGroup(string group)
-        {
-            var config = Config.Source.Configs[group];
-            return config ?? Config.Source.AddConfig(group);
         }
 
         private void AddToCache<T>(string group, string name, T value)
@@ -161,19 +160,42 @@ namespace Antmicro.Renode.Utilities
             FileName = filePath;
         }
 
-        public IConfigSource Source
+        public void Save()
+        {
+            if(Emulator.InCIMode)
+            {
+                return;
+            }
+            niniSource.Save(FileName);
+        }
+
+        public IConfig Add(string group) => Source.AddConfig(group);
+
+        public IConfig Get(string group) => Source.Configs[group];
+
+        public bool TryGet(string group, out IConfig config)
+        {
+            config = Get(group);
+            return config != null;
+        }
+
+        public IDisposable LockSource() => Emulator.InCIMode ? new DisposableWrapper() : new FileLocker(FileName + ConfigurationLockSuffix);
+
+        public string FileName { get; private set; }
+
+        private IConfigSource Source
         {
             get
             {
-                if(source == null)
+                if(niniSource == null)
                 {
-                    using(var locker = new FileLocker(FileName + ConfigurationLockSuffix))
+                    using(var locker = LockSource())
                     {
                         if(File.Exists(FileName))
                         {
                             try
                             {
-                                source = new IniConfigSource(FileName);
+                                niniSource = new IniConfigSource(FileName);
                             }
                             catch(Exception)
                             {
@@ -182,19 +204,16 @@ namespace Antmicro.Renode.Utilities
                         }
                         else
                         {
-                            source = new IniConfigSource();
-                            source.Save(FileName);
+                            niniSource = new IniConfigSource();
+                            Save();
                         }
                     }
                 }
-                source.AutoSave = !Emulator.InCIMode;
-                return source;
+                return niniSource;
             }
         }
 
-        public string FileName { get; private set; }
-
-        private IniConfigSource source;
+        private IniConfigSource niniSource;
 
         private const string ConfigurationLockSuffix = ".lock";
     }

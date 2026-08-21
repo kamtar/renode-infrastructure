@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -9,7 +9,9 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Utilities;
 
 using Xwt;
@@ -20,20 +22,53 @@ namespace Antmicro.Renode.UI
     {
         public static void HandleCrash(Exception e)
         {
+            try
+            {
+                Logger.Flush();
+            }
+            catch(Exception)
+            {
+                // there is nothing to do here
+            }
+
             var message = GetFullStackTrace(e);
             SaveErrorToFile(TemporaryFilesManager.Instance.EmulatorTemporaryPath + TemporaryFilesManager.CrashSuffix, message);
             ShowErrorInConsole(message);
             try
             {
-                ApplicationExtensions.InvokeInUIThreadAndWait(() => ShowErrorWindow(message));
+                if(CommandLineInterface.UsingXwtUI)
+                {
+                    ShowErrorWindow(message);
+                }
             }
             catch(Exception)
             {
-                // there is nothing to do here    
+                // there is nothing to do here
             }
         }
 
-        private static void ShowErrorWindow(string message)
+        public static void ShowErrorWindow(string message)
+        {
+            var mre = new ManualResetEventSlim();
+
+            var dialog = ApplicationExtensions.InvokeInUIThreadAndWait(() =>
+            {
+                var localDialog = CreateErrorWindow(message);
+                localDialog.Hidden += (_, __) => localDialog.Close();
+                localDialog.Closed += (_, __) => mre.Set();
+                localDialog.Show();
+                return localDialog;
+            });
+
+            Console.TreatControlCAsInput = false;
+            Console.CancelKeyPress += (_, __) => mre.Set();
+
+            mre.Wait();
+
+            dialog.Dispose();
+        }
+
+        private static Dialog CreateErrorWindow(string message)
         {
             var dialog = new Dialog();
             dialog.Title = "Fatal error";
@@ -54,9 +89,7 @@ namespace Antmicro.Renode.UI
             dialog.Buttons.Add(new DialogButton(Command.Ok));
             dialog.Width = 350;
             dialog.Height = 300;
-
-            dialog.Run();
-            dialog.Dispose();
+            return dialog;
         }
 
         private static void SaveErrorToFile(string location, string message)

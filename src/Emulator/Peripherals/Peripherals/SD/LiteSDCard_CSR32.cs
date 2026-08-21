@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -12,6 +12,7 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SD
@@ -54,37 +55,37 @@ namespace Antmicro.Renode.Peripherals.SD
             phyRegistersCollection.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("core")]
+        [ConnectionRegion("core")]
         public uint ReadDoubleWordFromCore(long offset)
         {
             return coreRegistersCollection.Read(offset);
         }
 
-        [ConnectionRegionAttribute("core")]
+        [ConnectionRegion("core")]
         public void WriteDoubleWordToCore(long offset, uint value)
         {
             coreRegistersCollection.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("reader")]
+        [ConnectionRegion("reader")]
         public uint ReadDoubleWordFromReader(long offset)
         {
             return readerRegistersCollection.Read(offset);
         }
 
-        [ConnectionRegionAttribute("reader")]
+        [ConnectionRegion("reader")]
         public void WriteDoubleWordToReader(long offset, uint value)
         {
             readerRegistersCollection.Write(offset, value);
         }
 
-        [ConnectionRegionAttribute("writer")]
+        [ConnectionRegion("writer")]
         public uint ReadDoubleWordFromWriter(long offset)
         {
             return writerRegistersCollection.Read(offset);
         }
 
-        [ConnectionRegionAttribute("writer")]
+        [ConnectionRegion("writer")]
         public void WriteDoubleWordToWriter(long offset, uint value)
         {
             writerRegistersCollection.Write(offset, value);
@@ -322,6 +323,7 @@ namespace Antmicro.Renode.Peripherals.SD
             ShortBusy,
         }
 
+        [RegistersDescription]
         private enum PhyRegisters
         {
             CardDetect = 0x0,
@@ -330,6 +332,7 @@ namespace Antmicro.Renode.Peripherals.SD
             DataWStatus = 0xC,
         }
 
+        [RegistersDescription("core")]
         private enum CoreRegisters
         {
             Argument = 0x0,
@@ -342,6 +345,7 @@ namespace Antmicro.Renode.Peripherals.SD
             BlockCount = 0x28
         }
 
+        [RegistersDescription("reader")]
         private enum ReaderRegisters
         {
             // 64-bits long, spread accross 2 registers
@@ -358,6 +362,7 @@ namespace Antmicro.Renode.Peripherals.SD
             DmaOffset = 0x18
         }
 
+        [RegistersDescription("writer")]
         private enum WriterRegisters
         {
             // 64-bits long, spread accross 2 registers

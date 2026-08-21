@@ -1,5 +1,5 @@
 ﻿//
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -13,6 +13,7 @@ using Antmicro.Renode.Core.CAN;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Utilities.Packets;
 
@@ -85,13 +86,21 @@ namespace Antmicro.Renode.Peripherals.CAN
 
             registerMap[(long)Register.TestRegister] = new DoubleWordRegister(this)
                 .WithReservedBits(0, 4)
-                .WithFlag(4, out rv.TestRegister.LoopBackMode, writeCallback: (oldVal, newVal) =>
+                .WithFlag(4, out rv.TestRegister.LoopBackMode, changeCallback: (oldVal, newVal) =>
                 {
-                    if(!IsProtectedWrite && newVal != oldVal)
+                    if(!IsProtectedWrite)
                     {
                         this.Log(LogLevel.Warning, "Trying to write to protected field. Ignoring.");
                         rv.TestRegister.LoopBackMode.Value = oldVal;
                         return;
+                    }
+                    if(newVal)
+                    {
+                        this.NoisyLog("Loopback enabled");
+                    }
+                    else
+                    {
+                        this.NoisyLog("Loopback disabled");
                     }
                 }, name: "LBCK")
                 .WithTag("TX", 5, 2)
@@ -815,15 +824,24 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private bool TransmitMessage(CANMessageFrame canMessage)
         {
-            var transmitted = true;
+            var transmitted = false;
             var fs = FrameSent;
+            this.NoisyLog("Sent CAN message {0}", canMessage);
+
+            if(rv.TestRegister.LoopBackMode.Value)
+            {
+                transmitted = true;
+                this.NoisyLog("Loopbacked message");
+                LoopbackReceive(canMessage);
+            }
+
             if(fs != null)
             {
+                transmitted = true;
                 fs.Invoke(canMessage);
             }
-            else
+            if(!transmitted)
             {
-                transmitted = false;
                 this.Log(LogLevel.Warning, "FrameSent is not initialized. Is the controller connected to medium?");
             }
 
@@ -832,6 +850,7 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private void HandleRxInner(CANMessageFrame rxMessage)
         {
+            this.NoisyLog("Received CAN message {0}", rxMessage);
             var match = FilterMessage(rxMessage);
             if(!match)
             {
@@ -891,9 +910,23 @@ namespace Antmicro.Renode.Peripherals.CAN
                             // referencing this specific RxBuffer will not match.
                             continue;
                         }
+                        // M_CAN: a filter element set to "store into Rx Buffer or as a debug
+                        // message" (SFEC/EFEC == 7) ignores the SFT/EFT filter-type field and
+                        // matches the dedicated ID in ID1 (SFID1/EFID1). ID2 (SFID2/EFID2) holds
+                        // the target Rx Buffer index in this mode, not a second ID, so it must
+                        // not be handed to the range/dual/classic matcher.
+                        // For extended frames, the received ID is ANDed with the Extended ID
+                        // AND Mask (XIDAM) before the comparison, as acceptance filtering of
+                        // extended frames is always performed on the masked ID.
+                        var effectiveId = isExtended
+                            ? id & (uint)rv.ExtendedIdANDMask.ExtendedIDANDMask.Value
+                            : id;
+                        match = effectiveId == filter.ID1;
                     }
-
-                    match = MatchFilterElement(isExtended, id, filter);
+                    else
+                    {
+                        match = MatchFilterElement(isExtended, id, filter);
+                    }
 
                     if(!match)
                     {
@@ -1320,6 +1353,15 @@ namespace Antmicro.Renode.Peripherals.CAN
 
             Line0.Set(flag0);
             Line1.Set(flag1);
+        }
+
+        private void LoopbackReceive(CANMessageFrame frame)
+        {
+            machine.HandleTimeDomainEvent(
+                OnFrameReceived,
+                frame,
+                TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp()
+            );
         }
     }
 }

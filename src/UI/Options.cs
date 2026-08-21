@@ -33,7 +33,6 @@ namespace Antmicro.Renode.UI
                 HideMonitor = true;
             }
 
-#if NET
             if(ServerMode && !UI)
             {
                 DisableXwt = true;
@@ -48,13 +47,6 @@ namespace Antmicro.Renode.UI
                 error = "--server-mode (or --ui) and --robot-debug-on-error cannot be set at the same time";
                 return false;
             }
-#else
-            if(ServerMode)
-            {
-                error = "--server-mode is allowed only in .NET build";
-                return false;
-            }
-#endif
 
             error = null;
             return true;
@@ -63,8 +55,8 @@ namespace Antmicro.Renode.UI
         [Name('p', "plain"), DefaultValue(false), Description("Remove steering codes (e.g., colours) from output.")]
         public bool Plain { get; set; }
 
-        [Name('P', "port"), DefaultValue(-1), Description("Instead of opening a window, listen for Monitor commands on the specified port.")]
-        public int Port { get; set; }
+        [Name('P', "port"), Description("Instead of opening a window, listen for Monitor commands on the specified port. Specify 0 to automatically assign an unused port. Specify -1 to disable both the port and the GUI monitor.")]
+        public int? Port { get; set; }
 
         [Name('e', "execute"), Description("Execute command on startup (executed after the optional script). May be used many times.")]
         public string[] Execute { get; set; }
@@ -108,7 +100,7 @@ namespace Antmicro.Renode.UI
         [Name("keep-temporary-files"), Description("Don't clean temporary files on exit")]
         public bool KeepTemporaryFiles { get; set; }
 
-        [Name("server-mode"), DefaultValue(false), Description("Insted of opening a window. Expose localhost:port/proxy endpoint (Works only in .NET build)")]
+        [Name("server-mode"), DefaultValue(false), Description("Instead of opening a window, expose localhost:port/proxy endpoint")]
         public bool ServerMode { get; set; }
 
         [Name("server-mode-port"), DefaultValue(21234), Description("Set port for server mode")]

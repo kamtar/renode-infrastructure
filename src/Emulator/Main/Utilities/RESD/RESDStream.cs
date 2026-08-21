@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -45,6 +45,12 @@ namespace Antmicro.Renode.Utilities.RESD
             if(offsetType == RESDStreamSampleOffset.CurrentVirtualTime)
             {
                 var machine = @this.GetMachine();
+                if(!machine.IsPaused)
+                {
+                    @this.DebugLog("RESD: Creating a stream with the {0} offset type on a running machine may result in sample skips",
+                        RESDStreamSampleOffset.CurrentVirtualTime);
+                }
+
                 if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
                 {
                     cpu.SyncTime();
@@ -64,6 +70,12 @@ namespace Antmicro.Renode.Utilities.RESD
             if(offsetType == RESDStreamSampleOffset.CurrentVirtualTime)
             {
                 var machine = @this.GetMachine();
+                if(!machine.IsPaused)
+                {
+                    @this.DebugLog("RESD: Creating a stream with the {0} offset type on a running machine may result in sample skips",
+                        RESDStreamSampleOffset.CurrentVirtualTime);
+                }
+
                 if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
                 {
                     cpu.SyncTime();
@@ -343,8 +355,6 @@ namespace Antmicro.Renode.Utilities.RESD
                     lastSample = sample;
                     continue;
                 }
-
-                return RESDStreamStatus.OK;
             }
 
             sample = lastSample;
@@ -617,7 +627,7 @@ namespace Antmicro.Renode.Utilities.RESD
 
                 machine.ClockSource.ExchangeClockEntryWith(HandleEvent, entry => entry.With(
                     period: timeInterval.TotalNanoseconds,
-                    value: timeInterval.TotalNanoseconds,
+                    value: machine.ElapsedVirtualTime.TimeElapsed.TotalNanoseconds,
                     enabled: true
                 ));
             }

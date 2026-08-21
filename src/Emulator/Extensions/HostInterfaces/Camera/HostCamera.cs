@@ -20,6 +20,7 @@ namespace Antmicro.Renode.HostInterfaces.Camera
 {
     public static class HostCameraExtensions
     {
+        [SupportedRID("linux")]
         public static void AddExternalCamera(this Emulation emulation, string device, string name = "camera")
         {
             var camera = new HostCamera(device);
@@ -28,16 +29,17 @@ namespace Antmicro.Renode.HostInterfaces.Camera
         }
     }
 
+    [SupportedRID("linux")]
     public class HostCamera : IHostMachineElement
     {
         public HostCamera(string device)
         {
-#if !PLATFORM_LINUX
-            throw new RecoverableException("Host camera integration is currently available on Linux only");
-#else
+            if(!RuntimeInfo.IsLinux())
+            {
+                throw new RecoverableException("Host camera integration is currently available on Linux only");
+            }
             this.device = device;
             InitCamera();
-#endif
         }
 
         public byte[] GrabFrame()

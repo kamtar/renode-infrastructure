@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -9,13 +9,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 
 using Antmicro.Renode.Config;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.UserInterface.Tokenizer;
 using Antmicro.Renode.Utilities;
 
@@ -49,8 +49,21 @@ namespace Antmicro.Renode.UserInterface.Commands
                 writer.WriteLine("Available peripherals:");
                 writer.WriteLine();
 
+                root.ProcessTree();
                 root.PrintTree(writer);
             }
+        }
+
+        [Runnable]
+        public void Run(ICommandInteraction writer, LiteralToken searchToken)
+        {
+            RunFiltering(writer, searchString: searchToken.Value);
+        }
+
+        [Runnable]
+        public void Run(ICommandInteraction writer, RangeToken searchRange)
+        {
+            RunFiltering(writer, rangeToken: searchRange);
         }
 
         [Runnable]
@@ -75,6 +88,20 @@ namespace Antmicro.Renode.UserInterface.Commands
             }
         }
 
+        private void RunFiltering(ICommandInteraction writer, string searchString = null, RangeToken rangeToken = null)
+        {
+            var root = CreateTree(writer);
+
+            if(root != null)
+            {
+                writer.WriteLine("Filtered peripherals:");
+                writer.WriteLine();
+
+                root.ProcessTree(searchString: searchString, rangeToken: rangeToken);
+                root.PrintTree(writer);
+            }
+        }
+
         private PeripheralNode CreateTree(ICommandInteraction writer)
         {
             var currentMachine = GetCurrentMachine();
@@ -89,6 +116,8 @@ namespace Antmicro.Renode.UserInterface.Commands
             var sysbusEntry = peripheralEntries.First(x => x.Key.Name == Machine.SystemBusName);
             var sysbusNode = new PeripheralNode(sysbusEntry);
             var nodeQueue = new Queue<PeripheralNode>(peripheralEntries.Where(x => x.Key != sysbusEntry.Key).Select(x => new PeripheralNode(x)));
+
+            sysbusEntry.Key.ShouldBePrinted = true;
 
             while(nodeQueue.Count > 0)
             {
@@ -118,7 +147,7 @@ namespace Antmicro.Renode.UserInterface.Commands
             public List<PeripheralJson> Children { get; set; } = new List<PeripheralJson>();
         }
 
-        private class PeripheralNode
+        private class PeripheralNode : ITreePrintNode
         {
             public PeripheralNode(KeyValuePair<PeripheralTreeEntry, IEnumerable<IRegistrationPoint>> rawNode)
             {
@@ -172,88 +201,77 @@ namespace Antmicro.Renode.UserInterface.Commands
                 writer.WriteLine(SimpleJson.PrettySerializeObject(document));
             }
 
-            public void PrintTree(ICommandInteraction writer, TreeViewBlock[] pattern = null)
+            public void ProcessTree(string searchString = null, RangeToken rangeToken = null)
             {
-                if(pattern == null)
-                {
-                    pattern = new TreeViewBlock[0];
-                }
-                var indent = GetIndentString(pattern);
-                writer.WriteLine(String.Format("{0}{1} ({2})", indent, PeripheralEntry.Name, PeripheralEntry.Type.Name));
-
-                if(PeripheralEntry.Parent != null)
-                {
-                    var newIndent = GetIndentString(UpdatePattern(pattern, Children.Count > 0 ? TreeViewBlock.Straight : TreeViewBlock.Empty));
-                    if(!(PeripheralEntry.RegistrationPoint is ITheOnlyPossibleRegistrationPoint))
-                    {
-                        foreach(var registerPlace in RegistrationPoints)
-                        {
-                            writer.WriteLine(String.Format("{0}{1}", newIndent, registerPlace.PrettyString));
-                        }
-                    }
-                    writer.WriteLine(newIndent);
-                }
-                else
-                {
-                    writer.WriteLine(GetIndentString(new TreeViewBlock[] { TreeViewBlock.Straight }));
-                }
-
-                var lastChild = Children.LastOrDefault();
                 foreach(var child in Children)
                 {
-                    child.PrintTree(writer, UpdatePattern(pattern, child != lastChild ? TreeViewBlock.Full : TreeViewBlock.End));
+                    // case 1: no filtering
+                    if((rangeToken == null) && (searchString == null))
+                    {
+                        child.PeripheralEntry.ShouldBePrinted = true;
+                    }
+                    // case 2: node name or type name
+                    else if(searchString != null)
+                    {
+                        var name = child.PeripheralEntry.Name;
+                        var typeName = child.PeripheralEntry.TypeName;
+                        if(name == null || typeName == null)
+                        {
+                            continue;
+                        }
+                        child.PeripheralEntry.ShouldBePrinted = name.ToLower().Contains(searchString.ToLower())
+                                                             || typeName.ToLower().Contains(searchString.ToLower());
+                    }
+                    // case 3: address range
+                    else if(rangeToken != null)
+                    {
+                        foreach(var rp in child.RegistrationPoints)
+                        {
+                            if(child.PeripheralEntry.ShouldBePrinted)
+                            {
+                                break;
+                            }
+
+                            var registerPlace = rp as BusRegistration;
+                            if(registerPlace == null)
+                            {
+                                child.PeripheralEntry.ShouldBePrinted = false;
+                                continue;
+                            }
+                            var registerPlaceLower = registerPlace.StartingPoint;
+                            var registerPlaceUpper = registerPlace.StartingPoint + registerPlace.Offset;
+
+                            child.PeripheralEntry.ShouldBePrinted = rangeToken.Value.Contains(registerPlaceLower)
+                                                                 || rangeToken.Value.Contains(registerPlaceUpper);
+                        }
+                    }
+                    child.ProcessTree(searchString, rangeToken);
+                }
+
+                // if there is a child that should be printed then print the parent also
+                if(Children.Where(x => x.PeripheralEntry.ShouldBePrinted).Any())
+                {
+                    PeripheralEntry.ShouldBePrinted = true;
+                }
+                foreach(var leftover in Children.Where(x => !x.PeripheralEntry.ShouldBePrinted))
+                {
+                    Children.Remove(leftover);
                 }
             }
 
-            private static String GetIndentString(TreeViewBlock[] rawSignPattern)
-            {
-                var indentBuilder = new StringBuilder(DefaultPadding);
-                foreach(var tmp in rawSignPattern)
-                {
-                    indentBuilder.Append(GetSingleIndentString(tmp));
-                }
-                return indentBuilder.ToString();
-            }
+            public string Name => $"{PeripheralEntry.Name} ({PeripheralEntry.Type.Name})";
 
-            private static String GetSingleIndentString(TreeViewBlock rawSignPattern)
-            {
-                switch(rawSignPattern)
-                {
-                case TreeViewBlock.Full:
-                    return "├── ";
-                case TreeViewBlock.End:
-                    return "└── ";
-                case TreeViewBlock.Straight:
-                    return "│   ";
-                case TreeViewBlock.Empty:
-                    return "    ";
-                default:
-                    throw new ArgumentException();
-                }
-            }
+            IEnumerable<ITreePrintNode> ITreePrintNode.Children => Children.Where(p => p.PeripheralEntry.ShouldBePrinted);
 
-            private static TreeViewBlock[] UpdatePattern(TreeViewBlock[] oldPattern, TreeViewBlock newSign)
+            public IEnumerable<string> Notes
             {
-                FixLastSign(oldPattern);
-                var newPattern = new TreeViewBlock[oldPattern.Length + 1];
-                Array.Copy(oldPattern, newPattern, oldPattern.Length);
-                newPattern[newPattern.Length - 1] = newSign;
-                return newPattern;
-            }
-
-            private static void FixLastSign(TreeViewBlock[] pattern)
-            {
-                if(pattern.Length < 1)
+                get
                 {
-                    return;
-                }
-                if(pattern[pattern.Length - 1] == TreeViewBlock.Full)
-                {
-                    pattern[pattern.Length - 1] = TreeViewBlock.Straight;
-                }
-                else if(pattern[pattern.Length - 1] == TreeViewBlock.End)
-                {
-                    pattern[pattern.Length - 1] = TreeViewBlock.Empty;
+                    if(PeripheralEntry.Parent == null || PeripheralEntry.RegistrationPoint is ITheOnlyPossibleRegistrationPoint)
+                    {
+                        return Enumerable.Empty<string>();
+                    }
+                    return RegistrationPoints.Select(rp => rp.PrettyString);
                 }
             }
 
@@ -284,8 +302,6 @@ namespace Antmicro.Renode.UserInterface.Commands
             private readonly HashSet<PeripheralNode> Children;
 
             private const String DefaultPadding = "  ";
-
-            internal enum TreeViewBlock { Empty, Straight, End, Full };
         }
     }
 }

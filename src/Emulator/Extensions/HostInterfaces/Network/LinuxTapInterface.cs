@@ -1,11 +1,10 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-#if PLATFORM_LINUX
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -21,15 +20,12 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Network;
-using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.TAPHelper;
 using Antmicro.Renode.Utilities;
 
-using Mono.Unix;
-
 namespace Antmicro.Renode.HostInterfaces.Network
 {
-    public sealed class LinuxTapInterface : ITapInterface, IHasOwnLife, IDisposable
+    public sealed class LinuxTapInterface : ITapInterface
     {
         public LinuxTapInterface(string name, bool persistent)
         {
@@ -42,9 +38,9 @@ namespace Antmicro.Renode.HostInterfaces.Network
 
         public void Dispose()
         {
-            if(stream != null)
+            if(tapFileDescriptor != -1)
             {
-                stream.Close();
+                LibCWrapper.Close(tapFileDescriptor);
             }
 
             if(tapFileDescriptor != -1)
@@ -75,14 +71,14 @@ namespace Antmicro.Renode.HostInterfaces.Network
         public void ReceiveFrame(EthernetFrame frame)
         {
             // TODO: non blocking
-            if(stream == null)
+            if(tapFileDescriptor == -1)
             {
                 return;
             }
             var handle = GCHandle.Alloc(frame.Bytes, GCHandleType.Pinned);
             try
             {
-                var result = LibCWrapper.Write(stream.Handle, handle.AddrOfPinnedObject(), frame.Bytes.Length);
+                var result = LibCWrapper.Write(tapFileDescriptor, handle.AddrOfPinnedObject(), frame.Bytes.Length);
                 if(!result)
                 {
                     this.Log(LogLevel.Error,
@@ -171,11 +167,7 @@ namespace Antmicro.Renode.HostInterfaces.Network
                 {
                     var process = new Process();
                     var output = string.Empty;
-#if NET
                     process.StartInfo.FileName = "dotnet";
-#else
-                    process.StartInfo.FileName = "mono";
-#endif
                     process.StartInfo.Arguments = string.Format("{0} {1} true", DynamicModuleSpawner.GetTAPHelper(), deviceName);
 
                     try
@@ -208,7 +200,6 @@ namespace Antmicro.Renode.HostInterfaces.Network
                     Init();
                     return;
                 }
-                stream = new UnixStream(tapFileDescriptor, true);
                 InterfaceName = Marshal.PtrToStringAnsi(devName);
                 this.Log(LogLevel.Info,
                     "Opened interface {0}.", InterfaceName);
@@ -230,13 +221,13 @@ namespace Antmicro.Renode.HostInterfaces.Network
             while(true)
             {
                 byte[] buffer = null;
-                if(stream == null)
+                if(tapFileDescriptor == -1)
                 {
                     return;
                 }
                 try
                 {
-                    buffer = LibCWrapper.Read(stream.Handle, MTU, ReadTimeout, () => token.IsCancellationRequested);
+                    buffer = LibCWrapper.Read(tapFileDescriptor, MTU, ReadTimeout, () => token.IsCancellationRequested);
                 }
                 catch(ArgumentException)
                 {
@@ -271,9 +262,7 @@ namespace Antmicro.Renode.HostInterfaces.Network
         [Transient]
         private CancellationTokenSource cts;
         [Transient]
-        private UnixStream stream;
-        [Transient]
-        private int tapFileDescriptor;
+        private int tapFileDescriptor = -1;
         [Transient]
         private Thread thread;
         private readonly string deviceName;
@@ -285,4 +274,3 @@ namespace Antmicro.Renode.HostInterfaces.Network
         private const int ReadTimeout = 100; // in milliseconds
     }
 }
-#endif

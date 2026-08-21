@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -20,8 +20,6 @@ namespace Antmicro.Renode.UserInterface.Tokenizer
             var tokenizer = new Tokenizer();
             // comment
             tokenizer.AddToken(new Regex(@"^\#.*"), x => new CommentToken(x));
-
-            tokenizer.AddToken(new Regex(@"^:.*"), x => new CommentToken(x));
 
             // execution
             tokenizer.AddToken(new Regex(@"^`.*?`"), x => new ExecutionToken(x));
@@ -57,14 +55,17 @@ namespace Antmicro.Renode.UserInterface.Tokenizer
             // hex number
             tokenizer.AddToken(new Regex(@"^0x([0-9]|(?i:[a-f]))+"), x => new HexToken(x));
 
+            // time interval
+            tokenizer.AddToken(new Regex(@"^(([0-9]+:)?[0-9]+:)[0-9]+(\.[0-9]+)?"), x => new TimeIntervalToken(x));
+
             // float number
-            tokenizer.AddToken(new Regex(@"^[+-]?((\d+\.(\d*)?))"), x => new FloatToken(x));
+            tokenizer.AddToken(new Regex(@"^[+-]?((\d+\.(\d*)?(e[+-]?\d+)?))"), x => new FloatToken(x));
 
             // integer
-            tokenizer.AddToken(new Regex(@"^[+-]?\d+"), x => new DecimalIntegerToken(x));
+            tokenizer.AddToken(new Regex(@"^[+-]?\d+(e[+-]?\d+)?"), x => new DecimalIntegerToken(x));
 
             // boolean ignore case
-            tokenizer.AddToken(new Regex(@"^(?i)(true|false)"), x => new BooleanToken(x));
+            tokenizer.AddToken(new Regex(@"^(true|false|True|False)"), x => new BooleanToken(x));
 
             // "null"
             tokenizer.AddToken(new Regex(@"^null"), x => new NullToken(x));
@@ -82,10 +83,14 @@ namespace Antmicro.Renode.UserInterface.Tokenizer
             tokenizer.AddToken(new Regex(@"^,"), x => new CommaToken(x));
 
             // literal
-            tokenizer.AddToken(new Regex(@"^[\w\.\-\?]+"), x => new LiteralToken(x));
+            tokenizer.AddToken(new Regex(@"^[\w\.\-\?][\w\.\-\?:]*"), x => new LiteralToken(x));
 
             // whitespace
             tokenizer.AddToken(new Regex(@"^\s+"), x => null);
+
+            // comment
+            tokenizer.AddToken(new Regex(@"^:.*"), x => new CommentToken(x));
+
             return tokenizer;
         }
 

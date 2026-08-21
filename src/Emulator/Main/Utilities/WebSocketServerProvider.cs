@@ -179,8 +179,11 @@ namespace Antmicro.Renode.Utilities
 
         public WebSocketConnection CurrentConnection => connections.FirstOrDefault();
 
+        public event Action<int, int> Resized;
+
         private void NewConnectionEventHandler(WebSocketConnection sender, List<string> extraSegments)
         {
+            sender.Resized += Resized;
             if(bufferMessages)
             {
                 while(bufferQueue.TryDequeue(out var bytes))
@@ -198,6 +201,7 @@ namespace Antmicro.Renode.Utilities
     {
         public Action<WebSocketConnection, byte[]> DataBlockReceived;
         public Action<WebSocketConnection> Disconnected;
+        public Action<WebSocketConnection, int, int> Resized;
         public string Endpoint;
     }
 
@@ -254,9 +258,13 @@ namespace Antmicro.Renode.Utilities
             enqueuedEvent.Set();
         }
 
+        public void TriggerResize(int width, int height) => Resized?.Invoke(width, height);
+
         public int BufferSize { get; private set; }
 
         public event Action<byte[]> DataBlockReceived;
+
+        public event Action<int, int> Resized;
 
         private async Task AsyncReader()
         {
@@ -305,7 +313,15 @@ namespace Antmicro.Renode.Utilities
                 }
 
                 var fixedBuffer = buffer.Take(totalBytes).ToArray();
-                DataBlockReceived.Invoke(fixedBuffer);
+                try
+                {
+                    DataBlockReceived.Invoke(fixedBuffer);
+                }
+                catch(Exception ex)
+                {
+                    Logger.Log(LogLevel.Error, "WebSocket: Exception during buffer read: {0}", ex);
+                    break;
+                }
             }
 
             if(!cancellationToken.IsCancellationRequested)
@@ -334,7 +350,7 @@ namespace Antmicro.Renode.Utilities
 
                     while(queue.TryDequeue(out var dequeued))
                     {
-                        await webSocket.SendAsync(new ArraySegment<byte>(dequeued, 0, dequeued.Length), WebSocketMessageType.Text, true, cancellationToken.Token);
+                        await webSocket.SendAsync(new ArraySegment<byte>(dequeued, 0, dequeued.Length), WebSocketMessageType.Binary, true, cancellationToken.Token);
                     }
                 }
                 catch(Exception)

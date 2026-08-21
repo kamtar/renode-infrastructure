@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -111,6 +111,35 @@ namespace Antmicro.Renode.Core.Structure.Registers
             where R : IRegisterCollection
         {
             @this.RegistersCollection.RemoveAfterWriteHook(offset);
+        }
+    }
+
+    public static class RegisterCollectionExtensions
+    {
+        public static string[,] DumpRegister<T>(this IProvidesRegisterCollection<T> @this, long offset, bool allowSideEffects = false)
+            where T : IRegisterCollection
+        {
+            return @this.RegistersCollection.DumpRegister(offset, allowSideEffects);
+        }
+
+        public static string[,] DumpQuadWordRegister(this IProvidesRegisterCollection<QuadWordRegisterCollection> @this, long offset, bool allowSideEffects = false)
+        {
+            return @this.DumpRegister(offset, allowSideEffects);
+        }
+
+        public static string[,] DumpDoubleWordRegister(this IProvidesRegisterCollection<DoubleWordRegisterCollection> @this, long offset, bool allowSideEffects = false)
+        {
+            return @this.DumpRegister(offset, allowSideEffects);
+        }
+
+        public static string[,] DumpWordRegister(this IProvidesRegisterCollection<WordRegisterCollection> @this, long offset, bool allowSideEffects = false)
+        {
+            return @this.DumpRegister(offset, allowSideEffects);
+        }
+
+        public static string[,] DumpByteRegister(this IProvidesRegisterCollection<ByteRegisterCollection> @this, long offset, bool allowSideEffects = false)
+        {
+            return @this.DumpRegister(offset, allowSideEffects);
         }
     }
 
@@ -252,11 +281,27 @@ namespace Antmicro.Renode.Core.Structure.Registers
             }
         }
 
+        public void ResetRegister(long offset)
+        {
+            if(registers.TryGetValue(offset, out var selector))
+            {
+                selector.Reset();
+            }
+            else
+            {
+                parent.WarningLog("Tried to reset a register at offset {0}, but there is no register at that offset");
+            }
+        }
+
         public void ShadowReload()
         {
             foreach(var register in registers.Values)
             {
-                register.ShadowReload();
+                register.ShadowReloadValue();
+            }
+            foreach(var register in registers.Values)
+            {
+                register.ShadowReloadCallbacks();
             }
         }
 
@@ -434,6 +479,15 @@ namespace Antmicro.Renode.Core.Structure.Registers
             return register;
         }
 
+        public string[,] DumpRegister(long offset, bool allowSideEffects = false)
+        {
+            if(registers.TryGetValue(offset, out var register))
+            {
+                return register.Dump(allowSideEffects);
+            }
+            return null;
+        }
+
         /// <summary>
         /// Adds a register and condition to a new or existing selector.
         /// </summary>
@@ -467,6 +521,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
     public interface IRegisterCollection
     {
+        string[,] DumpRegister(long offset, bool allowSideEffects = false);
+
         void Reset();
 
         void RemoveBeforeReadHook(long offset);

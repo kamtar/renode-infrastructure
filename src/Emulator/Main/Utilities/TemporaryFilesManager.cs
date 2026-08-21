@@ -57,6 +57,19 @@ namespace Antmicro.Renode.Utilities
             }
         }
 
+        public string GetUnusedFilePath(string fileNameSuffix = null)
+        {
+            string path;
+            do
+            {
+                var fileName = string.Format(fileNameSuffix != null ? $"{Guid.NewGuid()}{fileNameSuffix}" : $"{Guid.NewGuid()}.tmp");
+                path = Path.Combine(emulatorTemporaryPath, fileName);
+                // this is guid, collision is very unlikely
+            }
+            while(File.Exists(path));
+            return path;
+        }
+
         public bool TryCreateFile(string fileName, out string path)
         {
             path = Path.Combine(emulatorTemporaryPath, fileName);
@@ -64,7 +77,6 @@ namespace Antmicro.Renode.Utilities
             // check if the file exists, since File.Create would override the file
             if(File.Exists(path))
             {
-                path = null;
                 return false;
             }
 
@@ -77,7 +89,6 @@ namespace Antmicro.Renode.Utilities
             }
             catch(Exception)
             {
-                path = null;
                 return false;
             }
 
@@ -99,7 +110,6 @@ namespace Antmicro.Renode.Utilities
             }
             catch(Exception)
             {
-                path = null;
                 return false;
             }
 

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -8,7 +8,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading;
 
 using Antmicro.Migrant;
 using Antmicro.Migrant.Hooks;
@@ -25,6 +24,7 @@ using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
+    [SupportedRID("linux")]
     public abstract class KVMCPU : BaseCPU, IGPIOReceiver, ICPUWithRegisters, IControllableCPU, ICPUWithMappedMemory, ICPUWithMMU, ICpuSupportingGdb
     {
         public KVMCPU(string cpuType, IMachine machine, Endianess endianess, CpuBitness cpuBitness, uint cpuId = 0)
@@ -218,6 +218,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override string ToString()
         {
             return $"[CPU: {this.GetCPUThreadName(machine)}]";
+        }
+
+        public virtual IEnumerable<CPURegister> GetAllRegisters()
+        {
+            return GetRegisters();
         }
 
         public abstract void SetRegister(int register, RegisterValue value);
@@ -441,30 +446,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected const int MaxRedirectionTableEntries = 24;
 
-        /*
-        Increments each time a new translation library resource is created.
-        This counter marks each new instance of a kvm library with a new number, which is used in file names to avoid collisions.
-        It has to survive emulation reset, so the file names remain unique.
-        */
-        private static int CpuCounter = 0;
-
         private void InitBinding()
         {
-            var libraryResource = $"Antmicro.Renode.kvm-{Architecture}.so";
-            foreach(var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if(assembly.TryFromResourceToTemporaryFile(libraryResource, out libraryFile, $"{CpuCounter}-{libraryResource}"))
-                {
-                    break;
-                }
-            }
-
-            Interlocked.Increment(ref CpuCounter);
-
-            if(libraryFile == null)
-            {
-                throw new ConstructionException($"Cannot find library {libraryResource}");
-            }
+            libraryFile = PlatformFileLoader.CopyPlatformFile($"kvm-{Architecture}.so");
 
             binder = new NativeBinder(this, libraryFile);
         }
