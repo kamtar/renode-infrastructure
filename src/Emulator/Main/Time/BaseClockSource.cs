@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -15,7 +15,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Time
 {
-    public class BaseClockSource : IClockSource
+    public class BaseClockSource : IClockSource, IDisposable
     {
         public BaseClockSource(bool skipAdvancesHigherThanNearestLimit = false)
         {
@@ -99,6 +99,10 @@ namespace Antmicro.Renode.Time
                 var result = clockEntries[i];
 
                 // Perform a full update of the clock entry we're getting
+                if(!result.Clocked)
+                {
+                    return result;
+                }
                 if(!result.Enabled)
                 {
                     return result;
@@ -128,7 +132,7 @@ namespace Antmicro.Renode.Time
                 var triggerFullUpdate = false;
                 for(int j = 0; j < clockEntries.Count; ++j)
                 {
-                    if(i != j && clockEntries[j].Enabled)
+                    if(i != j && clockEntries[j].Enabled && clockEntries[j].Clocked)
                     {
                         unaccountedTimes[j] += elapsed;
                         triggerFullUpdate |= unaccountedTimes[j] >= nearestLimitIn;
@@ -237,6 +241,12 @@ namespace Antmicro.Renode.Time
                     AddClockEntry(entry);
                 }
             }
+        }
+
+        public void Dispose()
+        {
+            reupdateNeeded.Dispose();
+            updateAlreadyInProgress.Dispose();
         }
 
         public TimeInterval NearestLimitIn
@@ -393,6 +403,10 @@ namespace Antmicro.Renode.Time
                     {
                         var clockEntry = clockEntries[i];
                         var updateHandler = clockEntriesUpdateHandlers[i];
+                        if(!clockEntry.Clocked)
+                        {
+                            continue;
+                        }
                         if(!clockEntry.Enabled)
                         {
                             continue;

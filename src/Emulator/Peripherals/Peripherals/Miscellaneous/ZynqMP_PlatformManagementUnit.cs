@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -12,6 +12,8 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -19,7 +21,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     {
         // apus and rpus must be passed in ascending order, for example
         // apus: [apu0, apu1, apu2, apu3]
-        public ZynqMP_PlatformManagementUnit(List<ICPU> apus, List<ICPU> rpus)
+        public ZynqMP_PlatformManagementUnit(IMachine machine, List<ICPU> apus, List<ICPU> rpus, List<IPeripheral> preservedOnAPUResets = null)
         {
             if(apus.Count != 4 || rpus.Count != 2)
             {
@@ -31,7 +33,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 registeredPeripherals[p] = new HashSet<IPeripheral>();
             }
-            powerManagement = new PowerManagementModule(this);
+            powerManagement = new PowerManagementModule(machine, this, preservedOnAPUResets);
         }
 
         public void OnGPIO(int number, bool value)
@@ -143,17 +145,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private IpiMessage ProcessIpiMessage(IpiMessage message)
         {
-            // 8 most significant bits of header indicate which PMU module should handle message
-            this.Log(LogLevel.Debug, "Processing message with Header = 0x{0:X}", message.Header);
-            var moduleId = (PmuModule)(message.Header >> 16);
+            this.Log(LogLevel.Debug, "Processing message with Header = 0x{0:X}", (uint)message.Header);
+
+            var moduleId = message.Header.ModuleId;
             switch(moduleId)
             {
             case PmuModule.PowerManagement:
                 return powerManagement.HandleMessage(message);
             default:
                 this.Log(LogLevel.Warning, "Received call for PMU module with ID {0} which is not implemented.", (uint)moduleId);
-                // PMU don't handle messages with wrong module id, so we return empty message
-                return new IpiMessage();
+                // PMU doesn't handle messages with an invalid module ID
+                return IpiMessage.CreateSuccessResponse();
             }
         }
 
@@ -163,8 +165,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Exception would indicate error in PMU code rather than in emulated software.
             var sourceMailboxAddress = ZynqMP_IPI.GetMailboxOffset(sourceId);
 
-            var message = new IpiMessage();
-            message.Header = ipi.Mailbox.ReadDoubleWord(sourceMailboxAddress + IpiMessage.HeaderOffset);
+            var header = ipi.Mailbox.ReadDoubleWord(sourceMailboxAddress + IpiMessage.HeaderOffset);
+            var message = new IpiMessage(header);
             for(var payloadIdx = 0; payloadIdx < IpiMessage.PayloadLen; ++payloadIdx)
             {
                 var payloadAddress = sourceMailboxAddress + IpiMessage.PayloadOffset + IpiMessage.FieldSize * payloadIdx;
@@ -206,19 +208,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public static IpiMessage CreateSuccessResponse()
             {
-                var message = new IpiMessage();
-                message.Header = (uint)IpiResponseHeader.Success;
-                return message;
+                return new IpiMessage((uint)IpiResponseHeader.Success);
             }
 
             public static IpiMessage CreateInvalidParamResponse()
             {
-                var response = new IpiMessage();
-                response.Header = (uint)IpiResponseHeader.InvalidParam;
-                return response;
+                return new IpiMessage((uint)IpiResponseHeader.InvalidParam);
             }
 
-            public uint Header = 0;
+            public IpiMessage(uint header)
+            {
+                Header = new HeaderStruct(header);
+            }
+
+            public HeaderStruct Header;
             public uint[] Payload = new uint[PayloadLen];
             public uint Reserved = 0;
             public uint Checksum = 0;
@@ -230,6 +233,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public const long FieldSize = 0x4;
             public const uint PayloadLen = 5;
 
+            public struct HeaderStruct
+            {
+                public static implicit operator uint(HeaderStruct header)
+                {
+                    return (uint)(header.MessageType | ((byte)header.ModuleId << 16) | (header.Flags << 24));
+                }
+
+                public HeaderStruct(uint header)
+                {
+                    MessageType = (ushort)BitHelper.GetValue(header, 0, 16);
+                    ModuleId = (PmuModule)BitHelper.GetValue(header, 16, 8);
+                    Flags = (byte)BitHelper.GetValue(header, 24, 8);
+                }
+
+                public readonly ushort MessageType;  // Bits 0-15
+                public readonly PmuModule ModuleId;  // Bits 16-23
+                public readonly byte Flags;  // Bits 24-31
+            }
+
             private enum IpiResponseHeader
             {
                 Success = 0x0,
@@ -239,20 +261,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private class PowerManagementModule
         {
-            public PowerManagementModule(ZynqMP_PlatformManagementUnit pmu)
+            public PowerManagementModule(IMachine machine, ZynqMP_PlatformManagementUnit pmu, List<IPeripheral> peripheralsPreservedOnAPUResets)
             {
+                this.machine = machine;
                 this.pmu = pmu;
-                resetStatus = new Dictionary<uint, uint>();
+
+                this.peripheralsPreservedOnAPUResets.Add(pmu);
+                this.peripheralsPreservedOnAPUResets.AddRange(pmu.rpus);
+                this.peripheralsPreservedOnAPUResets.AddRange(peripheralsPreservedOnAPUResets ?? Enumerable.Empty<IPeripheral>());
+
+                machine.PeripheralsChanged += (_, eventArgs) =>
+                {
+                    if(eventArgs.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.Addition && eventArgs.Peripheral is ZynqMP_RTC rtc)
+                    {
+                        // RTC should never be reset.
+                        this.peripheralsPreservedOnAPUResets.Add(rtc);
+                        this.peripheralsPreservedOnPSResets.Add(rtc);
+                        this.peripheralsPreservedOnSystemResets.Add(rtc);
+                    }
+                };
             }
 
             public void Reset()
             {
+                receivedUnhandledMessageTypes.Clear();
                 resetStatus.Clear();
             }
 
             public IpiMessage HandleMessage(IpiMessage message)
             {
-                var apiId = (PmApi)message.Header;
+                var apiId = (PmApi)message.Header.MessageType;
                 switch(apiId)
                 {
                 case PmApi.GetApiVersion:
@@ -269,8 +307,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return HandleClockGetDivider(message);
                 case PmApi.PllGetParameter:
                     return HandlePllGetParameter(message);
+                case PmApi.SystemShutdown:
+                    return HandleSystemShutdown(message);
                 default:
-                    return HandleDefault();
+                    // Warn only about the first message of each type because there are lots of messages for certain types (ClockGetState, PinCtrl*, etc.).
+                    if(!receivedUnhandledMessageTypes.Contains(apiId))
+                    {
+                        pmu.WarningLog("Received the first {0} message which is a type without proper handling currently implemented so just returning success; "
+                                + "enable PMU debug logs to see payload of this message and to see logs for all further {0} messages", apiId);
+                        receivedUnhandledMessageTypes.Add(apiId);
+                    }
+
+                    pmu.DebugLog("Received unhandled {0} message (payload: {1}), returning success", apiId, Misc.PrettyPrintCollectionHex(message.Payload));
+                    return IpiMessage.CreateSuccessResponse();
                 }
             }
 
@@ -307,8 +356,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     catch(ArgumentOutOfRangeException)
                     {
-                        pmu.Log(LogLevel.Warning, "Received invalid ack request with value {0}.", ack);
-                        return new IpiMessage();
+                        pmu.Log(LogLevel.Warning, "Received invalid ack request with value {0}, returning success.", ack);
+                        // Returning success anyway.
+                        return IpiMessage.CreateSuccessResponse();
                     }
                 }
 
@@ -321,13 +371,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 switch(ack)
                 {
                 case RequestAck.AckNo:
-                    // AckNo means we shouldn't do anything so we return empty message
-                    return new IpiMessage();
+                    // AckNo means we shouldn't do anything
+                    return IpiMessage.CreateSuccessResponse();
                 case RequestAck.AckBlocking:
                     return response;
                 case RequestAck.AckNonBlocking:
-                    pmu.Log(LogLevel.Warning, "Requested non blocking ACK which is not implemented.");
-                    return new IpiMessage();
+                    pmu.Log(LogLevel.Warning, "Received non blocking ACK which is not implemented, returning success.");
+                    // Returning success anyway.
+                    return IpiMessage.CreateSuccessResponse();
                 default:
                     throw new ArgumentOutOfRangeException("RequestAck");
                 }
@@ -417,6 +468,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         return IpiMessage.CreateInvalidParamResponse();
                     }
                 }
+                else if(clock == Clock.Pl0Ref)
+                {
+                    if(divider == ClockDivider.Div0)
+                    {
+                        response.Payload[0] = Pl0RefDivider0;
+                    }
+                    else if(divider == ClockDivider.Div1)
+                    {
+                        response.Payload[0] = Pl0RefDivider1;
+                    }
+                    else
+                    {
+                        return IpiMessage.CreateInvalidParamResponse();
+                    }
+                }
                 return response;
             }
 
@@ -487,25 +553,70 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            private IpiMessage HandleDefault()
+            // See ATF's `plat/xilinx/zynqmp/pm_service/zynqmp_pm_api_sys.c : pm_system_shutdown` for payload description.
+            private IpiMessage HandleSystemShutdown(IpiMessage message)
             {
+                var type = (SystemShutdownType)message.Payload[0];
+                var scope = (SystemShutdownScope)message.Payload[1];
+
+                // `IsDefined` isn't used for `SystemShutdownType` because it contains a `SetScope` type which should be handled internally
+                // by the `pm_system_shutdown` function and should never reach PMU.
+                if(!(type == SystemShutdownType.Restart || type == SystemShutdownType.Shutdown) || !Enum.IsDefined<SystemShutdownScope>(scope))
+                {
+                    pmu.WarningLog("SystemShutdown was requested with invalid type ({0} / 0x{0:X}) or scope ({1} / 0x{1:X}), ignoring the request", type, scope);
+                    return IpiMessage.CreateSuccessResponse();
+                }
+
+                if(type != SystemShutdownType.Restart)
+                {
+                    pmu.WarningLog("SystemShutdown was requested with currently-unhandled type ({0} / 0x{0:X}), ignoring the request", type);
+                    return IpiMessage.CreateSuccessResponse();
+                }
+
+                if(!pmu.TryGetMachine(out var machine))
+                {
+                    pmu.ErrorLog("SystemShutdown request can't be handled: this Platform Management Unit isn't registered to any machine");
+                    return IpiMessage.CreateSuccessResponse();
+                }
+
+                var peripheralsToSkip = scope switch
+                {
+                    SystemShutdownScope.ApuSubsystem => peripheralsPreservedOnAPUResets,
+                    SystemShutdownScope.ProcessingSystem => peripheralsPreservedOnPSResets,
+                    SystemShutdownScope.System => peripheralsPreservedOnSystemResets,
+                    _ => throw new ArgumentOutOfRangeException($"Invalid scope: {scope}"),
+                };
+
+                machine.RequestResetInSafeState(() =>
+                {
+                    pmu.InfoLog("System was reset due to the SystemShutdown request (type: {0}, scope: {1})", type, scope);
+                }, unresetable: peripheralsToSkip, runRegisteredResetEvents: true);
+
                 return IpiMessage.CreateSuccessResponse();
             }
 
+            private readonly IMachine machine;
             private readonly ZynqMP_PlatformManagementUnit pmu;
-            private readonly Dictionary<uint, uint> resetStatus;
+            private readonly Dictionary<uint, uint> resetStatus = new Dictionary<uint, uint>();
+            private readonly HashSet<PmApi> receivedUnhandledMessageTypes = new HashSet<PmApi>();
+            private readonly List<IPeripheral> peripheralsPreservedOnAPUResets = new List<IPeripheral>();
+            private readonly List<IPeripheral> peripheralsPreservedOnPSResets = new List<IPeripheral>();
+            private readonly List<IPeripheral> peripheralsPreservedOnSystemResets = new List<IPeripheral>();
 
             private const uint ApiVersion = 0x10001;
             private const uint ClockDividerMask = 0x3f;
             private const int ClockDivider0Shift = 8;
             private const int ClockDivider1Shift = 16;
             private const uint CrlApbUart1RefCtrl = 0x1001800;
+            private const uint Pl0RefDivider0 = 7;
+            private const uint Pl0RefDivider1 = 1;
 
             // We only list clocks that we need.
             // This enum corresponds to XPmClock enum in PMU FW source code.
             private enum Clock
             {
-                Uart1Ref = 0x39
+                Uart1Ref = 0x39,
+                Pl0Ref = 0x47,
             }
 
             private enum ClockDivider
@@ -548,19 +659,104 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 AckNonBlocking = 3
             }
 
-            // We only list API ids that we need.
-            // This enum corresponds to XPm_ApiId enum in PMU FW source code.
+            // This enum corresponds to XPm_ApiId enum in PMU FW source code:
+            // https://github.com/Xilinx/embeddedsw/blob/master/lib/bsp/standalone/src/common/pm_api_version.h
             private enum PmApi
             {
-                ApiMin          = 0x0,
-                GetApiVersion   = 0x1,
-                ForcePowerdown  = 0x8,
-                RequestWakeup   = 0xa,
-                ResetAssert     = 0x11,
-                ResetGetStatus  = 0x12,
-                ClockGetDivider = 0x28,
-                PllGetParameter = 0x31,
-                ApiMax          = 0x4a
+                ApiMin,
+                GetApiVersion,
+                SetConfiguration,
+                GetNodeStatus,
+                GetOpCharacteristic,
+                RegisterNotifier,
+                RequestSuspend,
+                SelfSuspend,
+                ForcePowerdown,
+                AbortSuspend,
+                RequestWakeup,
+                SetWakeupSource,
+                SystemShutdown,
+                RequestNode,
+                ReleaseNode,
+                SetRequirement,
+                SetMaxLatency,
+                ResetAssert,
+                ResetGetStatus,
+                MmioWrite,
+                MmioRead,
+                InitFinalize,
+                FpgaLoad,
+                FpgaGetStatus,
+                GetChipId,
+                SecureRsaAes,
+                SecureSha,
+                SecureRsa,
+                PinCtrlRequest,
+                PinCtrlRelease,
+                PinCtrlGetFunction,
+                PinCtrlSetFunction,
+                PinCtrlConfigParamGet,
+                PinCtrlConfigParamSet,
+                Ioctl,
+                QueryData,
+                ClockEnable,
+                ClockDisable,
+                ClockGetState,
+                ClockSetDivider,
+                ClockGetDivider,
+                ClockSetRate,
+                ClockGetRate,
+                ClockSetParent,
+                ClockGetParent,
+                SecureImage,
+                FpgaRead,
+                SecureAes,
+                PllSetParameter,
+                PllGetParameter,
+                PllSetMode,
+                PllGetMode,
+                RegisterAccess,
+                EfuseAccess,
+                AddSubsystem,
+                DestroySubsystem,
+                DescribeNodes,
+                AddNode,
+                AddNodeParent,
+                AddNodeName,
+                AddRequirement,
+                SetCurrentSubsystem,
+                InitNode,
+                FeatureCheck,
+                IsoControl,
+                ActivateSubsystem,
+                SetNodeAccess,
+                Bisr,
+                ApplyTrim,
+                NocClockEnable,
+                IfNocClockEnable,
+                ForceHouseclean,
+                FpgaGetVersion,
+                FpgaGetFeatureList,
+                HnicxNpiDataXfer,
+                FpgaSetConfigReg,
+                FpgaGetFrameData,
+                ClockDescribeRate,
+                ClockProgramRate,
+                ApiMax,
+            }
+
+            private enum SystemShutdownType
+            {
+                Shutdown,
+                Restart,
+                SetScope,  // This one should never be sent, it should be handled by `pm_system_shutdown` function internally
+            }
+
+            private enum SystemShutdownScope
+            {
+                ApuSubsystem,
+                ProcessingSystem,  // APU+RPU+PMU
+                System,
             }
         };
 
@@ -573,7 +769,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // Right now we only need to handle calls to PM module
-        private enum PmuModule
+        private enum PmuModule : byte
         {
             PowerManagement = 0x0
         }

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -88,12 +88,21 @@ namespace Antmicro.Renode.Core
 
         public void PauseAll()
         {
-            lock(machLock)
+            lock(disposedLock)
             {
-                MasterTimeSource.Stop();
-                Array.ForEach(machs.Rights, x => x.Pause());
-                ExternalsManager.Pause();
-                IsStarted = false;
+                if(disposed)
+                {
+                    // Its guaranteed that the emulation is already paused
+                    return;
+                }
+
+                lock(machLock)
+                {
+                    MasterTimeSource.Stop();
+                    Array.ForEach(machs.Rights, x => x.Pause());
+                    ExternalsManager.Pause();
+                    IsStarted = false;
+                }
             }
         }
 
@@ -111,25 +120,82 @@ namespace Antmicro.Renode.Core
 
         public void RunToNearestSyncPoint()
         {
-            if(IsStarted)
+            lock(disposedLock)
             {
-                throw new RecoverableException("This action is not available when emulation is already started");
-            }
+                if(disposed)
+                {
+                    throw new RecoverableException("Can't start emulation while disposing");
+                }
+                if(IsStarted)
+                {
+                    throw new RecoverableException("This action is not available when emulation is already started");
+                }
 
-            InnerStartAll();
+                InnerStartAll();
+            }
             MasterTimeSource.Run();
+            PauseAll();
+        }
+
+        public void RunUntil(TimeInterval targetTimestamp)
+        {
+            var elapsedTime = MasterTimeSource.ElapsedVirtualTime;
+            lock(disposedLock)
+            {
+                if(disposed)
+                {
+                    throw new RecoverableException("Can't start emulation while disposing");
+                }
+                if(IsStarted)
+                {
+                    throw new RecoverableException("This action is not available when emulation is already started");
+                }
+
+                if(elapsedTime == targetTimestamp)
+                {
+                    return;
+                }
+
+                if(elapsedTime > targetTimestamp)
+                {
+                    Logger.Log(LogLevel.Warning, "Given timestamp '{0}' is from the past. Current elapsed virtual time is {1}", targetTimestamp, elapsedTime);
+                    return;
+                }
+
+                InnerStartAll();
+            }
+            MasterTimeSource.RunFor(targetTimestamp - elapsedTime);
             PauseAll();
         }
 
         public void RunFor(TimeInterval period)
         {
-            if(IsStarted)
+            lock(disposedLock)
             {
-                throw new RecoverableException("This action is not available when emulation is already started");
+                if(disposed)
+                {
+                    throw new RecoverableException("Can't start emulation while disposing");
+                }
+                if(IsStarted)
+                {
+                    throw new RecoverableException("This action is not available when emulation is already started");
+                }
+                InnerStartAll();
             }
-            InnerStartAll();
             MasterTimeSource.RunFor(period);
             PauseAll();
+        }
+
+        public void SynchroniseQuantum()
+        {
+            lock(disposedLock)
+            {
+                if(disposed)
+                {
+                    throw new RecoverableException("Can't synchronise while disposing");
+                }
+            }
+            MasterTimeSource.SynchroniseQuantum();
         }
 
         public int GetSeed()
@@ -445,21 +511,35 @@ namespace Antmicro.Renode.Core
 
         public void Dispose()
         {
-            FileFetcher.CancelDownload();
-            lock(machLock)
+            bool alreadyDisposed;
+            lock(disposedLock)
             {
+                alreadyDisposed = disposed;
                 PauseAll();
-                // dispose externals before machines;
-                // some externals, e.g. execution tracer,
-                // require access to peripherals when operating
-                ExternalsManager.Clear();
-                BackendManager.Dispose();
-                Array.ForEach(machs.Rights, x => (x as IDisposable)?.Dispose());
-                MasterTimeSource.Dispose();
-                machs.Dispose();
-                HostMachine.Dispose();
-                CurrentLogger.Dispose();
-                FileFetcher.Dispose();
+                disposed = true;
+            }
+
+            if(!alreadyDisposed)
+            {
+                FileFetcher.CancelDownload();
+                lock(machLock)
+                {
+                    // dispose externals before machines;
+                    // some externals, e.g. execution tracer,
+                    // require access to peripherals when operating
+                    ExternalsManager.ClearEarlyDisposable();
+                    BackendManager.Dispose();
+                    Array.ForEach(machs.Rights, x => (x as IDisposable)?.Dispose());
+                    MasterTimeSource.Dispose();
+                    machs.Dispose();
+                    ExternalsManager.Clear();
+                    CurrentLogger.Dispose();
+                    FileFetcher.Dispose();
+                    if(randomGenerator.IsValueCreated)
+                    {
+                        randomGenerator.Value.Dispose();
+                    }
+                }
             }
         }
 
@@ -721,12 +801,16 @@ namespace Antmicro.Renode.Core
         [Transient]
         private bool isStarted;
 
+        [Transient]
+        private bool disposed;
+
         [field: Transient]
         private bool singleStepBlocking = true;
 
         private EmulationMode mode;
 
         private readonly object machLock = new object();
+        private readonly object disposedLock = new object();
 
         public IMachine this[String key]
         {

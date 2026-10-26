@@ -86,19 +86,33 @@ namespace Antmicro.Renode.Time
         }
 
         /// <summary>
+        /// If the time source is executing, blocks until the current quantum is finished.
+        /// </summary>
+        public void SynchroniseQuantum()
+        {
+            using(sync.HighPriority)
+            { }
+        }
+
+        /// <summary>
         /// Queues an action to execute in the nearest synced state.
         /// </summary>
         /// <param name="executeImmediately">Flag indicating if the action should be executed immediately when executed in already synced context or should it wait for the next synced state.</param>
-        public void ExecuteInNearestSyncedState(Action<TimeStamp> what, bool executeImmediately = false)
+        /// <returns>
+        /// Null if executes immediately or the ID of the action, which can be used to cancel it with <see cref="CancelActionToExecuteInSyncedState">.
+        /// </returns>
+        public ulong? ExecuteInNearestSyncedState(Action<TimeStamp> what, bool executeImmediately = false)
         {
             if(IsOnSyncPhaseThread && executeImmediately)
             {
                 what(new TimeStamp(ElapsedVirtualTime, Domain));
-                return;
+                return null;
             }
             lock(delayedActions)
             {
-                delayedActions.Add(new DelayedTask(what, new TimeStamp(), ++delayedTaskId));
+                var id = ++delayedTaskId;
+                delayedActions.Add(new DelayedTask(what, new TimeStamp(), id));
+                return id;
             }
         }
 
@@ -142,7 +156,6 @@ namespace Antmicro.Renode.Time
             using(sync.HighPriority)
             {
                 var handle = new TimeHandle(this, sink) { SourceSideActive = isStarted };
-                StopRequested += handle.RequestPause;
                 handles.Add(handle);
 #if DEBUG
                 this.Trace($"Registering sink ({(sink as IIdentifiable)?.GetDescription()}) in source ({this.GetDescription()}) via handle ({handle.GetDescription()})");
@@ -265,10 +278,10 @@ namespace Antmicro.Renode.Time
         public long NumberOfSyncPoints { get; private set; }
 
         /// <summary>
-        /// Gets the value representing current load, i.e., value indicating how much time the emulation spends sleeping in order to match the expected <see cref="Performance">.
+        /// Gets the value representing current load, i.e., value indicating how much time the emulation spends sleeping in order to match the expected performance.
         /// </summary>
         /// <remarks>
-        /// Value 1 means that there is no sleeping, i.e., it is not possible to execute faster. Value > 1 means that the execution is slower than expected. Value < 1 means that increasing <see cref="Performance"> will lead to faster execution.
+        /// Value 1 means that there is no sleeping, i.e., it is not possible to execute faster. Value > 1 means that the execution is slower than expected. Value < 1 means that time is spent idling; setting `PerformanceInMips` on a CPU could increase performance.
         /// This value is calculated as an average of 10 samples.
         /// </remarks>
         public double CurrentLoad { get { lock(hostTicksElapsed) { return hostTicksElapsed.AverageValue * 1.0 / virtualTicksElapsed.AverageValue; } } }
@@ -305,12 +318,9 @@ namespace Antmicro.Renode.Time
         /// <summary>
         /// Gets or sets flag indicating if the time flow should be slowed down to reflect real time or be as fast as possible.
         /// </summary>
-        /// <remarks>
-        /// Setting this flag to True has the same effect as setting <see cref="Performance"> to a very high value.
-        /// </remarks>
         public bool AdvanceImmediately { get; set; }
 
-        public IEnumerable<ITimeSink> Sinks { get { using(sync.HighPriority) { return handles.Select(x => x.TimeSink); } } }
+        public IEnumerable<ITimeSink> Sinks { get { using(sync.HighPriority) { return handles.All.Select(x => x.TimeSink); } } }
 
         /// <see cref="ITimeSource.Domain">
         public abstract ITimeDomain Domain { get; }
@@ -341,6 +351,14 @@ namespace Antmicro.Renode.Time
         public event Action BlockHook;
 
         /// <summary>
+        /// Used to request a pause on sinks before trying to acquire their locks.
+        /// </summary>
+        /// <remarks>
+        /// Triggering this event can improve pausing efficiency by interrupting the sink execution in the middle of a quant.
+        /// </remarks>
+        public event Action StopRequested;
+
+        /// <summary>
         /// Execute one iteration of time-granting loop.
         /// </summary>
         /// <remarks>
@@ -359,69 +377,77 @@ namespace Antmicro.Renode.Time
         /// </returns>
         protected bool InnerExecute(out TimeInterval virtualTimeElapsed, TimeInterval? timeLimit = null)
         {
-            if(updateNearestSyncPoint)
-            {
-                NearestSyncPoint += timeLimit.HasValue ? TimeInterval.Min(timeLimit.Value, Quantum) : Quantum;
-                updateNearestSyncPoint = false;
-                this.Trace($"Updated NearestSyncPoint to: {NearestSyncPoint}");
-            }
-            DebugHelper.Assert(NearestSyncPoint.Ticks >= ElapsedVirtualTime.Ticks, $"Nearest sync point set in the past: EVT={ElapsedVirtualTime} NSP={NearestSyncPoint}");
-
-            isBlocked = false;
-            var quantum = NearestSyncPoint - ElapsedVirtualTime;
-            this.Trace($"Starting a loop with #{quantum.Ticks} ticks");
-
-            SynchronizeVirtualTime();
-            var elapsedVirtualTimeAtStart = ElapsedVirtualTime;
-
             using(sync.LowPriority)
             {
-                handles.LatchAllAndCollectGarbage();
-                var shouldGrantTime = handles.AreAllReadyForNewGrant;
-
-                this.Trace($"Iteration start: slaves left {handles.ActiveCount}; will we try to grant time? {shouldGrantTime}");
-
-                if(handles.ActiveCount > 0)
+                if(updateNearestSyncPoint)
                 {
-                    var executor = new PhaseExecutor<LinkedListNode<TimeHandle>>();
+                    NearestSyncPoint += timeLimit.HasValue ? TimeInterval.Min(timeLimit.Value, Quantum) : Quantum;
+                    updateNearestSyncPoint = false;
+                    this.Trace($"Updated NearestSyncPoint to: {NearestSyncPoint}");
+                }
 
-                    if(!shouldGrantTime)
-                    {
-                        if(ExecuteInSerial)
-                        {
-                            // We only test in serial execution to ensure determinism
-                            executor.RegisterTestPhase(ExecuteReadyForUnblockTestPhase);
-                        }
-                        executor.RegisterPhase(ExecuteUnblockPhase);
-                        executor.RegisterPhase(ExecuteWaitPhase);
-                    }
-                    else if(quantum != TimeInterval.Empty)
-                    {
-                        executor.RegisterPhase(s => ExecuteGrantPhase(s, quantum));
-                        executor.RegisterPhase(ExecuteWaitPhase);
-                    }
+                // Some handles might be detached, holding back ElapsedVirtualTime. We have to clean them up and synchronize the virtual time before granting new time to the remaining handles.
+                handles.LatchAllAndCollectGarbage();
+                SynchronizeVirtualTime();
+                DebugHelper.Assert(NearestSyncPoint.Ticks >= ElapsedVirtualTime.Ticks, $"Nearest sync point set in the past: EVT={ElapsedVirtualTime} NSP={NearestSyncPoint}");
+
+                isBlocked = false;
+
+                // This is not revelant when we have blocked handles
+                var toRunFor = NearestSyncPoint - ElapsedVirtualTime;
+
+                var elapsedVirtualTimeAtStart = ElapsedVirtualTime;
+
+                if(handles.NotReady.Count > 0)
+                {
+                    this.Trace($"Iteration start: unblocking {handles.NotReady.Count} handles");
+
+                    var executor = new PhaseExecutor<LinkedListNode<TimeHandle>>();
 
                     if(ExecuteInSerial)
                     {
-                        executor.ExecuteInSerial(handles.WithLinkedListNode);
+                        // We only test in serial execution to ensure determinism
+                        executor.RegisterTestPhase(ExecuteReadyForUnblockTestPhase);
                     }
-                    else
-                    {
-                        executor.ExecuteInParallel(handles.WithLinkedListNode);
-                    }
+                    executor.RegisterPhase(ExecuteUnblockPhase);
+                    executor.RegisterPhase(ExecuteWaitPhase);
+                    executor.Execute(handles.NotReady.Nodes(), ExecuteInSerial);
 
-                    SynchronizeVirtualTime();
                     virtualTimeElapsed = ElapsedVirtualTime - elapsedVirtualTimeAtStart;
+                }
+                else if(toRunFor == TimeInterval.Empty)
+                {
+                    virtualTimeElapsed = toRunFor;
+                }
+                else if(handles.Ready.Count > 0)
+                {
+                    this.Trace($"Iteration start: granting {handles.Ready.Count} handles {toRunFor} of time");
+
+                    var executor = new PhaseExecutor<LinkedListNode<TimeHandle>>();
+                    executor.RegisterPhase(s => ExecuteGrantPhase(s, toRunFor));
+                    executor.RegisterPhase(ExecuteWaitPhase);
+                    executor.Execute(handles.Ready.Nodes(), ExecuteInSerial);
+
+                    virtualTimeElapsed = ElapsedVirtualTime - elapsedVirtualTimeAtStart;
+                    DebugHelper.Assert(virtualTimeElapsed <= toRunFor, "Some handle ran for more time than allocated");
+
+                    var allTookAllTime = virtualTimeElapsed == toRunFor;
+
+                    DebugHelper.Assert(allTookAllTime || isBlocked, "Some handle did not consume all time despite no handles being blocked");
+                    // NOTE: The other unusual situation, `allTookAllTime && isBlocked`,
+                    // is not asserted against because it can happen if a handle blocks
+                    // with an empty remaining interval. This is explicitly tested in
+                    // `ShouldHandleBlockingAtTheEndOfGrantedInterval`
                 }
                 else
                 {
-                    this.Trace($"There are no slaves, updating VTE by {quantum.Ticks}");
+                    this.Trace($"There are no handles, updating VTE by {toRunFor}");
                     // if there are no slaves just make the time pass
-                    virtualTimeElapsed = quantum;
+                    virtualTimeElapsed = toRunFor;
 
-                    UpdateTime(quantum);
+                    UpdateTime(toRunFor);
                     // here we must trigger `TimePassed` manually as no handles has been updated so they won't reflect the passed time
-                    TimePassed?.Invoke(quantum);
+                    TimePassed?.Invoke(toRunFor);
                 }
 
                 handles.UnlatchAll();
@@ -642,26 +668,23 @@ namespace Antmicro.Renode.Time
 
         private void SynchronizeVirtualTime()
         {
-            lock(virtualTimeSyncLock)
+            if(!handles.TryGetCommonElapsedTime(out var currentCommonElapsedTime, out virtualTimeProgressBlockers))
             {
-                if(!handles.TryGetCommonElapsedTime(out var currentCommonElapsedTime, out virtualTimeProgressBlockers))
-                {
-                    return;
-                }
-
-                if(currentCommonElapsedTime == ElapsedVirtualTime)
-                {
-                    return;
-                }
-
-                DebugHelper.Assert(currentCommonElapsedTime > ElapsedVirtualTime, $"A slave reports time from the past! The current virtual time is {ElapsedVirtualTime}, but {currentCommonElapsedTime} has been reported");
-
-                var timeDiff = currentCommonElapsedTime - ElapsedVirtualTime;
-                this.Trace($"Reporting time passed: {timeDiff}");
-                // this will update ElapsedVirtualTime
-                UpdateTime(timeDiff);
-                TimePassed?.Invoke(timeDiff);
+                return;
             }
+
+            if(currentCommonElapsedTime == ElapsedVirtualTime)
+            {
+                return;
+            }
+
+            DebugHelper.Assert(currentCommonElapsedTime > ElapsedVirtualTime, $"A slave reports time from the past! The current virtual time is {ElapsedVirtualTime}, but {currentCommonElapsedTime} has been reported");
+
+            var timeDiff = currentCommonElapsedTime - ElapsedVirtualTime;
+            this.Trace($"Reporting time passed: {timeDiff}");
+            // this will update ElapsedVirtualTime
+            UpdateTime(timeDiff);
+            TimePassed?.Invoke(timeDiff);
         }
 
         private void UpdateTime(TimeInterval virtualTimeElapsed)
@@ -782,20 +805,12 @@ namespace Antmicro.Renode.Time
             NumberOfSyncPoints++;
         }
 
-        /// <summary>
-        /// Used to request a pause on sinks before trying to acquire their locks.
-        /// </summary>
-        /// <remarks>
-        /// Triggering this event can improve pausing efficiency by interrupting the sink execution in the middle of a quant.
-        /// </remarks>
-        private event Action StopRequested;
-
-        private TimeInterval elapsedAtLastUpdate;
-        private bool isBlocked;
-        private bool updateNearestSyncPoint;
+        private TimeInterval elapsedAtLastUpdate; // Executor-thread out-of-loop or inside `virtualTimeSyncLock` only
+        private bool isBlocked; // Executor-thread only
+        private bool updateNearestSyncPoint; // Executor-thread only
         private int? executeThreadId;
         private ulong delayedTaskId;
-        private uint virtualTimeProgressBlockers;
+        private uint virtualTimeProgressBlockers; // Executor-thread out-of-loop or inside `virtualTimeSyncLock` only
         private TimeInterval quantum;
 
         [Antmicro.Migrant.Constructor(true)]
@@ -930,6 +945,18 @@ namespace Antmicro.Renode.Time
                     {
                         phase(target);
                     }
+                }
+            }
+
+            public void Execute(IEnumerable<T> targets, bool serial)
+            {
+                if(serial)
+                {
+                    ExecuteInSerial(targets);
+                }
+                else
+                {
+                    ExecuteInParallel(targets);
                 }
             }
 

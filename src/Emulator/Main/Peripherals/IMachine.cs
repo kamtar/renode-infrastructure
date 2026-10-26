@@ -96,7 +96,7 @@ namespace Antmicro.Renode.Core
 
         void RequestReset();
 
-        void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null);
+        void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false);
 
         void Reset();
 
@@ -113,6 +113,8 @@ namespace Antmicro.Renode.Core
         void StartGdbServer(SocketServerProvider terminal, IEnumerable<string> cpuNames = null);
 
         void StopGdbServer(int? port = null);
+
+        void StartMultiprocessGdbServer(int port, List<ICluster<ICpuSupportingGdb>> clusters, bool autostartEmulation = true);
 
         bool AttachConnectionAcceptedListenerToGdbStub(int port, Action<System.IO.Stream> listener);
 
@@ -142,6 +144,8 @@ namespace Antmicro.Renode.Core
 
         void ExchangeRegistrationPointForPeripheral(IPeripheral parent, IPeripheral child, IRegistrationPoint oldPoint, IRegistrationPoint newPoint);
 
+        void Abort();
+
         IPeripheral this[string name] { get; }
 
         IntPtr AtomicMemoryStatePointer { get; }
@@ -169,6 +173,8 @@ namespace Antmicro.Renode.Core
         Platform Platform { get; set; }
 
         bool IsPaused { get; }
+
+        bool IsAborted { get; }
 
         TimeStamp ElapsedVirtualTime { get; }
 

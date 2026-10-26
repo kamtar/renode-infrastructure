@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
@@ -119,55 +118,49 @@ namespace Antmicro.Renode.Peripherals.Analog
 
         private uint Convert(decimal input)
         {
+            // Current model is only one sided, not differential
+            // e.g. It assumes that IN- is 0 at all times, making the range [0, V_ref) without span compression
             // With span compression enabled, the maximum value is 0.8 * V_ref
             var maxVolts = ReferenceVoltage * (spanCompression.Value ? 0.8m : 1m);
             var lsb = maxVolts / (1 << (MeasurementResolutionBits - 1));
 
-            var diff = input - ReferenceVoltage;
-            if(Math.Abs(diff) > maxVolts)
+            if(Math.Abs(input) > maxVolts)
             {
                 overvoltageClamp.Value = false; // This is active low
-                diff = Math.Sign(diff) * maxVolts;
+                input = Math.Sign(input) * maxVolts;
             }
 
-            var result = (uint)((int)(diff / lsb)) & ((1u << MeasurementResolutionBits) - 1);
+            var result = (uint)((int)(input / lsb)) & ((1u << MeasurementResolutionBits) - 1);
 
             // Since the output is in 2's complement it is impossible to encode +V_ref
-            if(result > MaxRawPositiveMeasurement && Math.Sign(diff) > 0)
+            if(result > MaxRawPositiveMeasurement && Math.Sign(input) > 0)
             {
                 result = MaxRawPositiveMeasurement;
             }
+            this.DebugLog("Input value {0}, encoded value 0x{1:X}", input, result);
             return result;
         }
 
         private void EnqueueMeasurement()
         {
             var measurement = GetConvertedSample();
-            byte[] bytes;
-            int toSend;
+            var bytes = new byte[TransferBytes];
+            for(var i = 0; i < bytes.Length; i++)
+            {
+                var offset = Math.Max(MeasurementResolutionBits - (i + 1) * 8, 0);
+                var size = Math.Min(MeasurementResolutionBits - offset, 8);
+                bytes[i] = (byte)BitHelper.GetValue(measurement, offset, size);
+            }
+
             if(statusBitsEnable.Value)
             {
-                measurement <<= StatusBitCount;
-                BitHelper.SetBit(ref measurement, 5, overvoltageClamp.Value);
-                BitHelper.SetBit(ref measurement, 4, spanCompression.Value);
+                BitHelper.SetBit(ref bytes[^1], 5, overvoltageClamp.Value);
+                BitHelper.SetBit(ref bytes[^1], 4, spanCompression.Value);
                 // Read to trigger side-effects (e.g. clear the OV flag)
                 configRegister.Read();
-
-                toSend = (MeasurementResolutionBits + StatusBitCount).DivCeil(8);
-                bytes = BitConverter.GetBytes(measurement);
-            }
-            else
-            {
-                toSend = MeasurementResolutionBits.DivCeil(8);
-                bytes = BitConverter.GetBytes(measurement);
             }
 
-            // Bytes are transmitted MSB first
-            if(BitConverter.IsLittleEndian)
-            {
-                Array.Reverse(bytes);
-            }
-            toTransmit.EnqueueRange(bytes.Skip(bytes.Length - toSend).Take(toSend));
+            toTransmit.EnqueueRange(bytes);
         }
 
         private void ChangeState(State to)
@@ -191,6 +184,7 @@ namespace Antmicro.Renode.Peripherals.Analog
         private const int MeasurementResolutionBits = 18;
         private const uint MaxRawPositiveMeasurement = (1u << (MeasurementResolutionBits - 1)) - 1;
         private const byte StatusBitCount = 6;
+        private static readonly int TransferBytes = (MeasurementResolutionBits + StatusBitCount).DivCeil(8);
 
         private const byte ConfigAccessPattern = 0b00010100;
         private const byte ConfigReadWriteBit = 6;

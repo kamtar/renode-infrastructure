@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -54,6 +54,20 @@ namespace Antmicro.Renode.Utilities
             }
         }
 
+        public bool IsValid()
+        {
+            try
+            {
+                Validate();
+            }
+            catch(Exception)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
         public override string ToString()
         {
             return path;
@@ -92,7 +106,7 @@ namespace Antmicro.Renode.Utilities
 
     public class ReadFilePath : FilePath
     {
-        public ReadFilePath(string path) : base(path, FileAccess.Read) { }
+        public ReadFilePath(string path, bool validate = true) : base(path, FileAccess.Read, validate) { }
 
         public static implicit operator ReadFilePath(string path)
         {
@@ -102,9 +116,9 @@ namespace Antmicro.Renode.Utilities
 
     public class OptionalReadFilePath : FilePath
     {
-        public OptionalReadFilePath(string path) : base(path, FileAccess.Read, false)
+        public OptionalReadFilePath(string path, bool validate = true) : base(path, FileAccess.Read, false)
         {
-            if(path != null)
+            if(path != null && validate)
             {
                 Validate();
             }
@@ -128,7 +142,7 @@ namespace Antmicro.Renode.Utilities
 
     public class AppendFilePath : FilePath
     {
-        public AppendFilePath(string path) : base(path, FileAccess.Write) { }
+        public AppendFilePath(string path, bool validate = true) : base(path, FileAccess.Write, validate) { }
 
         public static implicit operator AppendFilePath(string path)
         {
@@ -138,7 +152,7 @@ namespace Antmicro.Renode.Utilities
 
     public class WriteFilePath : FilePath
     {
-        public WriteFilePath(string path) : base(path, FileAccess.Write) { }
+        public WriteFilePath(string path, bool validate = true) : base(path, FileAccess.Write, validate) { }
 
         public override void Validate()
         {
@@ -162,9 +176,23 @@ namespace Antmicro.Renode.Utilities
 
     public class SequencedFilePath : WriteFilePath
     {
-        public SequencedFilePath(string path) : base(path) { }
+        public static SequencedFilePath Create(string path, out string movedFilePath)
+        {
+            var sequencedFilePath = new SequencedFilePath(path, false);
+            sequencedFilePath.Validate(out movedFilePath);
+            return sequencedFilePath;
+        }
 
-        public override void Validate()
+        public SequencedFilePath(string path, bool validate = true) : base(path, validate) { }
+
+        public override void Validate() => Validate(out _);
+
+        public static implicit operator SequencedFilePath(string path)
+        {
+            return new SequencedFilePath(path);
+        }
+
+        private bool Validate(out string movedFilePath)
         {
             if(!File.Exists(path))
             {
@@ -172,7 +200,8 @@ namespace Antmicro.Renode.Utilities
                 {
                     throw new RecoverableException($"File {path} could not be created");
                 }
-                return;
+                movedFilePath = null;
+                return false;
             }
 
             var lastSplit = path.LastIndexOf(Path.DirectorySeparatorChar);
@@ -192,28 +221,25 @@ namespace Antmicro.Renode.Utilities
                 .Concat(new [] { 0 })
                 .Max();
 
-            var newPath = string.Format("{0}.{1}", path, lastIndex + 1);
+            movedFilePath = $"{path}.{lastIndex + 1}";
 
             try
             {
-                File.Move(path, newPath);
+                File.Move(path, movedFilePath);
             }
             catch(Exception e)
             {
-                throw new RecoverableException($"Error occured while moving old file to {newPath}: {e.Message}");
+                throw new RecoverableException($"Error occured while moving old file to {movedFilePath}: {e.Message}");
             }
 
-            Logger.Log(LogLevel.Info, "Old file {0} moved to {1}", path, newPath);
+            Logger.Log(LogLevel.Info, "Old file {0} moved to {1}", path, movedFilePath);
 
             if(!CanBeCreated())
             {
-                throw new RecoverableException($"File {newPath} could not be created");
+                throw new RecoverableException($"File {movedFilePath} could not be created");
             }
-        }
 
-        public static implicit operator SequencedFilePath(string path)
-        {
-            return new SequencedFilePath(path);
+            return true;
         }
     }
 }

@@ -23,36 +23,36 @@ namespace Antmicro.Renode.Time
         // -------
         // The objects of this class are used to synchronize execution of `time sources` and `time sinks`.
         //
-        // [SOURCE SIDE]                                   [SINK SIDE]
-        //                                   Dispose
-        //                                      |
-        //                                      V
-        //                                 +--------+
-        // Latch                       ->  |        |
-        // ...                             |        |
-        // (Grant / Unblock + (Latch)) ->  |        |  <-  Request* + (Latch)
-        // ...                             |  Time  |      ...
-        // WaitUntilDone* + (Unlatch)  ->  | Handle |  <-  ReportBreak / ReportContinue
-        // ...                             |        |
-        // Unlatch                     ->  |        |
-        //                                 |        |
-        //                                 +--------+
-        //                             --- properties ---
-        //                                 +--------+
-        // SourceSideActive            =   |        |  =   SinkSideActive
-        //                                 |        |  =   Enabled
-        //                                 +--------+
+        // [SOURCE SIDE]                                                     [SINK SIDE]
+        //                                                     Dispose
+        //                                                        |
+        //                                                        V
+        //                                                   +--------+
+        // Latch                                         ->  |        |
+        // ...                                               |        |
+        // (GrantTimeInterval / UnblockHandle + (Latch)) ->  |        |  <-  RequestTimeInterval* + (Latch)
+        // ...                                               |  Time  |      ...
+        // WaitUntilDone* + (Unlatch)                    ->  | Handle |  <-  ReportBackAndBreak / ReportBackAndContinue
+        // ...                                               |        |
+        // Unlatch                                       ->  |        |
+        //                                                   |        |
+        //                                                   +--------+
+        //                                               --- properties ---
+        //                                                   +--------+
+        // SourceSideActive                              =   |        |  =   SinkSideActive
+        //                                                   |        |  =   Enabled
+        //                                                   +--------+
         //
         //
         // Methods marked with '*' are blocking:
-        // * `Request` will block until `Grant` or `Unblock`
-        // * `WaitUntilDone` will block until `ReportBreak` or `ReportContinue`
+        // * `RequestTimeInterval` will block until `GrantTimeInterval` or `UnblockHandle`
+        // * `WaitUntilDone` will block until `ReportBackAndBreak` or `ReportBackAndContinue`
         //
         // Methods surrounded with '()' are executed conditionally:
-        // * `Latch` as a result of `Request` is executed only if this is the first `Request` after `ReportBreak`
+        // * `Latch` as a result of `RequestTimeInterval` is executed only if this is the first `RequestTimeInterval` after `ReportBackAndBreak`
         // * `Unlatch` as a result of `WaitUntilDone` is executed only if this is the first `WaitUntilDone` after successful unblocking of the handle
-        // * `Grant` is not executed as long as the previous `WaitUntilDone` does not finish successfully, returning `true`
-        // * `Unlock` is executed only when the previous `WaitUntilDone` returned `false`
+        // * `GrantTimeInterval` is not executed as long as the previous `WaitUntilDone` does not finish successfully, returning `true`
+        // * `Unblock` is executed only when the previous `WaitUntilDone` returned `false`
         //
         //
         // SOURCE SIDE simplified algorithm:
@@ -109,6 +109,7 @@ namespace Antmicro.Renode.Time
             DeferredEnabled = true;
 
             TimeSource = timeSource;
+            timeSource.StopRequested += RequestPause;
 
             // we should not assign this handle to TimeSink as the source might not be configured properly yet
             TimeSink = timeSink;
@@ -130,8 +131,9 @@ namespace Antmicro.Renode.Time
         {
             using(MonitorSmartLock.Lock(innerLock))
             {
-                DebugHelper.Assert(TimeSource.ElapsedVirtualTime >= TotalElapsedTime, $"Trying to move time handle back in time from: {TotalElapsedTime} to {TimeSource.ElapsedVirtualTime}");
-                TotalElapsedTime = TimeSource.ElapsedVirtualTime;
+                DebugHelper.Assert(TimeSource.NearestSyncPoint >= TotalElapsedTime, $"Trying to move time handle back in time from: {TotalElapsedTime} to {TimeSource.NearestSyncPoint}");
+                // `NearestSyncPoint` represents the time all handles "should" be at - blocked handles will be stuck in an earlier time (due to being blocked), but eventually they're supposed to converge to `NearestSyncPoint`
+                TotalElapsedTime = TimeSource.NearestSyncPoint;
             }
         }
 
@@ -428,7 +430,11 @@ namespace Antmicro.Renode.Time
                 // it does not allow the handle to be disposed when in use
                 Enabled = false;
 
+                // This will signal `HandlesCollection` to remove this handle
+                // from the list
                 DetachRequested = true;
+                TimeSource.StopRequested -= RequestPause;
+
                 sinkSideInProgress = false;
                 sourceSideInProgress = false;
                 reportPending = false;

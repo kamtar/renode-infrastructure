@@ -24,7 +24,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             DefineRegisters();
         }
 
-        public byte[] Read(int count)
+        public byte[] Read(int count = 1)
         {
             if(addressToRead == -1)
             {
@@ -40,8 +40,17 @@ namespace Antmicro.Renode.Peripherals.Sensors
             return result;
         }
 
+        // Writes to VEML7700 can be in two forms: a single address byte to set
+        // the address for a read, or three bytes, where the first byte is the
+        // address and the other two are the value to write to that address
         public void Write(byte[] data)
         {
+            if(data.Length == 0)
+            {
+                this.Log(LogLevel.Noisy, "Write with no data. Ignoring.");
+                return;
+            }
+
             if(data.Length == 1)
             {
                 addressToRead = data[0];
@@ -51,9 +60,9 @@ namespace Antmicro.Renode.Peripherals.Sensors
             if(data.Length != 3)
             {
                 this.WarningLog("Written {0} bytes when expecting 3", data.Length);
-                if(data.Length == 0) return;
             }
-            var value = BitHelper.ToUInt16(data, 0, true);
+            // data[0] is the address byte, so we read the value from 1
+            var value = BitHelper.ToUInt16(data, index: 1, reverse: true);
             RegistersCollection.Write(data[0], value);
         }
 
@@ -113,6 +122,17 @@ namespace Antmicro.Renode.Peripherals.Sensors
         // Whether to report an alternate device ID on command 7
         public bool AlternateDeviceId { get; set; }
 
+        private static int IntegrationTimeToIndex(IntegrationTime time) => time switch
+        {
+            IntegrationTime.Time25ms => 0,
+            IntegrationTime.Time50ms => 1,
+            IntegrationTime.Time100ms => 2,
+            IntegrationTime.Time200ms => 3,
+            IntegrationTime.Time400ms => 4,
+            IntegrationTime.Time800ms => 5,
+            _ => InvalidIntegrationTimeIndex
+        };
+
         private void DefineRegisters()
         {
             Registers.Configuration.Define(this, 1)
@@ -127,7 +147,14 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 .WithFlag(1, out interruptRegister, name: "Interrupt register enable (ALS_INT_EN)")
                 .WithReservedBits(2, 2)
                 .WithTag("Interrupt persistence (ALS_PERS)", 4, 2)
-                .WithEnumField<WordRegister, IntegrationTime>(6, 4, out integrationTimeRegister, name: "Integration time (ALS_IT)")
+                .WithEnumField<WordRegister, IntegrationTime>(6, 4, out integrationTimeRegister, writeCallback: (oldValue, newValue) =>
+                {
+                    if(IntegrationTimeToIndex(newValue) == InvalidIntegrationTimeIndex)
+                    {
+                        this.WarningLog("Invalid value {0} was passed as integration time", newValue);
+                        integrationTimeRegister.Value = oldValue;
+                    }
+                }, name: "Integration time (ALS_IT)")
                 .WithReservedBits(10, 1)
                 .WithEnumField<WordRegister, Gain>(11, 2, out gainRegister, name: "Gain (ALS_GAIN)")
                 .WithReservedBits(13, 2);
@@ -161,7 +188,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
 
         private ushort ScaleSample(decimal value)
         {
-            var coefficient = luxCoefficients[(int)gainRegister.Value][(int)integrationTimeRegister.Value];
+            var coefficient = luxCoefficients[(int)gainRegister.Value][IntegrationTimeToIndex(integrationTimeRegister.Value)];
             var result = Math.Round(value / coefficient);
             return (ushort)Math.Min(result, ushort.MaxValue);
         }
@@ -199,6 +226,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private const byte SlaveCode = 0xc4;
         private const byte SlaveCodeAlt = 0xd4;
         private const byte DeviceID = 0x81;
+        private const int InvalidIntegrationTimeIndex = -1;
 
         public enum Gain
         {

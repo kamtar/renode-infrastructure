@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -15,7 +15,7 @@ using ELFSharp.ELF;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public partial class X86KVM : X86KVMBase, ICPUSupportingLLVMDisas
+    public partial class X86KVM : X86KVMBase
     {
         public X86KVM(string cpuType, IMachine machine, uint cpuId = 0, Detected64BitBehaviour on64BitDetected = Detected64BitBehaviour.Warn)
             : base(cpuType, machine, CpuBitness.Bits32, cpuId)
@@ -23,7 +23,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             KvmSet64BitBehaviour((uint)on64BitDetected);
         }
 
-        public string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
+        public override string GetLLVMTriple(uint flags)
+        {
+            if(flags == 1)
+            {
+                return AllLLVMTriples[1];
+            }
+            return AllLLVMTriples[0];
+        }
 
         public override string Architecture => "x86";
 
@@ -159,11 +166,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public string[] AllLLVMTriples => new[] { "x86" };
+        public override string[] AllLLVMTriples => new[] { "i386", "i386-unknown-none-code16" };
 
-        public Endianess DisassemblyHexFormatting => Endianess.BigEndian;
+        public override Endianess DisassemblyHexFormatting => Endianess.BigEndian;
 
-        public string LLVMModel => Model == "x86" ? "i386" : Model;
+        public override string LLVMModel => Model == "x86" ? "i386" : Model;
 
         // 649:  Field '...' is never assigned to, and will always have its default value null
 #pragma warning disable 649

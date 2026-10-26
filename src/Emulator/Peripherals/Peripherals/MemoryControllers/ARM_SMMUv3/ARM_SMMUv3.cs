@@ -6,6 +6,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 
@@ -219,7 +220,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 win.AssertIsValid();
                 return win;
             }
-            var cd = ReadStruct<ContextDescriptor>(ste.S1ContextPtr);
+            var cd = sysbus.ReadStruct<ContextDescriptor>(ste.S1ContextPtr);
             if(!cd.V)
             {
                 this.WarningLog("Context descriptor for stream #{0} ({1}) loaded from 0x{2:X} is invalid", streamId, domain.SecurityState, ste.S1ContextPtr);
@@ -381,7 +382,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                     return null;
                 }
             }
-            throw new Exception("Unreachable");
+            throw new UnreachableException();
         }
 
         public void SignalPermissionFaultEvent(IPeripheral initiator, ulong address, AccessType accessType)

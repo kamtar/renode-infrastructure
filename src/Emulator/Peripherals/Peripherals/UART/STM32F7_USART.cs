@@ -5,6 +5,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 using Antmicro.Renode.Core;
@@ -25,7 +26,9 @@ namespace Antmicro.Renode.Peripherals.UART
             RegistersCollection = new DoubleWordRegisterCollection(this);
             this.frequency = frequency;
             this.lowPowerMode = lowPowerMode;
+            this.machine = machine;
             DefineRegisters();
+            ConfigureReceiverThread();
         }
 
         public override void Reset()
@@ -35,6 +38,20 @@ namespace Antmicro.Renode.Peripherals.UART
             IRQ.Unset();
             receiverTimeoutCancellationTokenSrc?.Cancel();
             ReceiveDmaRequest.Unset();
+        }
+
+        public override void WriteChar(byte value)
+        {
+            bool needRestart;
+            lock(intermediateReceiveQueue)
+            {
+                intermediateReceiveQueue.Enqueue(value);
+                needRestart = intermediateReceiveQueue.Count == 1;
+            }
+            if(needRestart)
+            {
+                receiverThread?.Restart();
+            }
         }
 
         public uint ReadDoubleWord(long offset)
@@ -47,7 +64,8 @@ namespace Antmicro.Renode.Peripherals.UART
             RegistersCollection.Write(offset, value);
         }
 
-        public override uint BaudRate => BaudRateMultiplier * frequency / (uint)baudRateDivisor.Value;
+        public override uint BaudRate =>
+            BaudRateMultiplier * frequency / Math.Max(1, BaudRateDivisor);
 
         public override Bits StopBits
         {
@@ -155,8 +173,8 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(6, out transferCompleteInterruptEnabled, name: "TCIE")
                 .WithFlag(7, out transmitRegisterEmptyInterruptEnabled, name: "TXEIE")
                 .WithFlag(8, name: "PEIE")
-                .WithFlag(9, out paritySelection, name: "PS")
-                .WithFlag(10, out parityControlEnabled, name: "PCE")
+                .WithFlag(9, out paritySelection, changeCallback: UndoIfEnabledCallback(paritySelection, "PS"), name: "PS")
+                .WithFlag(10, out parityControlEnabled, changeCallback: UndoIfEnabledCallback(parityControlEnabled, "PCE"), name: "PCE")
                 .WithTaggedFlag("WAKE", 11)
                 .WithTaggedFlag("MO", 12)
                 .WithTaggedFlag("MME", 13)
@@ -165,13 +183,22 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithTag("DEAT", 21, 5)
                 .WithTaggedFlag("M1", 28)
                 .WithReservedBits(29, 3)
-                .WithWriteCallback((_, __) => UpdateInterrupt());
+                .WithWriteCallback((_, __) =>
+                {
+                    // Register callbacks are called after field callbacks,
+                    // so `wasEnabledBeforeCurrentWrite` is updated after all
+                    // `UndoIfEnableCallback`s are called, which is what we
+                    // want, since the undos judge based on the old value of the
+                    // enabled field
+                    wasEnabledBeforeCurrentWrite = enabled.Value;
+                    UpdateInterrupt();
+                });
 
             var cr2 = Registers.ControlRegister2.Define(RegistersCollection)
                 .WithReservedBits(0, 4)
                 .WithTaggedFlag("ADDM7", 4)
                 .WithReservedBits(7, 1)
-                .WithValueField(12, 2, out stopBits)
+                .WithValueField(12, 2, out stopBits, changeCallback: UndoIfEnabledCallback(stopBits, "STOP"), name: "STOP")
                 .WithTaggedFlag("SWAP", 15)
                 .WithTaggedFlag("RXINV", 16)
                 .WithTaggedFlag("TXINV", 17)
@@ -197,18 +224,16 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithTaggedFlag("UCESM", 23)
                 .WithReservedBits(25, 7);
 
-            if(lowPowerMode)
-            {
-                Registers.BaudRate.Define(RegistersCollection)
-                    .WithValueField(0, 20, out baudRateDivisor, name: "BRR")
-                    .WithReservedBits(20, 12);
-            }
-            else
-            {
-                Registers.BaudRate.Define(RegistersCollection)
-                    .WithValueField(0, 16, out baudRateDivisor, name: "BRR")
-                    .WithReservedBits(16, 16);
-            }
+            Registers.BaudRate.Define(RegistersCollection)
+                .WithValueField(0, lowPowerMode ? 20 : 16, out baudRateDivisor, changeCallback: (oldVal, newVal) =>
+                {
+                    if(BaudRateDivisorIsBad)
+                    {
+                        baudRateDivisor.Value = oldVal;
+                    }
+                    BaudRateChanged();
+                }, name: "BRR")
+                .WithReservedBits(lowPowerMode ? 20 : 16, lowPowerMode ? 12 : 16);
 
             var request = Registers.Request.Define(RegistersCollection)
                 .WithFlag(1, FieldMode.Write, name: "SBKRQ")
@@ -313,7 +338,15 @@ namespace Antmicro.Renode.Peripherals.UART
                     .WithTag("BLEN (Block length)", 24, 8);
 
                 cr1
-                    .WithFlag(15, out over8, name: "OVER8")
+                    .WithFlag(15, out over8, changeCallback: (oldVal, newVal) =>
+                    {
+                        UndoIfEnabledCallback(over8, "OVER8")(oldVal, newVal);
+                        if(BaudRateDivisorIsBad)
+                        {
+                            over8.Value = oldVal;
+                        }
+                        BaudRateChanged();
+                    }, name: "OVER8")
                     .WithFlag(26, out receiverTimeoutInterruptEnable, name: "RTOIE")
                     .WithTaggedFlag("EOBIE", 27)
                     .WithWriteCallback((_, __) =>
@@ -412,7 +445,93 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
-        private uint BaudRateMultiplier => lowPowerMode ? 256u : over8.Value ? 2u : 1u;
+        private Action<T, T> UndoIfEnabledCallback<T>(IRegisterField<T> field, string fieldName) => (T oldValue, T _) =>
+        {
+            if(!wasEnabledBeforeCurrentWrite)
+            {
+                return;
+            }
+            this.WarningLog("{0} field was written to while UART was enabled", fieldName);
+            field.Value = oldValue;
+        };
+
+        private void BaudRateChanged()
+        {
+            ConfigureReceiverThread();
+        }
+
+        private void ConfigureReceiverThread()
+        {
+            lock(receiverThreadLock)
+            {
+                receiverThread?.Dispose();
+                receiverThread = machine.ObtainManagedThread(
+                    action: () =>
+                    {
+                        byte value;
+                        lock(intermediateReceiveQueue)
+                        {
+                            if(!intermediateReceiveQueue.TryDequeue(out value))
+                            {
+                                return;
+                            }
+                        }
+
+                        WriteCharInner(value, null);
+                    },
+                    period: this.GetActualTransmissionDuration(8),
+                    name: $"{nameof(STM32F7_USART)} receiver",
+                    owner: this,
+                    stopCondition: () =>
+                    {
+                        lock(intermediateReceiveQueue)
+                        {
+                            return intermediateReceiveQueue.Count == 0;
+                        }
+                    }
+                );
+
+                if(intermediateReceiveQueue.Count > 0)
+                {
+                    receiverThread.Restart();
+                }
+            }
+        }
+
+        private bool Over8 => over8 == null ? false : over8.Value;
+
+        private uint BaudRateMultiplier => lowPowerMode ? 256u : Over8 ? 2u : 1u;
+
+        private uint BaudRateDivisor
+        {
+            get
+            {
+                var baseDivisor = (uint)baudRateDivisor.Value;
+                if(!Over8)
+                {
+                    return baseDivisor;
+                }
+                return (baseDivisor & 0xfff0) | ((baseDivisor & 0x0007) << 1);
+            }
+        }
+
+        private bool BaudRateDivisorIsBad
+        {
+            get
+            {
+                if(Over8 && (baudRateDivisor.Value & 0x0080) != 0)
+                {
+                    this.WarningLog("USARTDIV[3] must be 0 when in OVER8 mode");
+                    return true;
+                }
+                if(BaudRateDivisor < 16)
+                {
+                    this.WarningLog("Baud rate divisior must be at least 16");
+                    return true;
+                }
+                return false;
+            }
+        }
 
         private CancellationTokenSource receiverTimeoutCancellationTokenSrc;
 
@@ -434,6 +553,14 @@ namespace Antmicro.Renode.Peripherals.UART
         private IValueRegisterField receiverTimeout;
 
         private BufferState bufferState;
+
+        private bool wasEnabledBeforeCurrentWrite;
+
+        private IManagedThread receiverThread;
+
+        private readonly Queue<byte> intermediateReceiveQueue = new();
+        private readonly object receiverThreadLock = new();
+        private readonly IMachine machine;
 
         private readonly uint frequency;
         private readonly bool lowPowerMode;

@@ -15,9 +15,9 @@ namespace Antmicro.Renode.UserInterface.Commands
 {
     public class MonitorPathCommand : Command
     {
-        public MonitorPathCommand(Monitor monitor, MonitorPath path) : base(monitor, "path", "allows modification of internal 'PATH' variable.")
+        public MonitorPathCommand(Monitor monitor, Func<MonitorPath> path) : base(monitor, "path", "allows modification of internal 'PATH' variable.")
         {
-            monitorPath = path;
+            monitorPathGetter = path;
         }
 
         public override void PrintHelp(ICommandInteraction writer)
@@ -25,18 +25,18 @@ namespace Antmicro.Renode.UserInterface.Commands
             base.PrintHelp(writer);
             writer.WriteLine();
             PrintCurrentPath(writer);
-            writer.WriteLine(string.Format("Default 'PATH' value is: {0}", monitorPath.DefaultPath));
+            writer.WriteLine($"Default 'PATH' value is: {monitorPathGetter().DefaultPath}");
             writer.WriteLine();
             writer.WriteLine("You can use following commands:");
-            writer.WriteLine(String.Format("'{0} set @path'\tto set 'PATH' to the given value", Name));
-            writer.WriteLine(String.Format("'{0} add @path'\tto prepend the given value to 'PATH'", Name));
-            writer.WriteLine(String.Format("'{0} reset'\t\tto reset 'PATH' to it's default value", Name));
+            writer.WriteLine($"'{Name} set @path'\tto set 'PATH' to the given value");
+            writer.WriteLine($"'{Name} add @path'\tto prepend the given value to 'PATH'");
+            writer.WriteLine($"'{Name} reset'\t\tto reset 'PATH' to it's default value");
         }
 
         [Runnable]
         public void Reset(ICommandInteraction writer, [Values("reset")] LiteralToken _)
         {
-            monitorPath.Reset();
+            monitorPathGetter().Reset();
             PrintCurrentPath(writer);
         }
 
@@ -46,10 +46,10 @@ namespace Antmicro.Renode.UserInterface.Commands
             switch(action.Value)
             {
             case "set":
-                monitorPath.Path = path.Value;
+                monitorPathGetter().Path = path.Value;
                 break;
             case "add":
-                monitorPath.Prepend(path.Value);
+                monitorPathGetter().Prepend(path.Value);
                 break;
             }
             PrintCurrentPath(writer);
@@ -57,9 +57,9 @@ namespace Antmicro.Renode.UserInterface.Commands
 
         private void PrintCurrentPath(ICommandInteraction writer)
         {
-            writer.WriteLine(string.Format("Current 'PATH' value is: {0}", monitorPath.Path));
+            writer.WriteLine(string.Format("Current 'PATH' value is: {0}", monitorPathGetter().Path));
         }
 
-        readonly MonitorPath monitorPath;
+        readonly Func<MonitorPath> monitorPathGetter;
     }
 }

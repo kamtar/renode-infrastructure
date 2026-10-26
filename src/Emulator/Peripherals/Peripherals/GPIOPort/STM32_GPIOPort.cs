@@ -59,6 +59,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
 
             mode = new Mode[NumberOfPins];
+            outputState = new bool[NumberOfPins];
+            externalState = new bool[NumberOfPins];
             outputSpeed = new OutputSpeed[NumberOfPins];
             pullUpPullDown = new PullUpPullDown[NumberOfPins];
 
@@ -82,6 +84,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             base.Reset();
             registers.Reset();
 
+            Array.Clear(outputState, 0, outputState.Length);
             lockedPins = 0;
             lockSequenceState = LockSequence.Idle;
 
@@ -107,8 +110,17 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         public override void OnGPIO(int number, bool value)
         {
-            base.OnGPIO(number, value);
-            Connections[number].Set(value);
+            if(!CheckPinNumber(number))
+            {
+                return;
+            }
+
+            externalState[number] = value;
+            if(mode[number] == Mode.Input || mode[number] == Mode.AlternateFunction)
+            {
+                WritePin(number, value);
+            }
+            // Don't call base as the State write needs to be conditional on the pin mode.
         }
 
         public IGPIOReceiver GetLocalReceiver(int pin)
@@ -132,7 +144,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             for(var i = 0; i < NumberOfPins; i++)
             {
                 var state = ((value & 1u) == 1);
-                WritePin(i, state);
+                // The output latch is writable in every mode, but only drives the pin in output mode.
+                outputState[i] = state;
+                if(mode[i] == Mode.Output)
+                {
+                    WritePin(i, state);
+                }
 
                 value >>= 1;
             }
@@ -142,6 +159,20 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             mode[number] = newMode;
             alternateFunctionOutputs[number].IsConnected = newMode == Mode.AlternateFunction;
+            if(newMode == Mode.AnalogMode)
+            {
+                // In analog mode the digital input buffer is disabled and IDR reads zero.
+                // See RM0090 section 8.3.12.
+                State[number] = false;
+                return;
+            }
+            if(newMode == Mode.AlternateFunction)
+            {
+                // Alternate function outputs are driven by their local receivers so the cached output
+                // or external input should not be applied for them.
+                return;
+            }
+            WritePin(number, newMode == Mode.Output ? outputState[number] : externalState[number]);
         }
 
         private void GuardPinAction(int number, string name, Action action)
@@ -197,16 +228,19 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     .WithReservedBits(16, 16)
                 },
                 {(long)Registers.OutputData, new DoubleWordRegister(this)
-                    .WithValueField(0, 16, writeCallback: (_, val) => WriteState((ushort)val), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(State), name: "ODR")
+                    .WithValueField(0, 16, writeCallback: (_, val) => WriteState((ushort)val), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(outputState), name: "ODR")
                     .WithReservedBits(16, 16)
                 },
                 {(long)Registers.BitSet, new DoubleWordRegister(this)
-                    .WithValueField(0, 16, FieldMode.Write,
-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) | val)); },
-                        name: "GPIOx_BS")
+                    // `BS` is ordered after `BR` so that if both are set at
+                    // once, `BS` is processed later and thus has priority, as
+                    // specified by the TRM
                     .WithValueField(16, 16, FieldMode.Write,
-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) & ~val)); },
+                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputState) & ~val)); },
                         name: "GPIOx_BR")
+                    .WithValueField(0, 16, FieldMode.Write,
+                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputState) | val)); },
+                        name: "GPIOx_BS")
                 },
                 { (long)Registers.ConfigurationLock, new DoubleWordRegister(this)
                     .WithValueField(0, 16, out var pendingLockPins, name: "LCK",
@@ -278,7 +312,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 },
                 {(long)Registers.BitReset, new DoubleWordRegister(this)
                     .WithValueField(0, 16, FieldMode.Write,
-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) & ~val)); },
+                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputState) & ~val)); },
                         name: "GPIOx_BRR")
                     .WithReservedBits(16, 16)
                 },
@@ -290,6 +324,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private LockSequence lockSequenceState;
 
         private readonly Mode[] mode;
+        private readonly bool[] outputState;
+        private readonly bool[] externalState;
         private readonly OutputSpeed[] outputSpeed;
         private readonly PullUpPullDown[] pullUpPullDown;
         private readonly HashSet<InvertedAFPin> invertedAFPins = new HashSet<InvertedAFPin>();

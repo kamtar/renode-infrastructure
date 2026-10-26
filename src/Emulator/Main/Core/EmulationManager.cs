@@ -1,6 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -139,7 +138,7 @@ namespace Antmicro.Renode.Core
                 }
 
                 EmulationEpoch++;
-                var deserializationResult = serializer.TryDeserialize<Emulation>(stream, out var emulation, out var metadata);
+                var deserializationResult = serializer.TryDeserialize<(Emulation, MonitorContext)>(stream, out var deserializedData, out var metadata);
                 string metadataStringFromFile = null;
 
                 try
@@ -160,8 +159,11 @@ namespace Antmicro.Renode.Core
                     throw CreateLoadException(deserializationResult, metadataStringFromFile);
                 }
 
+                (var emulation, var monitorContext) = deserializedData;
                 CurrentEmulation = emulation;
                 CurrentEmulation.BlobManager.Load(stream, fstream.Name);
+                ObjectCreator.Instance.GetSurrogate<Monitor>().MonitorContext = monitorContext;
+                Logger.Log(LogLevel.Info, $"Monitor symbols loaded:\n\tMacros: {monitorContext.Macros.Keys.Stringify()}\n\tAliasses: {monitorContext.Aliases.Keys.Stringify()}\n\tVariables: {monitorContext.Variables.Keys.Stringify()}");
 
                 if(metadataStringFromFile != MetadataString)
                 {
@@ -211,18 +213,26 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        // Note that 'SequencedFilePath' is not used directly in this method as it wwould corrupt the 'SnapshotTracker' state.
+        // Instead 'SnapshotTracker' uses 'SequencedFilePath' internally during 'MakeSpaceAtPath' call.
         public void Save(string path)
         {
+            path = Path.GetFullPath(path);
+
             try
             {
+                // If a snapshot already exists at this path then move it using 'SequencedFilePath'.
+                CurrentEmulation.SnapshotTracker.MakeSpaceAtPath(path);
+
                 using(var stream = new FileStream(path, FileMode.Create))
                 {
                     using(CurrentEmulation.ObtainSafeState())
                     {
                         try
                         {
+                            var monitorContext = ObjectCreator.Instance.GetSurrogate<Monitor>().MonitorContext;
                             CurrentEmulation.SnapshotTracker.Save(CurrentEmulation.MasterTimeSource.ElapsedVirtualTime, path);
-                            serializer.Serialize(CurrentEmulation, stream, Encoding.UTF8.GetBytes(MetadataString));
+                            serializer.Serialize((CurrentEmulation, monitorContext), stream, Encoding.UTF8.GetBytes(MetadataString));
                             CurrentEmulation.BlobManager.Save(stream);
                         }
                         catch(InvalidOperationException e)
@@ -266,11 +276,7 @@ namespace Antmicro.Renode.Core
         public void LoadLatestSnapshot(bool autoStart = false)
         {
             var currentTimeStamp = CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
-            if(currentTimeStamp == TimeInterval.FromTicks(0))
-            {
-                throw new RecoverableException("There are no snapshots taken before this timestamp.");
-            }
-            LoadLatestSnapshot(currentTimeStamp - TimeInterval.FromTicks(1), autoStart);
+            LoadLatestSnapshot(currentTimeStamp, autoStart);
         }
 
         public void LoadLatestSnapshot(TimeInterval beforeOrAtTimestamp, bool autoStart = false)

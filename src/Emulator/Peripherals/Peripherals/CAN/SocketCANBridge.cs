@@ -6,6 +6,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -23,23 +24,24 @@ namespace Antmicro.Renode.Peripherals.CAN
     public static class SocketCANBridgeExtensions
     {
         [SupportedRID("linux")]
-        public static void CreateSocketCANBridge(this IMachine machine, string name, string canInterfaceName = "vcan0", bool ensureFdFrames = false, bool ensureXlFrames = false)
+        public static void CreateSocketCANBridge(this IMachine machine, string name, string canInterfaceName = "vcan0", bool ensureFdFrames = false, bool ensureXlFrames = false, bool bufferFramesWhenPaused = false)
         {
             if(!RuntimeInfo.IsLinux())
             {
                 throw new PlatformNotSupportedException("Socket CAN bridge is accessible on Linux only");
             }
-            var bridge = new SocketCANBridge(canInterfaceName, ensureFdFrames, ensureXlFrames);
+            var bridge = new SocketCANBridge(canInterfaceName, ensureFdFrames, ensureXlFrames, bufferFramesWhenPaused);
             machine.RegisterAsAChildOf(machine.SystemBus, bridge, NullRegistrationPoint.Instance);
             machine.SetLocalName(bridge, name);
         }
     }
 
     [SupportedRID("linux")]
-    public class SocketCANBridge : ICAN
+    public class SocketCANBridge : ICAN, IHasOwnLife
     {
-        public SocketCANBridge(string canInterfaceName = "vcan0", bool ensureFdFrames = false, bool ensureXlFrames = false)
+        public SocketCANBridge(string canInterfaceName = "vcan0", bool ensureFdFrames = false, bool ensureXlFrames = false, bool bufferFramesWhenPaused = false)
         {
+            this.bufferFramesWhenPaused = bufferFramesWhenPaused;
             if(canInterfaceName.Length >= InterfaceRequest.InterfaceNameSize)
             {
                 throw new ConstructionException($"Parameter '{nameof(canInterfaceName)}' is too long, name of CAN device \"{canInterfaceName}\" exceeds {InterfaceRequest.InterfaceNameSize - 1} bytes");
@@ -121,6 +123,29 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
         }
 
+        public void Start()
+        {
+            Resume();
+        }
+
+        public void Pause()
+        {
+            lock(startedLock)
+            {
+                IsPaused = true;
+            }
+        }
+
+        public void Resume()
+        {
+            lock(startedLock)
+            {
+                IsPaused = false;
+            }
+        }
+
+        public bool IsPaused { get; private set; } = true;
+
         public event Action<CANMessageFrame> FrameSent;
 
         private bool TryEnableSocketOption(bool ensure, int option, string optionName)
@@ -160,7 +185,7 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 if(maximumTransmissionUnit - buffer.Count <= 0)
                 {
-                    throw new Exception("Unreachable");
+                    throw new UnreachableException();
                 }
 
                 var data = LibCWrapper.Read(canSocket, maximumTransmissionUnit - buffer.Count, ReadSocketTimeout, isCancellationRequested);
@@ -188,6 +213,19 @@ namespace Antmicro.Renode.Peripherals.CAN
                     this.Log(LogLevel.Warning, "Failed to convert SocketCAN frame to CANMessageFrame");
                     continue;
                 }
+                lock(startedLock)
+                {
+                    if(IsPaused)
+                    {
+                        if(!bufferFramesWhenPaused)
+                        {
+                            this.DebugLog("Emulation is paused. Dropping frame: {0}", message);
+                            continue;
+                        }
+                        // CANHub runs in virtual time, so the frame is queued until the next synced state after resuming
+                        this.DebugLog("Emulation is paused. Frame will be delivered after resuming: {0}", message);
+                    }
+                }
 
                 this.Log(LogLevel.Debug, "Transmitting {0}", message);
                 FrameSent?.Invoke(message);
@@ -198,10 +236,12 @@ namespace Antmicro.Renode.Peripherals.CAN
         private CancellationTokenSource cancellationTokenSource;
         [Transient]
         private Thread thread;
+        private readonly object startedLock = new object();
 
         private readonly int canSocket;
 
         private readonly int maximumTransmissionUnit;
+        private readonly bool bufferFramesWhenPaused;
 
         // PF_CAN
         private const int ProtocolFamilyCan = 29;

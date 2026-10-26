@@ -42,7 +42,7 @@ namespace Antmicro.Renode.Peripherals.UART
         public UARTHub(bool loopback) : base(loopback) { }
     }
 
-    public class UARTHubBase<I, T> : IExternal, IHasOwnLife, IConnectable<I>
+    public class UARTHubBase<I, T> : IExternal, IConnectable<I>
         where I : class, IUART<T>
         where T : IBinaryInteger<T>
     {
@@ -84,21 +84,6 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
-        public void Start()
-        {
-            Resume();
-        }
-
-        public void Pause()
-        {
-            started = false;
-        }
-
-        public void Resume()
-        {
-            started = true;
-        }
-
         public virtual void DetachFrom(I uart)
         {
             lock(locker)
@@ -112,8 +97,6 @@ namespace Antmicro.Renode.Peripherals.UART
                 uarts.Remove(uart);
             }
         }
-
-        public bool IsPaused => !started;
 
         public bool StrictMode
         {
@@ -155,6 +138,16 @@ namespace Antmicro.Renode.Peripherals.UART
             set => frameErrorRate = ValidateRate(nameof(FrameErrorRate), value);
         }
 
+        // NOTE: This is required by some of the UART models due to the fact, that some implementations
+        //       can have the delay "baked-in" into the TX/RX FIFO. Due to "hacky" nature of this option,
+        //       it shouldn't be relied upon and instead proper, general solution for handling baudrate-related
+        //       delay should be developed.
+        public bool ImmediateLoopback
+        {
+            get => immediateLoopback;
+            set => immediateLoopback = value;
+        }
+
         public event Action<I, T> DataTransmitted;
 
         public event Action<I, I, T> DataRouted;
@@ -162,7 +155,6 @@ namespace Antmicro.Renode.Peripherals.UART
         private static readonly Bits[] allStopBitValues = Enum.GetValues<Bits>();
         private static readonly byte[] allBitPositions = Enumerable.Range(0, default(T).GetByteCount() * 8).Select(x => (byte)x).ToArray();
 
-        protected bool started;
         protected bool strictMode;
         protected readonly bool shouldLoopback;
         protected readonly Dictionary<I, Action<T>> uarts;
@@ -171,11 +163,6 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void HandleCharReceived(T obj, TimeStamp when, I sender)
         {
-            if(!started)
-            {
-                return;
-            }
-
             DataTransmitted?.Invoke(sender, obj);
 
             lock(locker)
@@ -198,6 +185,11 @@ namespace Antmicro.Renode.Peripherals.UART
                     if(recipient is IDelayableUART drecipient)
                     {
                         localWhen = when + drecipient.CharacterReceptionDelay;
+                    }
+
+                    if(recipient == sender && immediateLoopback)
+                    {
+                        localWhen = TimeDomainsManager.Instance.VirtualTimeStamp;
                     }
 
                     // Only send extra info in strict mode, as the model might otherwise not deliver the message
@@ -321,5 +313,6 @@ namespace Antmicro.Renode.Peripherals.UART
         private int maximumFlippedBits;
         private double droppedCharacterRate;
         private double frameErrorRate;
+        private bool immediateLoopback;
     }
 }

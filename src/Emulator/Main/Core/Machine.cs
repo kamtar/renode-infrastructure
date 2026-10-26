@@ -103,6 +103,11 @@ namespace Antmicro.Renode.Core
             DetachIncomingInterrupts(registeredPeripherals.ToArray());
             DetachOutgoingInterrupts(registeredPeripherals);
 
+            if(localTimeSource != null)
+            {
+                localTimeSource.TimePassed -= HandleTimeProgress;
+            }
+
             // ordering below is due to the fact that the CPU can use other peripherals, e.g. Memory so it should be disposed first
             // Mapped memory can be used as storage by other disposable peripherals which may want to read it while being disposed
             foreach(var peripheral in GetPeripheralsOfType<IDisposable>().OrderBy(x => x is ICPU ? 0 : x is IMapped ? 2 : 1))
@@ -113,14 +118,12 @@ namespace Antmicro.Renode.Core
             (LocalTimeSource as SlaveTimeSource)?.Dispose();
             this.Log(LogLevel.Info, "Disposed.");
             var disposed = StateChanged;
-            if(disposed != null)
-            {
-                disposed(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Disposed));
-            }
+            StateChanged?.Invoke(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Disposed));
             Profiler?.Dispose();
             Profiler = null;
 
             atomicState.Dispose();
+            clockSource.Dispose();
 
             EmulationManager.Instance.CurrentEmulation.BackendManager.HideAnalyzersFor(this);
         }
@@ -144,7 +147,7 @@ namespace Antmicro.Renode.Core
         {
             var entries = ClockSource.GetAllClockEntries();
 
-            var table = new Table().AddRow("Owner", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
+            var table = new Table().AddRow("Owner", "Clocked", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
             table.AddRows(entries,
                 x =>
                 {
@@ -161,6 +164,7 @@ namespace Antmicro.Renode.Core
                                 ? GetAnyNameOrTypeName(ownerAsPeripheral)
                                 : owner.GetType().Name;
                 },
+                x => x.Clocked.ToString(),
                 x => x.Enabled.ToString(),
                 x => Misc.NormalizeDecimal(x.Frequency) + "Hz",
                 x => x.Period.ToString(),
@@ -337,7 +341,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null)
+        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false)
         {
             Action softwareRequestedReset = null;
             softwareRequestedReset = () =>
@@ -349,6 +353,11 @@ namespace Antmicro.Renode.Core
                     {
                         peripheral.Reset();
                         PeripheralReset?.Invoke(this, peripheral);
+                    }
+
+                    if(runRegisteredResetEvents)
+                    {
+                        MachineReset?.Invoke(this);
                     }
                 }
                 postReset?.Invoke();
@@ -495,6 +504,21 @@ namespace Antmicro.Renode.Core
                 catch(SocketException e)
                 {
                     throw new RecoverableException(string.Format("Could not start GDB server for {0}: {1}", cpuSupportingGdb.GetName(), e.Message));
+                }
+            }
+        }
+
+        public void StartMultiprocessGdbServer(int port, List<ICluster<ICpuSupportingGdb>> clusters, bool autostartEmulation = true)
+        {
+            foreach(var (process, processId) in clusters.Zip(Enumerable.Range(1, clusters.Count)))
+            {
+                try
+                {
+                    AddCpusToGdbStub(port, autostartEmulation, process, processId);
+                }
+                catch(SocketException e)
+                {
+                    throw new RecoverableException($"Could not start GDB server for process {processId} ({Misc.PrettyPrintCollection(process, x => x.GetName())}): {e.Message}");
                 }
             }
         }
@@ -753,8 +777,8 @@ namespace Antmicro.Renode.Core
             MultiTreeNode<IPeripheral, IRegistrationPoint> result;
             if(TryFindSubnodeByName(registeredPeripherals.GetNode(SystemBus), splitPath[1], out result, SystemBusName, out longestMatch))
             {
-                peripheral = (T)result.Value;
-                return true;
+                peripheral = result.Value as T;
+                return result.Value is T;
             }
             peripheral = null;
             return false;
@@ -1076,12 +1100,9 @@ namespace Antmicro.Renode.Core
         {
             lock(pausingSync)
             {
-                switch(state)
+                if(State != MachineState.Started)
                 {
-                case State.Paused:
                     return;
-                case State.NotStarted:
-                    goto case State.Paused;
                 }
                 (LocalTimeSource as SlaveTimeSource)?.Pause();
                 foreach(var ownLife in ownLifes.OrderBy(x => x is ICPU ? 0 : 1))
@@ -1091,12 +1112,7 @@ namespace Antmicro.Renode.Core
                     ownLife.Pause();
                     this.NoisyLog("{0} paused.", ownLifeName);
                 }
-                state = State.Paused;
-                var machinePaused = StateChanged;
-                if(machinePaused != null)
-                {
-                    machinePaused(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Paused));
-                }
+                State = MachineState.Paused;
                 this.Log(LogLevel.Info, "Machine paused.");
             }
         }
@@ -1231,6 +1247,17 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        public void Abort()
+        {
+            if(State == MachineState.Aborted)
+            {
+                return;
+            }
+            this.ErrorLog("This machine has aborted. Emulation cannot continue until this machine is removed.");
+            Pause();
+            State = MachineState.Aborted;
+        }
+
         public string PreservableName => $"Machine:{this.ToString()}";
 
         public DateTime RealTimeClockStart
@@ -1313,15 +1340,9 @@ namespace Antmicro.Renode.Core
 
         public Platform Platform { get; set; }
 
-        public bool IsPaused
-        {
-            get
-            {
-                // locking on pausingSync can cause a deadlock (when mach.Start() and AllMachineStarted are called together)
-                var stateCopy = state;
-                return stateCopy == State.Paused || stateCopy == State.NotStarted;
-            }
-        }
+        public bool IsPaused => State != MachineState.Started;
+
+        public bool IsAborted => State == MachineState.Aborted;
 
         public IPeripheralsGroupsManager PeripheralsGroups { get; private set; }
 
@@ -1483,6 +1504,14 @@ namespace Antmicro.Renode.Core
             return string.Format("{0}{1}{2}", parent, string.IsNullOrEmpty(parent) ? string.Empty : PathSeparator.ToString(), child);
         }
 
+        private static MachineStateChangedEventArgs.State ToEventState(MachineState state) => state switch
+        {
+            MachineState.Paused => MachineStateChangedEventArgs.State.Paused,
+            MachineState.Started => MachineStateChangedEventArgs.State.Started,
+            MachineState.Aborted => MachineStateChangedEventArgs.State.Aborted,
+            _ => throw new ArgumentOutOfRangeException(nameof(state), $"Unexpected value: {state}")
+        };
+
         private string GetNameForOwnLife(IHasOwnLife ownLife)
         {
             var peripheral = ownLife as IPeripheral;
@@ -1499,11 +1528,14 @@ namespace Antmicro.Renode.Core
         {
             lock(pausingSync)
             {
-                switch(state)
+                switch(State)
                 {
-                case State.Started:
+                case MachineState.Aborted:
+                    this.WarningLog("Machine is aborted, cannot start");
                     return;
-                case State.Paused:
+                case MachineState.Started:
+                    return;
+                case MachineState.Paused:
                     Resume();
                     return;
                 }
@@ -1526,12 +1558,7 @@ namespace Antmicro.Renode.Core
                 }
                 (LocalTimeSource as SlaveTimeSource)?.Resume();
                 this.Log(LogLevel.Info, "Machine started.");
-                state = State.Started;
-                var machineStarted = StateChanged;
-                if(machineStarted != null)
-                {
-                    machineStarted(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Started));
-                }
+                State = MachineState.Started;
             }
         }
 
@@ -1546,12 +1573,7 @@ namespace Antmicro.Renode.Core
                     ownLife.Resume();
                 }
                 this.Log(LogLevel.Info, "Machine resumed.");
-                state = State.Started;
-                var machineStarted = StateChanged;
-                if(machineStarted != null)
-                {
-                    machineStarted(this, new MachineStateChangedEventArgs(MachineStateChangedEventArgs.State.Started));
-                }
+                State = MachineState.Started;
             }
         }
 
@@ -1677,7 +1699,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        private void AddCpusToGdbStub(int port, bool autostartEmulation, IEnumerable<ICpuSupportingGdb> cpus)
+        private void AddCpusToGdbStub(int port, bool autostartEmulation, IEnumerable<ICpuSupportingGdb> cpus, int? pid = null)
         {
             foreach(var cpu in cpus)
             {
@@ -1687,30 +1709,30 @@ namespace Antmicro.Renode.Core
             {
                 foreach(var cpu in cpus)
                 {
-                    gdbStubs[port].AttachCPU(cpu);
+                    gdbStubs[port].AttachCPU(cpu, pid);
                     this.Log(LogLevel.Info, "CPU: {0} was added to GDB server running on port :{1}", cpu.GetName(), port);
                 }
             }
             else
             {
-                gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation));
+                gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation, pid));
                 this.Log(LogLevel.Info, "CPUs: {0} were added to a new GDB server created on port :{1}", Misc.PrettyPrintCollection(cpus, c => $"\"{c.GetName()}\""), port);
             }
         }
 
-        private void AddCpusToGdbStub(SocketServerProvider terminal, IEnumerable<ICpuSupportingGdb> cpus)
+        private void AddCpusToGdbStub(SocketServerProvider terminal, IEnumerable<ICpuSupportingGdb> cpus, int? pid = null)
         {
             foreach(var cpu in cpus)
             {
                 CheckIsCpuAlreadyAttached(cpu);
             }
-            int port = terminal.Port.Value;
+            var port = terminal.Port.Value;
 
             if(gdbStubs.ContainsKey(port))
             {
                 throw new RecoverableException($"There is already a GdbStub for port ({port}) used by this Socket. Use port variant of this function if this is expected");
             }
-            gdbStubs.Add(port, new GdbStub(this, cpus, terminal));
+            gdbStubs.Add(port, new GdbStub(this, cpus, terminal, pid));
         }
 
         private void InnerUnregisterFromParent(IPeripheral peripheral)
@@ -1824,7 +1846,7 @@ namespace Antmicro.Renode.Core
                     if(ownLife != null)
                     {
                         ownLifes.Add(ownLife);
-                        if(state == State.Paused)
+                        if(State == MachineState.Paused)
                         {
                             executeAfterLock = delegate
                             {
@@ -1917,13 +1939,26 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        private MachineState State
+        {
+            get => innerState;
+            set
+            {
+                if(value == innerState)
+                {
+                    return;
+                }
+                StateChanged?.Invoke(this, new MachineStateChangedEventArgs(ToEventState(value)));
+                innerState = value;
+            }
+        }
+
         private bool wasDeserialized;
         private int currentStampLevel;
         private bool alreadyDisposed;
         private Action<string> userStateHook;
         private string userState;
-        private State state;
-
+        private MachineState innerState;
         private RealTimeClockMode realTimeClockMode;
         private List<IPeripheral> currentStamp;
         private TimeSourceBase localTimeSource;
@@ -2227,6 +2262,16 @@ namespace Antmicro.Renode.Core
                 set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(frequency: value));
             }
 
+            public TimeInterval Period
+            {
+                get
+                {
+                    var entry = machine.ClockSource.GetClockEntry(action);
+                    return TimeInterval.FromTicks(entry.Period * TimeInterval.TicksPerSecond / entry.Frequency);
+                }
+                set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(period: value.Ticks, frequency: TimeInterval.TicksPerSecond));
+            }
+
             private ManagedThreadWrappingClockEntry(IMachine machine, Action action, Func<bool> stopCondition = null)
             {
                 this.action = () =>
@@ -2263,11 +2308,12 @@ namespace Antmicro.Renode.Core
             public IDictionary<int, ISet<Tuple<ulong, BreakpointType>>> Breakpoints;
         }
 
-        private enum State
+        private enum MachineState
         {
             NotStarted,
             Started,
-            Paused
+            Paused,
+            Aborted
         }
     }
 }

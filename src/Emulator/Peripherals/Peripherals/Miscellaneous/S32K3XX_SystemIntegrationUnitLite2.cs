@@ -405,13 +405,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return startPadIndex;
             };
 
+            // Registers always have to be distributed as if the value of `PadDataCount` was even - if it is
+            // odd there should be a 1 register wide hole between the last and second to last register.
+            var iterationCount = (PadDataCount + 1) & ~1;
             // While the register addresses are one after another...
-            for(var registerOffset = 0; registerOffset < PadDataCount; ++registerOffset)
+            for(var registerOffset = 0; registerOffset < iterationCount; ++registerOffset)
             {
                 // ...the register indexes are in reversed order pair-wise, so 1, 0, 3, 2, 5, 4, etc.
                 var registerIndex = registerOffset ^ 1;
                 var outputOffset = Registers.ParallelGPIOPadDataOut0 + registerOffset * 2;
                 var inputOffset = Registers.ParallelGPIOPadDataIn0 + registerOffset * 2;
+
+                if(registerIndex >= PadDataCount)
+                {
+                    continue;
+                }
 
                 for(var byteIndex = 0; byteIndex < 2; ++byteIndex)
                 {
@@ -420,7 +428,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                     (outputOffset + byteIndex).Define(asByteCollection)
                         .WithValueField(0, 8, name: $"ParallelPadDataOutput{registerIndex}.{byteIndex}",
-                            valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(padRange.Select(pinIndex => Connections[pinIndex].IsSet)),
+                            valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(padRange.Select(pinIndex =>
+                                validPadIndexes.Contains(pinIndex) ? Connections[pinIndex].IsSet : false)),
                             changeCallback: (previousValue, currentValue) =>
                             {
                                 var difference = previousValue ^ currentValue;
@@ -436,7 +445,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                     (inputOffset + byteIndex).Define(asByteCollection)
                         .WithValueField(0, 8, FieldMode.Read, name: $"ParallelPadDataInput{registerIndex}.{byteIndex}",
-                            valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(padRange.Select(pinIndex => State[pinIndex])))
+                            valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(padRange.Select(pinIndex =>
+                                validPadIndexes.Contains(pinIndex) ? State[pinIndex] : false)))
                     ;
                 }
             }

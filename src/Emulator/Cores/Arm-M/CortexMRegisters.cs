@@ -231,118 +231,95 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Register]
-        public RegisterValue FPSCR
+        public RegisterValue MSPCURR
         {
             get
             {
-                return GetRegisterValue32((int)CortexMRegisters.FPSCR);
+                return GetRegisterValue32((int)CortexMRegisters.MSPCURR);
             }
 
             set
             {
-                SetRegisterValue32((int)CortexMRegisters.FPSCR, value);
+                SetRegisterValue32((int)CortexMRegisters.MSPCURR, value);
             }
         }
 
-        public RegistersGroup D { get; private set; }
+        [Register]
+        public RegisterValue PSPCURR
+        {
+            get
+            {
+                return GetRegisterValue32((int)CortexMRegisters.PSPCURR);
+            }
 
-        public RegistersGroup S { get; private set; }
+            set
+            {
+                SetRegisterValue32((int)CortexMRegisters.PSPCURR, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue MSPS
+        {
+            get
+            {
+                return GetRegisterValue32((int)CortexMRegisters.MSPS);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)CortexMRegisters.MSPS, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue PSPS
+        {
+            get
+            {
+                return GetRegisterValue32((int)CortexMRegisters.PSPS);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)CortexMRegisters.PSPS, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue MSPNS
+        {
+            get
+            {
+                return GetRegisterValue32((int)CortexMRegisters.MSPNS);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)CortexMRegisters.MSPNS, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue PSPNS
+        {
+            get
+            {
+                return GetRegisterValue32((int)CortexMRegisters.PSPNS);
+            }
+
+            set
+            {
+                SetRegisterValue32((int)CortexMRegisters.PSPNS, value);
+            }
+        }
 
 #pragma warning disable SA1508
         protected override void InitializeRegisters()
         {
             base.InitializeRegisters();
-            var indexValueMapD = new Dictionary<int, CortexMRegisters>
-            {
-                { 0, CortexMRegisters.D0 },
-                { 1, CortexMRegisters.D1 },
-                { 2, CortexMRegisters.D2 },
-                { 3, CortexMRegisters.D3 },
-                { 4, CortexMRegisters.D4 },
-                { 5, CortexMRegisters.D5 },
-                { 6, CortexMRegisters.D6 },
-                { 7, CortexMRegisters.D7 },
-                { 8, CortexMRegisters.D8 },
-                { 9, CortexMRegisters.D9 },
-                { 10, CortexMRegisters.D10 },
-                { 11, CortexMRegisters.D11 },
-                { 12, CortexMRegisters.D12 },
-                { 13, CortexMRegisters.D13 },
-                { 14, CortexMRegisters.D14 },
-                { 15, CortexMRegisters.D15 },
-                { 16, CortexMRegisters.D16 },
-                { 17, CortexMRegisters.D17 },
-                { 18, CortexMRegisters.D18 },
-                { 19, CortexMRegisters.D19 },
-                { 20, CortexMRegisters.D20 },
-                { 21, CortexMRegisters.D21 },
-                { 22, CortexMRegisters.D22 },
-                { 23, CortexMRegisters.D23 },
-                { 24, CortexMRegisters.D24 },
-                { 25, CortexMRegisters.D25 },
-                { 26, CortexMRegisters.D26 },
-                { 27, CortexMRegisters.D27 },
-                { 28, CortexMRegisters.D28 },
-                { 29, CortexMRegisters.D29 },
-                { 30, CortexMRegisters.D30 },
-                { 31, CortexMRegisters.D31 },
-            };
-            D = new RegistersGroup(
-                indexValueMapD.Keys,
-                i => GetRegister((int)indexValueMapD[i]),
-                (i, v) => SetRegister((int)indexValueMapD[i], v));
-
-            var indexValueMapS = new Dictionary<int, CortexMRegisters>
-            {
-                { 0, CortexMRegisters.S0 },
-                { 1, CortexMRegisters.S1 },
-                { 2, CortexMRegisters.S2 },
-                { 3, CortexMRegisters.S3 },
-                { 4, CortexMRegisters.S4 },
-                { 5, CortexMRegisters.S5 },
-                { 6, CortexMRegisters.S6 },
-                { 7, CortexMRegisters.S7 },
-                { 8, CortexMRegisters.S8 },
-                { 9, CortexMRegisters.S9 },
-                { 10, CortexMRegisters.S10 },
-                { 11, CortexMRegisters.S11 },
-                { 12, CortexMRegisters.S12 },
-                { 13, CortexMRegisters.S13 },
-                { 14, CortexMRegisters.S14 },
-                { 15, CortexMRegisters.S15 },
-                { 16, CortexMRegisters.S16 },
-                { 17, CortexMRegisters.S17 },
-                { 18, CortexMRegisters.S18 },
-                { 19, CortexMRegisters.S19 },
-                { 20, CortexMRegisters.S20 },
-                { 21, CortexMRegisters.S21 },
-                { 22, CortexMRegisters.S22 },
-                { 23, CortexMRegisters.S23 },
-                { 24, CortexMRegisters.S24 },
-                { 25, CortexMRegisters.S25 },
-                { 26, CortexMRegisters.S26 },
-                { 27, CortexMRegisters.S27 },
-                { 28, CortexMRegisters.S28 },
-                { 29, CortexMRegisters.S29 },
-                { 30, CortexMRegisters.S30 },
-                { 31, CortexMRegisters.S31 },
-            };
-            S = new RegistersGroup(
-                indexValueMapS.Keys,
-                i => GetRegister((int)indexValueMapS[i]),
-                (i, v) => SetRegister((int)indexValueMapS[i], v));
-
         }
 #pragma warning restore SA1508
-
-#pragma warning disable 649
-        // 649:  Field '...' is never assigned to, and will always have its default value null
-        [Import(Name = "tlib_set_register_value_64")]
-        protected Action<int, ulong> SetRegisterValue64;
-
-        [Import(Name = "tlib_get_register_value_64")]
-        protected Func<int, ulong> GetRegisterValue64;
-#pragma warning restore 649
 
         private static readonly Dictionary<CortexMRegisters, CPURegister> mapping = new Dictionary<CortexMRegisters, CPURegister>
         {
@@ -440,6 +417,12 @@ namespace Antmicro.Renode.Peripherals.CPU
             { CortexMRegisters.S29,  new CPURegister(104, 32, isGeneral: false, isReadonly: false, aliases: new [] { "S29" }) },
             { CortexMRegisters.S30,  new CPURegister(105, 32, isGeneral: false, isReadonly: false, aliases: new [] { "S30" }) },
             { CortexMRegisters.S31,  new CPURegister(106, 32, isGeneral: false, isReadonly: false, aliases: new [] { "S31" }) },
+            { CortexMRegisters.MSPCURR,  new CPURegister(107, 32, isGeneral: false, isReadonly: false, aliases: new [] { "MSPCURR" }) },
+            { CortexMRegisters.PSPCURR,  new CPURegister(108, 32, isGeneral: false, isReadonly: false, aliases: new [] { "PSPCURR" }) },
+            { CortexMRegisters.MSPS,  new CPURegister(109, 32, isGeneral: false, isReadonly: false, aliases: new [] { "MSPS" }) },
+            { CortexMRegisters.PSPS,  new CPURegister(110, 32, isGeneral: false, isReadonly: false, aliases: new [] { "PSPS" }) },
+            { CortexMRegisters.MSPNS,  new CPURegister(111, 32, isGeneral: false, isReadonly: false, aliases: new [] { "MSPNS" }) },
+            { CortexMRegisters.PSPNS,  new CPURegister(112, 32, isGeneral: false, isReadonly: false, aliases: new [] { "PSPNS" }) },
         };
     }
 
@@ -449,6 +432,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         LR = 14,
         PC = 15,
         CPSR = 25,
+        FPSCR = 74,
         Control = 18,
         BasePri = 19,
         VecBase = 20,
@@ -461,7 +445,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         FAULTMASK = 30,
         VPR = 31,
         NSACR = 32,
-        FPSCR = 74,
+        MSPCURR = 107,
+        PSPCURR = 108,
+        MSPS = 109,
+        PSPS = 110,
+        MSPNS = 111,
+        PSPNS = 112,
         R0 = 0,
         R1 = 1,
         R2 = 2,

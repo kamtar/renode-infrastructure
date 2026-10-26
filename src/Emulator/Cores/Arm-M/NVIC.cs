@@ -78,6 +78,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             return targetInterruptSecurityState[interruptNumber];
         }
 
+        /// <remarks>
+        /// NOTE: RFKXX is not respected here. `tlib_nvic_find_pending_irq()`
+        /// does not respect PRIMASK/BASEPRI/FAULTMASK.
+        /// </remarks>
         public int? FindPendingInterrupt()
         {
             lock(irqs)
@@ -847,6 +851,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             canResetOnlyFromSecure = false;
             deepSleepOnlyFromSecure = false;
             binaryPointPosition.Reset();
+            basepri.Reset();
             hardFaultForced = false;
         }
 
@@ -971,12 +976,26 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        public bool Clocked
+        {
+            get => systick.NonSecureVal.Clocked;
+            set
+            {
+                // Propagate setting to both security banks.
+                systick.NonSecureVal.Clocked = value;
+                if(cpu.TrustZoneEnabled)
+                {
+                    systick.SecureVal.Clocked = value;
+                }
+            }
+        }
+
         public bool HaltSystickOnDeepSleep { get; set; }
 
         /// <summary>
         /// Blocks writes to CCR.DIV_0_TRP register field so CPU wouldn't fault on integer division by 0
         /// </summary>
-        public bool FilterCcrDiv0Write { get; set; } = true;
+        public bool FilterCcrDiv0Write { get; set; } = false;
 
         [DefaultInterruptAttribute]
         public GPIO IRQ { get; private set; }
@@ -1001,14 +1020,43 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool DeepSleepEnabled { get; set; }
 
+        public const uint STIROffset = (uint)Registers.SoftwareTriggerInterrupt;
+
         private static int GetStartingInterrupt(long offset, bool externalInterrupt)
         {
             return (int)(offset + (externalInterrupt ? 16 : 0));
         }
 
+        private static bool IsAnException(int interrupt)
+        {
+            return Enum.IsDefined(typeof(SystemException), interrupt);
+        }
+
+        private static bool IsSynchronousException(int interrupt)
+        {
+            if(IsAnException(interrupt))
+            {
+                var exception = (SystemException)interrupt;
+                switch(exception)
+                {
+                // These are the asynchronous system exceptions
+                // Taken from https://support.arm.com/documentation/107706/0100/Exceptions-and-interrupts-overview/Classification-of-synchronous-and-asynchronous-exceptions
+                case SystemException.NMI:
+                case SystemException.SysTick:
+                case SystemException.SysTick_S:
+                case SystemException.PendSV:
+                case SystemException.PendSV_S:
+                    return false;
+                default:
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private static string ExceptionToString(int exception)
         {
-            if(Enum.IsDefined(typeof(SystemException), exception))
+            if(IsAnException(exception))
             {
                 return ((SystemException)exception).ToString();
             }
@@ -1074,7 +1122,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             Registers.InterruptControlState.Define(RegisterCollection)
                 .WithValueField(0, 9, FieldMode.Read, valueProviderCallback: _ => (uint)(activeIRQs.Count == 0 ? 0 : activeIRQs.Peek()), name: "VECTACTIVE")
                 .WithReservedBits(9, 2)
-                .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => activeIRQs.Intersect(Enum.GetValues(typeof(SystemException)).Cast<int>()).Count() <= 1, name: "RETTOBASE")
+                .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => activeIRQs.Count() <= 1, name: "RETTOBASE")
                 .WithValueField(12, 9, FieldMode.Read, valueProviderCallback: _ => (ulong)(FindPendingInterrupt() ?? 0), name: "VECTPENDING")
                 .WithReservedBits(21, 1)
                 .WithTaggedFlag("ISRPENDING", 22)
@@ -1920,7 +1968,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             case RegistersV7.Control:
                 if((mpuControlRegister & 0x1) != (value & 0x1))
                 {
-                    this.cpu.MPUEnabled = (value & 0x1) != 0x0;
+                    cpu.MPUEnabled = (value & 0x1) != 0x0;
+                }
+                if((mpuControlRegister & 0x4) != (value & 0x4))
+                {
+                    cpu.MPUPrivdefena = (value & 0x4) != 0x0;
                 }
                 mpuControlRegister = value;
                 break;
@@ -2235,17 +2287,23 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private void SetPendingWithoutEscalation(int i)
         {
+            if(IsSynchronousException(i) && (irqs[i] & IRQState.Active) != 0)
+            {
+                this.ErrorLog($"Ignoring request to set {ExceptionToString(i)} pending.");
+                return;
+            }
+
             var before = irqs[i];
             irqs[i] |= IRQState.Pending;
             pendingIRQs.Add(i);
 
             // when SEVONPEND is set all interrupts (even those masked)
             // generate an event when entering the pending state
-            if(before != irqs[i] && currentSevOnPending.Get(IsInterruptTargetNonSecure(i)))
+            if(before != irqs[i] && currentSevOnPending.Get(!IsInterruptTargetNonSecure(i)))
             {
                 foreach(var cpu in machine.SystemBus.GetCPUs().OfType<CortexM>())
                 {
-                    cpu.SetEventFlag(true);
+                    cpu.SetEventFlag();
                 }
             }
         }
@@ -2869,6 +2927,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 systickEnabled = false;
                 reloadValue = 0;
+                TickInterruptEnabled = false;
+                CountFlag = false;
 
                 systick.Reset();
                 systick.AutoUpdate = true;
@@ -2952,6 +3012,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 set
                 {
                     systick.Divider = value;
+                }
+            }
+
+            public bool Clocked
+            {
+                get => systick.Clocked;
+                set
+                {
+                    systick.Clocked = value;
                 }
             }
 

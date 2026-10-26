@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -24,7 +24,7 @@ namespace Antmicro.Renode.Utilities.GDB
 {
     public class CommandsManager
     {
-        public CommandsManager(IMachine machine, IEnumerable<ICpuSupportingGdb> cpus)
+        public CommandsManager(IMachine machine)
         {
             availableCommands = new HashSet<CommandDescriptor>();
             typesWithCommands = new HashSet<string>();
@@ -34,28 +34,33 @@ namespace Antmicro.Renode.Utilities.GDB
             CanAttachCPU = true;
 
             commandsCache = new Dictionary<string, Command>();
-            ManagedCpus = new ManagedCpusDictionary();
-            foreach(var cpu in cpus)
-            {
-                if(!TryAddManagedCPU(cpu))
-                {
-                    throw new RecoverableException($"Could not create GDB server for CPU: {cpu.GetName()}");
-                }
-            }
-            selectedCpu = ManagedCpus[PacketThreadId.Any];
+            ManagedCpus = new ManagedCpusDictionary(this);
         }
 
-        public void AttachCPU(ICpuSupportingGdb cpu)
+        public void AttachCPU(ICpuSupportingGdb cpu, int? pid)
         {
             if(!CanAttachCPU)
             {
                 throw new RecoverableException("Cannot attach CPU because GDB is already connected.");
             }
+            if(!ManagedCpus.DeclareProcess(cpu, pid))
+            {
+                throw new RecoverableException("CPU is already a part of a different process.");
+            }
             if(!TryAddManagedCPU(cpu))
             {
+                ManagedCpus.DeclareProcess(cpu, null);
                 throw new RecoverableException("CPU already attached to this GDB server.");
             }
             InvalidateCompiledFeatures();
+            if(selectedCpu is null)
+            {
+                selectedCpu = cpu;
+                if(pid is int p)
+                {
+                    ManagedCpus.AttachedProcesses.Add(p);
+                }
+            }
         }
 
         public bool IsCPUAttached(ICpuSupportingGdb cpu)
@@ -107,36 +112,40 @@ namespace Antmicro.Renode.Utilities.GDB
             // This method gathers features from all cores and unifies them.
 
             // if unifiedFeatures contains any feature, it means that features were compiled and cached
-            if(unifiedFeatures.Any())
+            var pidKey = Process ?? 0; // 0 is safe to use in non-multiprocess cases as PID 0 is not valid in GDB
+            if(unifiedFeatures.TryGetValue(pidKey, out var features))
             {
-                return unifiedFeatures;
+                return features;
             }
+
+            features = new List<GDBFeatureDescriptor>();
+            unifiedFeatures.Add(pidKey, features);
 
             if(ManagedCpus.Count() == 1)
             {
-                unifiedFeatures.AddRange(Cpu.GDBFeatures);
-                return unifiedFeatures;
+                features.AddRange(Cpu.GDBFeatures);
+                return features;
             }
 
-            var features = new Dictionary<string, List<GDBFeatureDescriptor>>();
-            foreach(var cpu in ManagedCpus)
+            var featuresDict = new Dictionary<string, List<GDBFeatureDescriptor>>();
+            foreach(var cpu in ManagedCpus.Where(cpu => (ManagedCpus[cpu].ProcessId ?? pidKey) == pidKey))
             {
                 foreach(var feature in cpu.GDBFeatures)
                 {
-                    if(!features.ContainsKey(feature.Name))
+                    if(!featuresDict.ContainsKey(feature.Name))
                     {
-                        features.Add(feature.Name, new List<GDBFeatureDescriptor>());
+                        featuresDict.Add(feature.Name, new List<GDBFeatureDescriptor>());
                     }
-                    features[feature.Name].Add(feature);
+                    featuresDict[feature.Name].Add(feature);
                 }
             }
 
-            foreach(var featureVariations in features.Values)
+            foreach(var featureVariations in featuresDict.Values)
             {
-                unifiedFeatures.Add(UnifyFeature(featureVariations));
+                features.Add(UnifyFeature(featureVariations));
             }
 
-            return unifiedFeatures;
+            return features;
         }
 
         public GDBRegisterDescriptor[] GetCompiledRegisters(int registerNumber)
@@ -146,14 +155,15 @@ namespace Antmicro.Renode.Utilities.GDB
             // costly, so this function caches the already filtered lists for
             // faster retrieval.
 
-            if(unifiedRegisters.TryGetValue(registerNumber, out var registers))
+            var pidKey = Process ?? 0; // 0 is safe to use in non-multiprocess cases as PID 0 is not valid in GDB
+            if(unifiedRegisters.TryGetValue((pidKey, registerNumber), out var registers))
             {
                 return registers;
             }
 
             registers = GetCompiledFeatures().SelectMany(f => f.Registers)
                 .Where(r => r.Number == registerNumber).ToArray();
-            unifiedRegisters.Add(registerNumber, registers);
+            unifiedRegisters.Add((pidKey, registerNumber), registers);
 
             return registers;
         }
@@ -175,13 +185,13 @@ namespace Antmicro.Renode.Utilities.GDB
             breakpointCommand.RemoveAllWatchpoints();
         }
 
-        public void LoadLatestSnapshot(Action<CommandsManager> onLoadAction = null)
+        public void LoadLatestSnapshotBefore(Action<CommandsManager> onLoadAction = null)
         {
             var currentTimeStamp = EmulationManager.Instance.CurrentEmulation.MasterTimeSource.ElapsedVirtualTime;
-            LoadLatestSnapshot(currentTimeStamp - TimeInterval.FromTicks(1), onLoadAction);
+            LoadLatestSnapshotBefore(currentTimeStamp, onLoadAction);
         }
 
-        public void LoadLatestSnapshot(TimeInterval beforeOrAtTimeStamp, Action<CommandsManager> onLoadAction = null)
+        public void LoadLatestSnapshotBefore(TimeInterval beforeTimeStamp, Action<CommandsManager> onLoadAction = null)
         {
             if(Machine.GdbStubs.Count > 1)
             {
@@ -190,7 +200,9 @@ namespace Antmicro.Renode.Utilities.GDB
             var port = Machine.GdbStubs.Values.First().Terminal.Port.Value;
             var machineName = Machine.ToString();
 
-            EmulationManager.Instance.LoadLatestSnapshot(beforeOrAtTimeStamp);
+            var snapshotPath = EmulationManager.Instance.CurrentEmulation.SnapshotTracker.GetSnapshotForGdbBeforeTimeStamp(beforeTimeStamp);
+            EmulationManager.Instance.Load(snapshotPath, preserveState: true);
+
             if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var newMachine))
             {
                 throw new RecoverableException("Machine was not found in the snapshot.");
@@ -205,7 +217,11 @@ namespace Antmicro.Renode.Utilities.GDB
 
         public bool CanAttachCPU { get; set; }
 
+        public bool MultiprocessEnabled { get; set; }
+
         public ICpuSupportingGdb Cpu => selectedCpu;
+
+        public int? Process => ManagedCpus[Cpu].ProcessId;
 
         public ISet<Tuple<ulong, BreakpointType>> Breakpoints => GetOrCreateCommand<BreakpointCommand>().Breakpoints;
 
@@ -278,10 +294,8 @@ namespace Antmicro.Renode.Utilities.GDB
 
         private void InvalidateCompiledFeatures()
         {
-            if(unifiedFeatures.Any())
-            {
-                unifiedFeatures.RemoveAll(_ => true);
-            }
+            unifiedFeatures.Clear();
+            unifiedRegisters.Clear();
         }
 
         private bool TryAddManagedCPU(ICpuSupportingGdb cpu)
@@ -343,8 +357,10 @@ namespace Antmicro.Renode.Utilities.GDB
         private readonly HashSet<CommandDescriptor> availableCommands;
         private readonly HashSet<string> typesWithCommands;
         private readonly HashSet<Command> activeCommands;
-        private readonly List<GDBFeatureDescriptor> unifiedFeatures = new List<GDBFeatureDescriptor>();
-        private readonly Dictionary<int, GDBRegisterDescriptor[]> unifiedRegisters = new Dictionary<int, GDBRegisterDescriptor[]>();
+        // Key: Process ID
+        private readonly Dictionary<int, List<GDBFeatureDescriptor>> unifiedFeatures = new();
+        // Key: (Process ID, Register number)
+        private readonly Dictionary<(int, int), GDBRegisterDescriptor[]> unifiedRegisters = new();
 
         private readonly Dictionary<string,Command> commandsCache;
         [Constructor]
@@ -352,14 +368,37 @@ namespace Antmicro.Renode.Utilities.GDB
 
         public class ManagedCpusDictionary : IEnumerable<ICpuSupportingGdb>
         {
+            public ManagedCpusDictionary(CommandsManager manager)
+            {
+                this.manager = manager;
+            }
+
             /// <remarks> There is no check whatsoever to prevent inserting the same CPU twice here, with different unique ID </remarks>
-            public uint Add(ICpuSupportingGdb cpu)
+            public int Add(ICpuSupportingGdb cpu)
             {
                 // Thread id "0" might be interpreted as "any" thread by GDB, so start from 1
-                uint ctr = (uint)cpusToIds.Count + 1;
+                var ctr = cpusToIds.Count + 1;
                 cpusToIds.Add(cpu, ctr);
                 idsToCpus.Add(ctr, cpu);
                 return ctr;
+            }
+
+            public bool DeclareProcess(ICpuSupportingGdb cpu, int? pid)
+            {
+                if(cpusToPids.ContainsKey(cpu) && pid is not null)
+                {
+                    return false;
+                }
+
+                if(pid is int p)
+                {
+                    cpusToPids[cpu] = p;
+                }
+                else
+                {
+                    cpusToPids.Remove(cpu);
+                }
+                return true;
             }
 
             public IEnumerator<ICpuSupportingGdb> GetEnumerator()
@@ -372,33 +411,39 @@ namespace Antmicro.Renode.Utilities.GDB
                 return this.GetEnumerator();
             }
 
-            public ICpuSupportingGdb this[int idx]
+            public PacketThreadId this[ICpuSupportingGdb cpu]
             {
                 get
                 {
-                    // There are two special cases here:
-                    // -1 means "all" - not supported right now
-                    // 0 means an arbitrary process or thread - so take the first one available
-                    switch(idx)
-                    {
-                    case PacketThreadId.All:
-                        throw new NotSupportedException("Selecting \"all\" CPUs is not supported");
-                    case PacketThreadId.Any:
-                        return idsToCpus.OrderBy(kv => kv.Key).First().Value;
-                    default:
-                        return idsToCpus[(uint)idx];
-                    }
+                    int? processId = manager.MultiprocessEnabled ? cpusToPids[cpu] : null;
+                    return new PacketThreadId(processId, cpusToIds[cpu]);
                 }
             }
 
-            public ICpuSupportingGdb this[uint idx] => this[(int)idx];
+            public ICpuSupportingGdb this[PacketThreadId id]
+            {
+                // There are two special cases here:
+                // -1 means "all" - not supported right now
+                // 0 means an arbitrary process or thread - so take the first one available
+                get => id.ThreadId switch
+                {
+                    PacketThreadId.All => throw new NotSupportedException("Selecting \"all\" CPUs is not supported"),
+                    PacketThreadId.Any => this.idsToCpus.OrderBy(kv => kv.Key).First().Value,
+                    _ => idsToCpus[id.ThreadId],
+                };
+            }
 
-            public uint this[ICpuSupportingGdb cpu] => cpusToIds[cpu];
+            public IEnumerable<PacketThreadId> All => cpusToIds.Keys.Select(cpu => this[cpu]);
 
-            public IEnumerable<uint> GdbCpuIds => idsToCpus.Keys;
+            public bool MultiprocessExtensionRequested => cpusToPids.Count > 0;
 
-            private readonly Dictionary<uint, ICpuSupportingGdb> idsToCpus = new Dictionary<uint, ICpuSupportingGdb>();
-            private readonly Dictionary<ICpuSupportingGdb, uint> cpusToIds = new Dictionary<ICpuSupportingGdb, uint>();
+            public HashSet<int> AttachedProcesses => attachedProcesses;
+
+            private readonly CommandsManager manager;
+            private readonly Dictionary<int, ICpuSupportingGdb> idsToCpus = new Dictionary<int, ICpuSupportingGdb>();
+            private readonly Dictionary<ICpuSupportingGdb, int> cpusToIds = new Dictionary<ICpuSupportingGdb, int>();
+            private readonly Dictionary<ICpuSupportingGdb, int> cpusToPids = new Dictionary<ICpuSupportingGdb, int>();
+            private readonly HashSet<int> attachedProcesses = new HashSet<int>();
         }
 
         private class CommandDescriptor

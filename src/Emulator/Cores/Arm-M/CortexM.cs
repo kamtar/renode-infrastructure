@@ -8,6 +8,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 using Antmicro.Renode.Core;
@@ -238,24 +239,24 @@ namespace Antmicro.Renode.Peripherals.CPU
                 var mProfileFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-profile");
                 for(var index = 0u; index <= 12; index++)
                 {
-                    mProfileFeature.Registers.Add(new GDBRegisterDescriptor(index, 32, $"r{index}", "uint32", "general"));
+                    mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.R0 + index, 32, $"r{index}", "uint32", "general"));
                 }
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(13, 32, "sp", "data_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(14, 32, "lr", "uint32", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(15, 32, "pc", "code_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(25, 32, "xpsr", "uint32", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.SP, 32, "sp", "data_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.LR, 32, "lr", "code_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PC, 32, "pc", "code_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.CPSR, 32, "xpsr", "uint32", "general"));    // cpsr is aliased to xpsr in tlibs
                 features.Add(mProfileFeature);
 
                 var mSystemFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-system");
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(26, 32, "msp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(27, 32, "psp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(28, 32, "primask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(29, 32, "basepri", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(30, 32, "faultmask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(31, 32, "control", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPCURR, 32, "msp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPCURR, 32, "psp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PRIMASK, 32, "primask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.BasePri, 32, "basepri", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.FAULTMASK, 32, "faultmask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.Control, 32, "control", "uint32", "general"));
                 features.Add(mSystemFeature);
 
-                bool hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
+                var hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
                 if(hasMProfileVectorExtensions)
                 {
                     var mveProfileFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-profile-mve");
@@ -274,30 +275,38 @@ namespace Antmicro.Renode.Peripherals.CPU
                     features.Add(mveProfileFeature);
                 }
 
+                if(TrustZoneEnabled)
+                {
+                    var mSecextFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.secext");
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPS, 32, "msp_s", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPS, 32, "psp_s", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPNS, 32, "msp_ns", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPNS, 32, "psp_ns", "uint32", "general"));
+                    features.Add(mSecextFeature);
+                }
+
                 // +++++ Important
                 // tlibs implement VFP using DOUBLE PRECISION FP (64 bit) registers.
                 // Each D (double) register holds two F (fp) registers! (arm/cpu.h)
                 // To keep consistency with tlibs, the code below uses D registers.
 
-                bool has32RegisterVfp = (GetArmFeature(ArmFeatures.ARM_FEATURE_VFP3)
+                var has32RegisterVfp = (GetArmFeature(ArmFeatures.ARM_FEATURE_VFP3)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_NEON)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_VFP4));
 
-                bool has16RegisterVfp = ((GetArmFeature(ArmFeatures.ARM_FEATURE_VFP_FP16)
+                var has16RegisterVfp = ((GetArmFeature(ArmFeatures.ARM_FEATURE_VFP_FP16)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_VFP))
                         && !has32RegisterVfp);
 
                 if(has32RegisterVfp || has16RegisterVfp)
                 {
                     var mVfpFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.vfp");
-                    const int vfpRegisterOffset = 42;
-                    int vfpRegisterEnd = has32RegisterVfp ? 31 : 15;
+                    var vfpRegisterEnd = has32RegisterVfp ? 31 : 15;
                     for(var reg = 0u; reg <= vfpRegisterEnd; reg++)
                     {
-                        mVfpFeature.Registers.Add(new GDBRegisterDescriptor(reg + vfpRegisterOffset, 64, $"d{reg}", "ieee_double", "float"));
+                        mVfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.D0 + reg, 64, $"d{reg}", "ieee_double", "float"));
                     }
-                    // The fpscr is always reg# = 74
-                    mVfpFeature.Registers.Add(new GDBRegisterDescriptor(74, 32, "fpscr", "int", "float"));
+                    mVfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.FPSCR, 32, "fpscr", "int", "float"));
                     features.Add(mVfpFeature);
                 }
 
@@ -446,6 +455,19 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get => GetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), () => tlibGetPmsav8Mair(1, 0));
             set => SetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), val => tlibSetPmsav8Mair(1, val, 0), value);
+        }
+
+        public bool MPUPrivdefena
+        {
+            get
+            {
+                return tlibIsPrivdefenaEnabled() != 0;
+            }
+
+            set
+            {
+                tlibSetPrivdefena(value ? 1u : 0u);
+            }
         }
 
         public bool MPUEnabled
@@ -1133,6 +1155,14 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
+        private uint IsSTIRAddress(uint address)
+        {
+            return machine.SystemBus.GetRegistrationPoints(nvic)
+                .Where(p => address == p.Range.StartAddress + NVIC.STIROffset)
+                .Any() ? 1u : 0u;
+        }
+
+        [Export]
         private void SetPendingIRQ(int number)
         {
             nvic.SetPendingIRQ(number);
@@ -1335,6 +1365,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<int> tlibEnableMpu;
 
         [Import]
+        private readonly Action<uint> tlibSetPrivdefena;
+
+        [Import]
+        private readonly Func<uint> tlibIsPrivdefenaEnabled;
+
+        [Import]
         private readonly Func<int> tlibIsMpuEnabled;
 
         [Import(Name = "tlib_set_register_value_32_non_secure")]
@@ -1410,11 +1446,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             public static implicit operator ulong(ContextState stateObj)
             {
-                var state = 0u;
-                state |= (stateObj.Privileged ? 1u : 0) & 1u;
-                state |= (stateObj.CpuSecure ? 2u : 0) & 2u;
-                state |= (stateObj.AttributionSecure ? 4u : 0) & 4u;
-                state |= (stateObj.Semihosting ? 8u : 0) & 8u;
+                var state = 0UL;
+                state |= stateObj.Privileged ? 1UL : 0;
+                state |= stateObj.CpuSecure ? 2UL : 0;
+                state |= stateObj.AttributionSecure ? 4UL : 0;
+                state |= stateObj.Semihosting ? 8UL : 0;
                 return state;
             }
 
@@ -1422,10 +1458,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 return new ContextState
                 {
-                    Privileged = (state & 1u) == 1u,
-                    CpuSecure = (state & 2u) == 2u,
-                    AttributionSecure = (state & 4u) == 4u,
-                    Semihosting = (state & 8u) == 8u,
+                    Privileged = (state & 1UL) == 1UL,
+                    CpuSecure = (state & 2UL) == 2UL,
+                    AttributionSecure = (state & 4UL) == 4UL,
+                    Semihosting = (state & 8UL) == 8UL,
                 };
             }
         }

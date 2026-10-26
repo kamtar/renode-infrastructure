@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -10,16 +10,20 @@ using System;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.USB;
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities.Collections;
+
+#nullable enable
 
 namespace Antmicro.Renode.Peripherals.USB
 {
     public class USBHost : SimpleContainerBase<IUSBDevice>
     {
-        public USBHost(uint defaultDelay = 1000)
+        public USBHost(uint defaultDelay = 1000, uint maxSetupRetries = 3)
         {
             this.defaultDelay = defaultDelay;
+            this.maxSetupRetries = maxSetupRetries;
             timeSource = EmulationManager.Instance.CurrentEmulation.MasterTimeSource; // We use time as a hack for now
             devices = new TwoWayDictionary<byte, IUSBDevice>();
             addressCounter = 2; // Zero is reserved, 1 is host, so we start from 2
@@ -46,7 +50,7 @@ namespace Antmicro.Renode.Peripherals.USB
             }
         }
 
-        protected virtual void DeviceEnumerated(IUSBDevice device)
+        protected virtual void DeviceEnumerated(IUSBConnection device)
         {
             // Intentionally left empty
         }
@@ -59,57 +63,44 @@ namespace Antmicro.Renode.Peripherals.USB
 
         protected void EnumerateDevice(IUSBDevice device)
         {
-            SetAddress(device);
-            GetDescriptor(device);
-            SetConfiguration(device);
-            // Note: We wait for endpoints to fully enable, because if we
-            // do it too early, then the data will be lost
-            ExecuteWithDelay(() => { DeviceEnumerated(device); });
-        }
-
-        private void GetDescriptor(IUSBDevice device)
-        {
-            var setupPacket = new SetupPacket();
-            setupPacket.Recipient = PacketRecipient.Device;
-            setupPacket.Type = PacketType.Standard;
-            setupPacket.Request = (byte)StandardRequest.GetDescriptor;
-            setupPacket.Direction = Core.USB.Direction.DeviceToHost;
-            setupPacket.Value = 0x0200;
-            setupPacket.Index = 0;
-            setupPacket.Count = 9;
-            device.USBCore.HandleSetupPacket(setupPacket, _ => { }, null);
-        }
-
-        private void SetAddress(IUSBDevice device)
-        {
-            var setupPacket = new SetupPacket();
-            setupPacket.Recipient = PacketRecipient.Device;
-            setupPacket.Type = PacketType.Standard;
-            setupPacket.Request = (byte)StandardRequest.SetAddress;
-            setupPacket.Direction = Core.USB.Direction.HostToDevice;
-            setupPacket.Value = addressCounter;
-            setupPacket.Index = 0;
-            setupPacket.Count = 0;
-
-            // This should respond with empty data packet, but we dont check it for now as it is not necessary
-            device.USBCore.HandleSetupPacket(setupPacket, _ =>
+            var conn = device.ConnectUSB();
+            addressCounter += 1;
+            // Delay the first try so that the device has a chance to enable
+            ExecuteWithDelay(() =>
             {
-                devices.Add(addressCounter, device);
-                addressCounter++;
-            }, null);
+                WaitForSetupEndpoint(conn, 0, (ep0) =>
+                {
+                    ep0.SetAddress(addressCounter, () =>
+                    {
+                        // USB configurations are 1-based (0 means unconfigured),
+                        // so choose the first configuration, which all devices should have
+                        ep0.SetConfiguration(1, () => DeviceEnumerated(conn));
+                    });
+                }, maxSetupRetries);
+            });
         }
 
-        private void SetConfiguration(IUSBDevice device)
+        protected void WaitForSetupEndpoint(IUSBConnection connection, byte endpointAddress, Action<IUSBPipeSetup> onConnected, uint retriesLeft)
         {
-            var setupPacket = new SetupPacket();
-            setupPacket.Recipient = PacketRecipient.Device;
-            setupPacket.Type = PacketType.Standard;
-            setupPacket.Request = (byte)StandardRequest.SetConfiguration;
-            setupPacket.Direction = Core.USB.Direction.HostToDevice;
-            setupPacket.Value = 1; // Set to first configuration for now
-            setupPacket.Index = 0;
-            setupPacket.Count = 0;
-            device.USBCore.HandleSetupPacket(setupPacket, _ => { }, null);
+            if(retriesLeft == 0)
+            {
+                this.WarningLog("Failed to connect to endpoint {0} as setup. Maxmimum number of retries exceeded", endpointAddress);
+                return;
+            }
+            var endpoint = connection.ConnectEndpointSetup(endpointAddress);
+            if(endpoint is not null)
+            {
+                onConnected.Invoke(endpoint);
+            }
+            else
+            {
+                // Delay and then try again
+                this.DebugLog("Failed to connect to endpoint {0} as setup. Retrying ({1} attempts left)", endpointAddress, retriesLeft);
+                ExecuteWithDelay(() =>
+                {
+                    WaitForSetupEndpoint(connection, endpointAddress, onConnected, retriesLeft - 1);
+                });
+            }
         }
 
         private bool TryInitializeConnectedDevice(IUSBDevice peripheral)
@@ -128,7 +119,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 ChildCollection.Add(addressCounter, peripheral);
                 // Initialize device with it's first configuration
                 // Note: Delay here is necessary, as if we start to do anything before
-                // the USB device gets to pullup, then we'll stall endpoints 
+                // the USB device gets to pullup, then we'll stall endpoints
                 ExecuteWithDelay(() => { EnumerateDevice(peripheral); });
                 return true;
             }
@@ -149,5 +140,6 @@ namespace Antmicro.Renode.Peripherals.USB
         private readonly TimeSourceBase timeSource;
         private readonly TwoWayDictionary<byte, IUSBDevice> devices;
         private readonly uint defaultDelay;
+        private readonly uint maxSetupRetries;
     }
 }

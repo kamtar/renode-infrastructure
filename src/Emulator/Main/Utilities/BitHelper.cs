@@ -650,6 +650,31 @@ namespace Antmicro.Renode.Utilities
             return value;
         }
 
+        public static uint SignTruncate(int value, int size)
+        {
+            return (uint)value & (size == 32 ? uint.MaxValue : (1u << size) - 1u);
+        }
+
+        public static ulong SignTruncate(long value, int size)
+        {
+            return (ulong)value & (size == 64 ? ulong.MaxValue : (1ul << size) - 1ul);
+        }
+
+        public static long MinSignedValue(int size)
+        {
+            return -(1L << (size - 1));
+        }
+
+        public static long MaxSignedValue(int size)
+        {
+            return (1L << (size - 1)) - 1;
+        }
+
+        public static ulong MaxUnsignedValue(int size)
+        {
+            return size == 64 ? ulong.MaxValue : (1UL << size) - 1;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static uint CalculateMask(int width, int position)
         {
@@ -743,6 +768,21 @@ namespace Antmicro.Renode.Utilities
             DebugHelper.Assert(bitsCount >= 0);
             // Return count of bytes, including one which isn't full of bits.
             return (bitsCount - 1) / BitsPerByte + 1;
+        }
+
+        public static uint[] ToUInt32Array(byte[] data, bool littleEndian)
+        {
+            var res = new uint[(data.Length + 3) / 4];
+            for(var idx = 0; idx < data.Length / 4; idx += 1)
+            {
+                res[idx] = ToUInt32(data, idx * 4, 4, littleEndian);
+            }
+            // Handle partial value
+            if(data.Length % 4 != 0)
+            {
+                res[^1] = ToUInt32(data, data.Length & ~3, data.Length % 4, littleEndian);
+            }
+            return res;
         }
 
         public const int BitsPerByte = 8;
